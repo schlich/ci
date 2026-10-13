@@ -166,6 +166,9 @@ export extern "ci cancel" [
 # Vacate a Codex task's claim that its task left behind, without touching the topic
 export extern "ci unclaim" []
 
+# Hand the topic checked out here to the next agent session that edits the workspace
+export extern "ci adopt" []
+
 # List stale workspaces and checkpoints
 export extern "ci prune" [
     --apply # Forget and delete the listed workspaces and checkpoints

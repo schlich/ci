@@ -405,15 +405,23 @@ def gen-new-topic-facts [key: string] {
         owner: (pick-from $"($key)/owner" ["none" "active" "delivered" "discarded" "released"])
         dedicated: (flag $"($key)/dedicated")
         topic_done: (flag $"($key)/done")
+        in_place: (flag $"($key)/in-place")
     }
 }
 
 for-all "ci new never moves an owned or dedicated working copy" {|key|
     let facts = (gen-new-topic-facts $key)
     if (new-topic-refusal $facts) == null {
-        assert ($facts.owner != "active") "started a topic over an active task's change"
+        assert ($facts.owner != "active" or $facts.in_place) "started a topic over an active task's change"
         assert ((not $facts.dedicated) or $facts.topic_done) "stranded a `ci start` topic"
     }
+}
+
+# A session that claimed an empty change names it with `ci new`; the change,
+# and so the session's claim on it, stays.
+for-all "ci new names an owned empty change in place" {|key|
+    let facts = (gen-new-topic-facts $key | merge { owner: "active" in_place: true dedicated: false })
+    assert equal (new-topic-refusal $facts) null
 }
 
 for-all "ci new starts a sibling in every unowned shared workspace" {|key|

@@ -5,8 +5,9 @@
 #   context-status brief      a few lines, printed when a shell enters a workspace
 #   context-status handoff    Markdown for the next agent; --hook wraps it as
 #                             Claude Code or Codex SessionStart hook output
-#   context-status guard      Claude Code PreToolUse hook: refuse edits JJ would
-#                             attribute to the shared default checkout
+#   context-status guard      Claude Code PreToolUse hook: claim a free workspace
+#                             on a session's first edit, and refuse edits to
+#                             a workspace another session or topic holds
 #   context-status json       the collected record
 #   context-status refresh    update the cached pipeline state now
 #
@@ -23,6 +24,20 @@ const LOCK_FILE = "context-status.lock"
 const PENDING_TTL = 1min
 const SETTLED_TTL = 15min
 const LOCK_TTL = 2min
+# The ownership record and the claim directory that marks it active. Codex
+# sessions wrote them first, hence the name; Claude Code sessions use them too.
+const OWNER_FILE = "codex-session.json"
+const CLAIM_DIR = "codex-session-claim"
+# A topic `ci adopt` hands to the next session that edits the workspace.
+const ADOPT_FILE = "jj-ci-adopt.json"
+# Serializes claims, so two sessions' first edits cannot both take a workspace.
+const CLAIM_LOCK = "agent-claim.lock"
+const CLAIM_LOCK_TTL = 1min
+# How long an owning session may stay quiet before another may take over. An
+# owned change that is still empty holds no work, so a short pause frees it;
+# one with work waits as long as `ci prune` does for an ended task.
+const IDLE_TAKEOVER = 10min
+const BUSY_TAKEOVER = 2day
 
 # Each revision as one JSON line. Trunk commits the topic lacks only count.
 const REVISION_TEMPLATE = '
@@ -106,18 +121,134 @@ def worktree-workspaces [worktree: path] {
 }
 
 # Whether an agent may edit a file, from facts the guard reads:
-#   workspace  whether the file is inside a JJ workspace at all
-#   worktree   whether it sits in a Git worktree with no JJ workspace of its own
-#   default    whether its workspace is the canonical default checkout
-#   dedicated  whether the repository has topic workspaces besides it
-#   ignored    whether Git ignores the file there
-# Only a repository that uses topic workspaces is guarded: in it, the default
-# checkout is shared by every session, and a worktree's edits reach no change.
+#   workspace     whether the file is inside a JJ workspace at all
+#   worktree      whether it sits in a Git worktree with no JJ workspace of its own
+#   dedicated     whether the repository has topic workspaces besides it
+#   ignored       whether Git ignores the file there
+#   owner         owner-status of the workspace's ownership record
+#   same_session  whether that record belongs to this session
+#   idle          how long the owning session has been quiet, or null if unknown
+#   free          whether the workspace is idle on trunk: nothing above trunk
+#                 but an empty change, so no one's work is checked out
+#   adoptable     whether its topic was handed to the next session, by
+#                 `ci start` dedicating the workspace to it or by `ci adopt`
+# Only a repository that uses topic workspaces is guarded. In it, a session
+# works only where it owns the change: its first edit claims a free workspace,
+# the default checkout included, and never another session's or a topic
+# nobody handed over. `allow` lets the edit through; `claim` records this
+# session as the owner first; `deny` names why not.
 def edit-verdict [facts: record] {
     if not $facts.workspace or not $facts.dedicated { return { action: "allow" reason: null } }
     if $facts.worktree { return { action: "deny" reason: "worktree" } }
-    if $facts.default and not $facts.ignored { return { action: "deny" reason: "shared-default" } }
-    { action: "allow" reason: null }
+    # An ignored file reaches no change, so whoever holds the workspace loses nothing.
+    if $facts.ignored { return { action: "allow" reason: null } }
+    if $facts.owner == "active" {
+        if $facts.same_session { return { action: "allow" reason: null } }
+        # A stale record must not hold a workspace forever.
+        let limit = if $facts.free { $IDLE_TAKEOVER } else { $BUSY_TAKEOVER }
+        if $facts.idle == null or $facts.idle < $limit { return { action: "deny" reason: "owned" } }
+        return { action: "claim" reason: null }
+    }
+    if $facts.free or $facts.adoptable { return { action: "claim" reason: null } }
+    { action: "deny" reason: "occupied" }
+}
+
+# How long the session behind an ownership record has been quiet, from the
+# transcript it writes as it runs: a Claude Code session records its
+# transcript's path, and a Codex task is found by its rollout file. Null when
+# neither can be found. Keep in step with owner-liveness in ci.nu.
+def owner-idle [record: any] {
+    if $record == null { return null }
+    let transcript = ($record.transcript_path? | default "")
+    let session = ($record.session_id? | default "")
+    let codex = ($env.CODEX_HOME? | default ($env.HOME | path join ".codex"))
+    let files = if ($transcript | is-not-empty) and ($transcript | path exists) {
+        [$transcript]
+    } else if $session =~ '^[a-zA-Z0-9_-]+$' {
+        # An archived Codex task has ended, however recently it wrote.
+        if (glob $"($codex)/archived_sessions/**/*($session).jsonl" | is-not-empty) { return 1000wk }
+        glob $"($codex)/sessions/**/*($session).jsonl"
+    } else { [] }
+    if ($files | is-empty) { return null }
+    (date now) - ($files | each {|file| ls --long $file | first | get modified } | math max)
+}
+
+# Whether a workspace's collected facts show it idle on trunk, and whether its
+# checked-out topic was handed to the next session.
+def occupancy [root: path, facts: record] {
+    let jj_dir = ($root | path join ".jj")
+    let held = ($facts.checked_out | append ($facts.stack | get change_id))
+    let handed = ([(read-json ($jj_dir | path join "jj-ci-workspace.json")) (read-json ($jj_dir | path join $ADOPT_FILE))]
+        | compact | any {|record| $record.change_id? in $held })
+    {
+        free: ($facts.stranded == null and ($facts.conflicts | is-empty) and ($facts.stack | length) <= 1 and ($facts.stack | all {|rev| $rev.empty }))
+        adoptable: $handed
+    }
+}
+
+# The workspaces besides `root` that a session could claim now: idle on
+# trunk, or parked on landed work, with no active owner. Reads without
+# snapshotting, so edits not yet recorded can hide from it.
+def list-workspace-roots [root: path] {
+    let listing = (^jj --ignore-working-copy --repository $root workspace list -T 'name ++ "\t" ++ root ++ "\n"' | complete)
+    if $listing.exit_code != 0 { return [] }
+    $listing.stdout | lines | where {|line| $line | is-not-empty } | parse "{name}\t{root}"
+}
+
+def free-workspaces [root: path] {
+    let revset = $"working_copies\() & \(\(empty\() & ~conflicts\() & children\(::($TRUNK))) | ::($TRUNK))"
+    let idle = (^jj --ignore-working-copy --repository $root log --no-graph -r $revset -T 'working_copies ++ "\n"' | complete)
+    if $idle.exit_code != 0 { return [] }
+    let names = ($idle.stdout | split row --regex '\s+' | where {|name| $name | is-not-empty } | str replace --regex '@$' '')
+    list-workspace-roots $root
+    | where {|workspace| $workspace.name in $names and $workspace.root != $root }
+    | where {|workspace| (owner-status (read-json ($workspace.root | path join ".jj" $OWNER_FILE))) != "active" }
+}
+
+def free-workspace-hint [root: path, relative?: string] {
+    let free = (free-workspaces $root)
+    # `ci start` puts new workspaces beside the default checkout.
+    let parent = (list-workspace-roots $root | where name == "default" | get --optional 0.root | default $root)
+    let start = if $relative == null { "`ci start NAME`" } else { $"`ci start NAME` and edit ($parent)/.jj-workspaces/NAME/($relative)" }
+    if ($free | is-empty) {
+        $"No other workspace is free; create one with ($start)."
+    } else {
+        $"Free workspaces: ($free | each {|workspace| $'($workspace.name) at ($workspace.root)' } | str join ', '). Use one of them, or create another with ($start)."
+    }
+}
+
+# Record `session` as the owner of `change` in `root`, if the ownership record
+# still reads as `seen` when the claim lock is held: a session that claimed
+# in between keeps the workspace. Returns whether this session now owns it.
+def claim-workspace [root: path, seen: any, claim: record] {
+    let jj_dir = ($root | path join ".jj")
+    let lock = ($jj_dir | path join $CLAIM_LOCK)
+    # A lock this old belongs to a claim that crashed.
+    if ($lock | path exists) and ((date now) - (ls --long $lock | first | get modified)) > $CLAIM_LOCK_TTL {
+        rm --recursive --force $lock
+    }
+    if (^mkdir $lock | complete).exit_code != 0 { return false }
+    let claimed = try {
+        let owner_path = ($jj_dir | path join $OWNER_FILE)
+        if (read-json $owner_path) != $seen { false } else {
+            {
+                cwd: $root
+                session_id: $claim.session_id
+                change_id: $claim.change_id
+                agent: "claude-code"
+                transcript_path: $claim.transcript_path
+                claimed_at: (date now | format date "%+")
+                described: true
+                state: "active"
+                finished: false
+            } | to json | save --force $owner_path
+            mkdir ($jj_dir | path join $CLAIM_DIR)
+            rm --force ($jj_dir | path join $ADOPT_FILE)
+            true
+        }
+    } catch { false }
+    rm --recursive --force $lock
+    $claimed
 }
 
 def read-json [path: path] {
@@ -404,13 +535,45 @@ def "main refresh" [dir?: path] {
     refresh-now (require-root $dir)
 }
 
+# edit-verdict for a tracked file in `root`, for `session`, from facts already
+# collected there, with the free workspaces to suggest when it would deny.
+def session-access [root: path, facts: record, session: string] {
+    let record = (read-json ($root | path join ".jj" $OWNER_FILE))
+    let access = ({
+        workspace: true worktree: false dedicated: true ignored: false
+        owner: (owner-status $record)
+        same_session: ($session != "" and ($record.session_id? | default "") == $session)
+        idle: (owner-idle $record)
+    } | merge (occupancy $root $facts))
+    let verdict = (edit-verdict $access)
+    { facts: $access verdict: $verdict hint: (if $verdict.action == "deny" { free-workspace-hint $root } else { "" }) }
+}
+
+# What a session starting in the workspace may do there, as edit-verdict
+# decides it for the session's first edit.
+def access-text [access: record] {
+    let verdict = $access.verdict
+    match [$verdict.action $verdict.reason] {
+        ["allow" _] => (if $access.facts.same_session { "- Access: this session owns this workspace's change." })
+        ["claim" _] => (if $access.facts.owner == "active" {
+            $"- Access: the session that owns this workspace has been quiet for ($access.facts.idle | format duration hr | str replace --regex '\.\d+' ''); your first edit takes it over for this session."
+        } else if $access.facts.free {
+            "- Access: this workspace is idle on trunk, so it is free. Your first edit claims it for this session. Name the topic with `ci new -m MESSAGE`, which describes the empty change in place."
+        } else {
+            "- Access: this workspace's topic was handed to the next session; your first edit claims it and continues the topic."
+        })
+        ["deny" "owned"] => $"- Access: another agent session owns this workspace, so edits here are refused. ($access.hint)"
+        ["deny" _] => $"- Access: this workspace holds a topic no session owns, so edits here are refused. Continue it only if the user asks, after `ci adopt` there hands it over. ($access.hint)"
+    }
+}
+
 def handoff-text [facts: record] {
     let owner = match $facts.owner {
-        "active" => $"owned by an active Codex task on change ($facts.owner_change)"
-        "delivered" => "its Codex task delivered the topic"
-        "discarded" => "its Codex task ended without delivering"
-        "released" => "its Codex task released the workspace; the topic may continue elsewhere"
-        _ => "no task owner recorded"
+        "active" => $"owned by an active agent session on change ($facts.owner_change)"
+        "delivered" => "its last session delivered the topic"
+        "discarded" => "its last session ended without delivering"
+        "released" => "its last session released the workspace; the topic may continue elsewhere"
+        _ => "no session owner recorded"
     }
     let stack = ($facts.stack | each {|rev|
         let flags = ([(if $rev.conflict { "conflicted" }) (if not $rev.described { "undescribed" })] | compact)
@@ -418,16 +581,13 @@ def handoff-text [facts: record] {
         $"  - ($rev.short) ($rev.title)($suffix)"
     })
     let files = ($facts.working_copy | each {|file| $"($file.0) ($file.1)" })
-    let layout = ($facts.layout? | default { default: false dedicated: false })
     [
         $"JJ workspace context \(context-status, (date now | format date '%Y-%m-%d %H:%M %Z')):"
         $"- Workspace: ($facts.root), ($owner)."
         (if ($facts.healed? | default false) {
             "- Updated this workspace's files first: another workspace had rewritten its checked-out change, which left it stale."
         })
-        (if $layout.default and $layout.dedicated {
-            $"- Shared checkout: this is the repository's canonical checkout, and other sessions use it at the same time, so agent edits here are refused. Start your own workspace with `ci start NAME` and edit under ($facts.root)/.jj-workspaces/NAME."
-        })
+        (if ($facts.access? | default null) != null { access-text $facts.access })
         $"- Topic: (topic-title $facts | ansi strip)."
         $"- Stage: ($facts.stage). Next: ($facts.next)."
         (if ($stack | is-not-empty) { (["- Changes above trunk, oldest first:"] | append $stack | str join "\n") })
@@ -459,11 +619,20 @@ def worktree-handoff-text [worktree: path, root: path] {
     ] | compact | str join "\n"
 }
 
-# PreToolUse guard for agent edits: refuse an Edit, Write, or NotebookEdit
-# that JJ would attribute to the shared default checkout, either because the
-# file is in it or because it is in a Git worktree with no JJ workspace of its
-# own. It reads the Claude Code hook event on stdin; silence lets the edit
-# through. Never snapshots a working copy.
+def deny-edit [reason: string] {
+    { hookSpecificOutput: {
+        hookEventName: "PreToolUse"
+        permissionDecision: "deny"
+        permissionDecisionReason: $reason
+    } } | to json --raw | print
+}
+
+# PreToolUse guard for agent edits. In a repository with topic workspaces, a
+# session's first Edit, Write, or NotebookEdit in a free workspace claims it,
+# and edits to a workspace another session owns, to a topic nobody handed
+# over, or to a Git worktree with no JJ workspace of its own are refused. It
+# reads the Claude Code hook event on stdin; silence lets the edit through.
+# A workspace is snapshotted only when no live session owns it.
 def "main guard" [] {
     let event = (try { open --raw /dev/stdin | from json } catch { return })
     let file = ($event.tool_input?.file_path? | default ($event.tool_input?.notebook_path? | default ""))
@@ -475,22 +644,67 @@ def "main guard" [] {
     let worktree = (enclosing-git-worktree $dir $root)
     let layout = (workspace-layout $root)
     let relative = ($file | path relative-to ($worktree | default $root))
-    let ignored = $worktree == null and $layout.default and (^git -C $root check-ignore --quiet -- $relative | complete).exit_code == 0
-    let verdict = (edit-verdict { workspace: true worktree: ($worktree != null) default: $layout.default dedicated: $layout.dedicated ignored: $ignored })
+    let session = ($event.session_id? | default "")
+    let record = (read-json ($root | path join ".jj" $OWNER_FILE))
+    let facts = {
+        workspace: true
+        worktree: ($worktree != null)
+        dedicated: $layout.dedicated
+        ignored: false
+        owner: (owner-status $record)
+        same_session: ($session != "" and ($record.session_id? | default "") == $session)
+        idle: null
+        free: false
+        adoptable: false
+    }
+    # Decide from the cheapest facts first: most edits come from the owner.
+    if (edit-verdict $facts).action == "allow" { return }
+    let facts = ($facts | merge {
+        ignored: ($worktree == null and (^git -C $root check-ignore --quiet -- $relative | complete).exit_code == 0)
+        idle: (owner-idle $record)
+    })
+    let verdict = (edit-verdict $facts)
     if $verdict.action == "allow" { return }
-    let reason = if $verdict.reason == "worktree" {
+    if $verdict.reason == "worktree" {
         let existing = (worktree-workspaces $worktree | path basename)
         let target = if ($existing | length) == 1 { $existing | first } else { "NAME" }
         let known = if ($existing | length) > 1 { $" Workspaces here: ($existing | str join ', ')." } else { "" }
-        $"($file) is in the Git worktree ($worktree), which is not a JJ workspace: JJ resolves it to the shared checkout at ($root) and would never record this edit. (if ($existing | is-empty) { $'Run `ci start NAME` in ($worktree) first, then edit' } else { 'Edit' }) ($worktree)/.jj-workspaces/($target)/($relative) instead.($known)"
-    } else {
-        $"($file) is in ($root), the repository's canonical checkout, which other sessions use at the same time. Start your own workspace with `ci start NAME` and edit ($root)/.jj-workspaces/NAME/($relative) instead."
+        deny-edit $"($file) is in the Git worktree ($worktree), which is not a JJ workspace: JJ resolves it to the shared checkout at ($root) and would never record this edit. (if ($existing | is-empty) { $'Run `ci start NAME` in ($worktree) first, then edit' } else { 'Edit' }) ($worktree)/.jj-workspaces/($target)/($relative) instead.($known)"
+        return
     }
-    { hookSpecificOutput: {
-        hookEventName: "PreToolUse"
-        permissionDecision: "deny"
-        permissionDecisionReason: $reason
-    } } | to json --raw | print
+    let owned_text = {||
+        let quiet = if $facts.idle == null { "" } else { $", quiet for ($facts.idle | format duration min | str replace --regex '\.\d+' '')" }
+        $"($root) belongs to another agent session \(($record.session_id? | default 'unknown'), change ($record.change_id? | default 'unknown' | str substring 0..7)($quiet)). (free-workspace-hint $root $relative)"
+    }
+    # Whether a quiet owner's change is still empty decides a takeover, and
+    # that needs the workspace read; an owner active within the shorter limit
+    # keeps it either way.
+    if $verdict.reason == "owned" and ($facts.idle == null or $facts.idle < $IDLE_TAKEOVER) { deny-edit (do $owned_text); return }
+    # Only a workspace no live session holds gets here, so reading it may
+    # snapshot its files; that is what tells an idle checkout from one with
+    # edits nobody has recorded yet.
+    let collected = (collect-healing $root)
+    if $collected == null {
+        deny-edit $"($root) could not be read; run `jj status` there to see why. (free-workspace-hint $root $relative)"
+        return
+    }
+    let facts = ($facts | merge (occupancy $root $collected.facts))
+    let verdict = (edit-verdict $facts)
+    match $verdict.action {
+        "allow" => { return }
+        "deny" if $verdict.reason == "owned" => { deny-edit (do $owned_text); return }
+        "deny" => {
+            let topic = (topic-title $collected.facts | ansi strip)
+            deny-edit $"($root) holds the topic ($topic), and no session owns it, so this session may not add to it. Continue that topic only if the user asks: running `ci adopt` there hands it to the next session that edits it. (free-workspace-hint $root $relative)"
+            return
+        }
+    }
+    # Without a session ID no later edit could match the record.
+    if ($session | is-empty) { return }
+    let change = ($collected.facts.checked_out | first)
+    if not (claim-workspace $root $record { session_id: $session change_id: $change transcript_path: ($event.transcript_path? | default null) }) {
+        deny-edit $"Another session claimed ($root) a moment ago. (free-workspace-hint $root $relative)"
+    }
 }
 
 # Markdown for the next agent. As a SessionStart hook it reads the hook event
@@ -513,7 +727,9 @@ def "main handoff" [
         } else {
             let collected = (collect-healing $root)
             if $collected == null { return }
-            let facts = ($collected.facts | insert layout (workspace-layout $root) | insert healed $collected.healed)
+            let layout = (workspace-layout $root)
+            let facts = ($collected.facts | insert healed $collected.healed)
+            let facts = if $layout.dedicated { $facts | insert access (session-access $root $facts ($event.session_id? | default "")) } else { $facts }
             refresh-in-background $facts
             handoff-text $facts
         }
@@ -537,8 +753,6 @@ const SEVERITIES = ["error" "warning" "info"]
 
 # Findings for one workspace, from facts `audit-facts` gathers:
 #   name, root, exists, error      the workspace and whether it could be read
-#   default, dedicated             canonical checkout of a repository with
-#                                  topic workspaces
 #   owner, owner_change, legacy    the ownership record's status, change, and
 #                                  whether it predates `state`
 #   owner_checked_out              whether that change is checked out here
@@ -570,10 +784,6 @@ def audit-findings [facts: record] {
         (if $facts.claim and $facts.owner != "active" {
             do $finding "error" "leftover-claim" "A session claim remains without an active task; new Codex sessions are refused." "`ci unclaim` in the workspace"
         })
-        # TLA: NoClaimOnSharedDefault.
-        (if $facts.owner == "active" and $facts.default and $facts.dedicated {
-            do $finding "error" "shared-default-claim" $"A task owns the canonical checkout with change ($change)." "move the topic to `ci start NAME`, then `ci unclaim` here"
-        })
         # TLA: DeliveredRecordIsTrue.
         (if $facts.legacy {
             do $finding "warning" "legacy-record" $"The ownership record for change ($change) predates `state`; it cannot say whether the topic was delivered." "check the topic's branch; `ci park` or `ci unclaim` rewrites the record"
@@ -595,10 +805,9 @@ def list-workspaces [root: path] {
     jj-lines $root [workspace list -T 'name ++ "\t" ++ root ++ "\n"'] | parse "{name}\t{root}"
 }
 
-def audit-facts [workspace: record, dedicated: bool] {
+def audit-facts [workspace: record] {
     let blank = {
         name: $workspace.name root: $workspace.root exists: false error: null
-        default: ($workspace.name == "default") dedicated: $dedicated
         owner: "none" owner_change: null legacy: false owner_checked_out: false claim: false
         stack: 0 published: false behind: 0 conflicts: [] stale_entries: [] stranded: false
     }
@@ -636,8 +845,7 @@ def "main audit" [
 ] {
     let root = (require-root $dir)
     let workspaces = (list-workspaces $root)
-    let dedicated = (($workspaces | length) > 1)
-    let findings = ($workspaces | each {|workspace| audit-findings (audit-facts $workspace $dedicated) } | flatten)
+    let findings = ($workspaces | each {|workspace| audit-findings (audit-facts $workspace) } | flatten)
     let orphans = (orphaned-session-records)
     let findings = if ($orphans | is-empty) { $findings } else {
         $findings | append { workspace: "(codex)" severity: "info" code: "orphaned-session-records" detail: $"($orphans | length) Codex session records name workspaces that no longer exist." fix: "harmless; delete them from $XDG_STATE_HOME/codex-jj-sessions" }

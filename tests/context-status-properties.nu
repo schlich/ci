@@ -9,7 +9,7 @@
 source pbt.nu
 source ../context-status.nu
 
-const ERROR_CODES = ["missing-workspace" "unreadable" "stranded-topic" "orphaned-claim" "leftover-claim" "shared-default-claim"]
+const ERROR_CODES = ["missing-workspace" "unreadable" "stranded-topic" "orphaned-claim" "leftover-claim"]
 
 def gen-audit-facts [key: string] {
     let owner = (pick-from $"($key)/owner" ["none" "active" "delivered" "discarded" "released"])
@@ -18,8 +18,6 @@ def gen-audit-facts [key: string] {
         root: "/w"
         exists: ((pick $"($key)/exists" 8) != 0)
         error: (if (pick $"($key)/error" 8) == 0 { "stale" } else { null })
-        default: (flag $"($key)/default")
-        dedicated: (flag $"($key)/dedicated")
         owner: $owner
         owner_change: (if $owner == "none" { null } else { gen-change-id $"($key)/change" })
         legacy: ($owner == "released" and (flag $"($key)/legacy"))
@@ -34,14 +32,13 @@ def gen-audit-facts [key: string] {
     }
 }
 
-# The state the TLA+ invariants allow: a claim exactly while a task is
-# active, that task's change checked out, and never on a shared default.
+# The state the ownership rules allow: a claim exactly while a session is
+# active, with that session's change checked out, in any workspace.
 def consistent [facts: record] {
     $facts | merge {
         exists: true error: null
         claim: ($facts.owner == "active")
         owner_checked_out: ($facts.owner == "active" or $facts.owner_checked_out)
-        default: ($facts.default and not ($facts.owner == "active" and $facts.dedicated))
         legacy: false
         stranded: false
     }
@@ -77,11 +74,6 @@ for-all "a claim without an active task is a leftover claim" {|key|
     assert ("leftover-claim" in (audit-findings $facts | get code))
 }
 
-for-all "a task on a shared canonical checkout is reported" {|key|
-    let facts = (consistent (gen-audit-facts $key) | merge { owner: "active" default: true dedicated: true claim: true })
-    assert ("shared-default-claim" in (audit-findings $facts | get code))
-}
-
 for-all "a legacy record is never trusted as delivered" {|key|
     let facts = (consistent (gen-audit-facts $key) | merge { owner: "released" legacy: true })
     assert ("legacy-record" in (audit-findings $facts | get code))
@@ -95,8 +87,7 @@ for-all "errors appear only when an invariant is broken" {|key|
         or $facts.error != null
         or $facts.stranded
         or ($facts.owner == "active" and not $facts.owner_checked_out)
-        or ($facts.claim != ($facts.owner == "active"))
-        or ($facts.owner == "active" and $facts.default and $facts.dedicated)
+        or ($facts.claim and $facts.owner != "active")
     )
     assert equal ($errors | is-not-empty) $broken
     assert ($errors | all {|code| $code in $ERROR_CODES })
@@ -119,10 +110,26 @@ def gen-edit-facts [key: string] {
     {
         workspace: (flag $"($key)/workspace")
         worktree: (flag $"($key)/worktree")
-        default: (flag $"($key)/default")
         dedicated: (flag $"($key)/dedicated")
         ignored: (flag $"($key)/ignored")
+        owner: (pick-from $"($key)/owner" ["none" "active" "delivered" "discarded" "released"])
+        same_session: (flag $"($key)/same")
+        idle: (pick-from $"($key)/idle" [null 1min 30min 3day])
+        free: (flag $"($key)/free")
+        adoptable: (flag $"($key)/adoptable")
     }
+}
+
+# A tracked file in a workspace of a repository with topic workspaces: the
+# edits the claim rules decide.
+def gen-guarded-facts [key: string] {
+    gen-edit-facts $key | merge { workspace: true worktree: false dedicated: true ignored: false }
+}
+
+for-all "edit-verdict returns a known action, with a reason when it denies" {|key|
+    let verdict = (edit-verdict (gen-edit-facts $key))
+    assert ($verdict.action in ["allow" "claim" "deny"]) $"unknown action ($verdict.action)"
+    assert equal ($verdict.reason != null) ($verdict.action == "deny")
 }
 
 for-all "edits are never refused where no topic workspaces exist" {|key|
@@ -137,10 +144,67 @@ for-all "a Git worktree's edits are refused wherever topic workspaces exist" {|k
     assert equal (edit-verdict $facts) { action: "deny" reason: "worktree" }
 }
 
-for-all "only tracked edits to the shared default checkout are refused" {|key|
-    let facts = (gen-edit-facts $key | merge { workspace: true worktree: false dedicated: true })
-    let expected = if $facts.default and not $facts.ignored { "deny" } else { "allow" }
-    assert equal (edit-verdict $facts).action $expected
+for-all "an ignored file is editable in any workspace" {|key|
+    let facts = (gen-guarded-facts $key | merge { ignored: true })
+    assert equal (edit-verdict $facts).action "allow"
+}
+
+for-all "a session edits freely where it owns the change" {|key|
+    let facts = (gen-guarded-facts $key | merge { owner: "active" same_session: true })
+    assert equal (edit-verdict $facts).action "allow"
+}
+
+# The default checkout is not special: any workspace idle on trunk is free.
+for-all "the first session to edit a free workspace claims it" {|key|
+    let facts = (gen-guarded-facts $key | merge {
+        owner: (pick-from $"($key)/ended" ["none" "delivered" "discarded" "released"])
+        free: true
+    })
+    assert equal (edit-verdict $facts).action "claim"
+}
+
+for-all "a session never edits another live session's workspace" {|key|
+    let facts = (gen-guarded-facts $key | merge { owner: "active" same_session: false })
+    let limit = if $facts.free { 10min } else { 2day }
+    if $facts.idle == null or $facts.idle < $limit {
+        assert equal (edit-verdict $facts) { action: "deny" reason: "owned" }
+    }
+}
+
+# A stale record never holds a workspace forever.
+for-all "a quiet session's workspace can be taken over" {|key|
+    let facts = (gen-guarded-facts $key | merge { owner: "active" same_session: false idle: 3day })
+    assert equal (edit-verdict $facts).action "claim"
+}
+
+for-all "a session paused briefly keeps work it started" {|key|
+    let facts = (gen-guarded-facts $key | merge { owner: "active" same_session: false free: false idle: 30min })
+    assert equal (edit-verdict $facts).action "deny"
+}
+
+for-all "a topic nobody owns or handed over is never claimed" {|key|
+    let facts = (gen-guarded-facts $key | merge {
+        owner: (pick-from $"($key)/ended" ["none" "delivered" "discarded" "released"])
+        free: false
+        adoptable: false
+    })
+    assert equal (edit-verdict $facts) { action: "deny" reason: "occupied" }
+}
+
+for-all "a handed-over topic is claimed by the next session" {|key|
+    let facts = (gen-guarded-facts $key | merge {
+        owner: (pick-from $"($key)/ended" ["none" "delivered" "discarded" "released"])
+        adoptable: true
+    })
+    assert equal (edit-verdict $facts).action "claim"
+}
+
+for-all "a claim never takes a workspace from a live owner" {|key|
+    let facts = (gen-guarded-facts $key)
+    if (edit-verdict $facts).action == "claim" and $facts.owner == "active" {
+        assert (not $facts.same_session)
+        assert ($facts.idle != null and $facts.idle >= 10min) "took over a session that was just active"
+    }
 }
 
 for-all "a session's Git worktree is found inside the workspace, never above it" {|key|

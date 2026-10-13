@@ -1,8 +1,9 @@
-# Interactive guard for workspaces that `ci start` created. A bare
-# `jj new main` there moves the working copy off an unfinished topic, which
-# then sits beside main while `ci` works on an empty change. This refuses a
-# `jj new` whose parents do not descend from the unlanded working copy. `^jj`
-# runs JJ directly and skips the guard.
+# Interactive guard for workspaces that `ci start` created or an agent
+# session claimed. A bare `jj new main` there moves the working copy off an
+# unfinished topic, which then sits beside main while `ci` works on an empty
+# change, or out from under the session editing it. This refuses a `jj new`
+# whose parents do not descend from the unlanded or claimed working copy.
+# `^jj` runs JJ directly and skips the guard.
 
 # The parents a `jj new` invocation would give the new working-copy change, or
 # null when it does not move this workspace's working copy off `@`: another
@@ -36,13 +37,27 @@ def jj-new-parents [args: list<string>] {
     if ($parents | is-empty) { null } else { $parents }
 }
 
-# Why this `jj new` would strand the topic, or null when it may run.
+# Why this `jj new` would strand the topic, or move an agent session's
+# claimed change out from under it, or null when it may run.
 def jj-new-refusal [parents: list<string>] {
     let root = (^jj root | complete)
     if $root.exit_code != 0 { return null }
-    let marker = ($root.stdout | str trim | path join ".jj" "jj-ci-workspace.json")
-    if not ($marker | path exists) { return null }
+    let jj_dir = ($root.stdout | str trim | path join ".jj")
     let revset = ($parents | each {|parent| $"\(($parent)\)" } | str join " | ")
+    # An agent session claimed the change checked out here; its next edit
+    # would land in whatever the working copy moved to. Keep in step with
+    # owner-status in ci.nu.
+    let owner_path = ($jj_dir | path join "codex-session.json")
+    let owner = if ($owner_path | path exists) { try { open $owner_path } catch { null } } else { null }
+    let owner_active = $owner != null and (($owner.state? | default "") == "active" or (($owner.state? | default "") == "" and not ($owner.finished? | default false)))
+    if $owner_active and ($owner.change_id? | default "" | is-not-empty) {
+        let left = (^jj log --no-graph -r $"change_id\(($owner.change_id)\) & ::@ ~ ::\(($revset)\)" -T 'change_id.short()' | complete)
+        if $left.exit_code == 0 and ($left.stdout | str trim | is-not-empty) {
+            return $"agent session ($owner.session_id? | default 'unknown') owns this workspace's change ($left.stdout | str trim), and the new change would not descend from it"
+        }
+    }
+    let marker = ($jj_dir | path join "jj-ci-workspace.json")
+    if not ($marker | path exists) { return null }
     # Unfinished work: a working copy above trunk that holds changes or a
     # description. An empty undescribed one is simply replaced.
     let stranded = (^jj log --no-graph -r $"@ ~ ::main@tangled ~ \(empty\() & description\(exact:\"\"\)\) ~ ::\(($revset)\)" -T 'change_id.short() ++ "\t" ++ description.first_line()' | complete)
@@ -63,7 +78,7 @@ def --wrapped jj [...args: string] {
         if $refusal != null {
             error make {
                 msg: $"Refusing `jj ($args | str join ' ')`: ($refusal)."
-                help: "Keep working here with `jj new` or `jj new --no-edit`, start other work with `ci start NAME`, end the topic with `ci park` or `ci cancel`, or run `^jj` to leave the topic on purpose."
+                help: "Keep working here with `jj new` or `jj new --no-edit`, start other work in a free workspace or with `ci start NAME`, end the topic with `ci park` or `ci cancel`, or run `^jj` to leave the topic on purpose."
             }
         }
     }

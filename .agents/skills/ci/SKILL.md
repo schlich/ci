@@ -51,7 +51,7 @@ equivalent low-level commands:
 - `ci land` for delivery to `main`;
 - `ci rebase` for updating that topic in place;
 - `ci new` to start a topic as a revision in the current workspace, `ci start`
-  to create a workspace for a concurrent actor, and `ci park` or
+  to create a workspace when no free one exists, and `ci park` or
   `ci cancel` to release a topic.
 
 When the `ci` MCP server is available, call its tools (`status`, `plan`,
@@ -79,8 +79,9 @@ Use the narrowest workflow that matches the request:
 | Decide whether a topic ships alone or stacked | `ci sequence` | Read-only apart from a fetch. Trial-merges in-flight topics (dispatched `jj-*` bookmarks and workspace changes) against `main@tangled` and each other, then proposes independent topics or stacks. `--json` for structured output. |
 | Update a topic from trunk | `ci rebase` | Checkpoints, fetches, and rebases the same change. |
 | Restack dispatched topics after trunk moves | `ci sequence --apply` | Run it by hand only on request. Restacks stacked topics onto their parent's bookmark and conflicting topics onto `main@tangled`, parents first. Checked-out topics are rebased from their own workspace only when a trial merge is clean. Pushes only conflict-free stacks. `--all` also rebases topics that are merely behind; `--no-push` stops before any remote change. |
-| Start a topic | `ci new [-m <message>]` | Fetches and starts a new change on `main@tangled` in the current workspace; the previous topic stays as a sibling (`jj edit` returns to it). Refuses while an active Codex task owns the workspace or an unfinished `ci start` topic is checked out. |
-| Start concurrent work | `ci start <name>` | Creates `.jj-workspaces/<name>` at `main@tangled` for an actor that runs alongside the current working copy (another agent task, a build, a dev server), inside the Git worktree it runs from if any (such as a Claude Code worktree); refuses a name already in use. |
+| Start a topic | `ci new [-m <message>]` | Fetches and starts a topic on `main@tangled` in the current workspace. An empty working copy that is unnamed, or that this session claimed, becomes the topic in place, keeping its change ID; otherwise a new change starts and the previous topic stays as a sibling (`jj edit` returns to it). Refuses while an active agent session owns another change here or an unfinished `ci start` topic is checked out. |
+| Start concurrent work | `ci start <name>` | Only when no workspace is free. Creates `.jj-workspaces/<name>` at `main@tangled` for an actor that runs alongside the current working copy (another agent task, a build, a dev server), inside the Git worktree it runs from if any (such as a Claude Code worktree); refuses a name already in use. |
+| Hand a topic to an agent | `ci adopt` | Only on the user's request. Lets the next agent session that edits the workspace claim the topic checked out there, which agents are otherwise refused. |
 | Finish a landed topic | `ci park` | Verifies the current revision is on `main@tangled`, deletes the topic bookmark locally and on Tangled, and removes a workspace that `ci start` created before archiving. `--keep` returns it to the pool instead: it stays on an empty change on main and drops its `ci start` marker, so the next task starts a fresh topic there. Any other workspace also stays. An empty working copy passes when its dispatched branch, if any, landed. |
 | Drop a topic that will not land | `ci cancel` | Refuses while a Tangled pull request from its branch is open. Checkpoints, deletes the topic bookmark, abandons the revisions above `main@tangled`, and releases the workspace like `park`. Requires an explicit user request. |
 | Reclaim leaked workspaces | `ci prune` | Dry run by default. Lists missing workspaces and unowned ones whose work is delivered (only an empty undescribed working copy remains above `main@tangled`), plus checkpoints older than `--keep-days`. Reports stale workspaces untouched. `--apply` updates stale ones, decides again, then forgets and deletes the listed ones, which requires an explicit user request. |
@@ -92,7 +93,7 @@ Use the narrowest workflow that matches the request:
 
 ## Safety rules
 
-- `ci sync` rejects nonempty changes and active Codex task ownership.
+- `ci sync` rejects nonempty changes and active agent session ownership.
   Use `ci rebase` to update an active topic without creating another change.
 - Do not dispatch an empty or conflicted change. `ci dispatch` enforces this,
   but inspect the state first so the user understands the blocker.
@@ -129,12 +130,17 @@ bypass the workflow with direct branch pushes or merges.
 
 ## Continuous integration and conflict handling
 
-The canonical checkout tracks `main`. In a repository with topic workspaces,
-other sessions share it, so agent hooks refuse edits there: an agent session
-opened in it starts with `ci start NAME`. In a topic workspace of its own,
-start the next topic with `ci new` and continue in place; another separate
-workspace is only for concurrent work that needs the current working copy to
-stay put, such as another active task, a build, a dev server, or an editor.
+In a repository with topic workspaces, an agent session works only in a
+workspace whose change it owns. Any workspace idle on trunk (nothing above
+`main@tangled` but an empty change) is free, the default checkout included:
+the session's first edit there claims it, and `ci new -m MESSAGE` names the
+claimed change in place. A workspace another live session owns, or one holding
+a topic no session owns, refuses the session's edits; the session-start note
+and the refusal name the free workspaces to move to, and only when none is
+free does the session create one with `ci start NAME`. Never take over a topic
+the user started unless they ask; they hand it over with `ci adopt`. In a
+workspace it owns, a session starts its next topic with `ci new` and continues
+in place after `ci park --keep` or `ci park` returns the workspace to trunk.
 From a Claude Code worktree under `.claude/worktrees/`, which is a Git
 worktree rather than a JJ workspace, `ci start` creates the workspace inside
 it so the app lets the session edit there.

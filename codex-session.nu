@@ -101,17 +101,21 @@ def owner-status [owner: any] {
 #   same_session  whether that record belongs to this session
 #   claim         whether a startup claim directory exists
 #   has_state     whether this session already recorded a workspace
+#   free          whether the workspace is idle on trunk: nothing above trunk
+#                 but an empty change
+#   marker        whether `ci start` dedicated the workspace to its topic
 # `resume` continues this session's task, `claim` starts a new topic, `skip`
 # leaves the workspace unclaimed with `reason`, and `refuse` stops the session.
 def claim-verdict [facts: record] {
     if $facts.owner == "active" and not $facts.same_session {
-        return { action: "refuse" reason: "This workspace belongs to another active Codex task. Use a separate JJ workspace for a different topic." }
+        return { action: "refuse" reason: "This workspace belongs to another active agent session. Use a separate JJ workspace for a different topic." }
     }
     if $facts.has_state { return { action: "resume" reason: null } }
-    # A repository with topic workspaces keeps its default one as the
-    # canonical checkout on main; claiming it strands the checkout on a topic.
-    if $facts.workspace == "default" and $facts.dedicated {
-        return { action: "skip" reason: "This is the repository's canonical checkout. Start the topic in its own workspace with `ci start NAME` and open that directory as the project." }
+    # In a repository with topic workspaces, a task takes a workspace only
+    # when it is free, the canonical checkout included, or dedicated to its
+    # topic; a topic no task owns stays with whoever started it.
+    if $facts.dedicated and not $facts.free and not $facts.marker {
+        return { action: "skip" reason: "This workspace holds a topic no task owns. Start yours in a free workspace, or with `ci start NAME`, and open that directory as the project." }
     }
     if $facts.claim {
         return { action: "refuse" reason: "This workspace has a session claim that no active task holds. Inspect .jj/codex-session.json, then clear it with `ci unclaim`." }
@@ -122,9 +126,13 @@ def claim-verdict [facts: record] {
 def workspace-facts [root: string] {
     let listing = (checked $root -- workspace list -T 'name ++ "\t" ++ target.current_working_copy() ++ "\n"')
     let workspaces = ($listing | lines | where {|line| $line | is-not-empty } | parse "{name}\t{current}")
+    # Free: at most one change above trunk, and that one empty.
+    let above = (checked $root -- log --no-graph -r $"\((trunk-revset $root))..@" -T 'json(empty && !conflict) ++ "\n"' | lines | where {|line| $line | is-not-empty })
     {
         workspace: ($workspaces | where current == "true" | get --optional 0.name | default "default")
         dedicated: (($workspaces | length) > 1)
+        free: (($above | length) <= 1 and ($above | all {|empty| $empty == "true" }))
+        marker: ($root | path join ".jj" "jj-ci-workspace.json" | path exists)
     }
 }
 
@@ -145,7 +153,7 @@ def prepare [cwd: string, session_id: string, path: path] {
     }
     # Listing workspaces costs a JJ call, and the guard runs on every tool
     # call; a resuming session never needs it.
-    let facts = if $has_state { $base_facts | merge { workspace: "" dedicated: false } } else { $base_facts | merge (workspace-facts $root) }
+    let facts = if $has_state { $base_facts | merge { workspace: "" dedicated: false free: false marker: false } } else { $base_facts | merge (workspace-facts $root) }
     let verdict = (claim-verdict $facts)
     if $verdict.action == "refuse" {
         let detail = if $owner != null and $facts.owner == "active" { $" Owner: task ($owner.session_id? | default 'unknown'), change ($owner.change_id? | default 'unknown')." } else { "" }
@@ -236,7 +244,7 @@ def main [event: string] {
         let verdict = (prepare $cwd $session_id $path)
         let mutating = (($hook.tool_name? | default "") =~ $MUTATING_TOOLS)
         if $verdict != null and $verdict.action == "skip" {
-            # An unclaimed canonical checkout may be read, never edited.
+            # A workspace left unclaimed may be read, never edited.
             if $event == "guard" and $mutating {
                 block $verdict.reason
             } else if $event == "session-start" {

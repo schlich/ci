@@ -16,6 +16,8 @@ def gen-claim-facts [key: string] {
         same_session: (flag $"($key)/same")
         claim: (flag $"($key)/claim")
         has_state: (flag $"($key)/state")
+        free: (flag $"($key)/free")
+        marker: (flag $"($key)/marker")
     }
 }
 
@@ -33,9 +35,9 @@ for-all "no session takes over another session's active workspace" {|key|
     assert equal (claim-verdict $facts).action "refuse"
 }
 
-# TLA: NoClaimOnSharedDefault.
-for-all "no new task claims the canonical checkout of a repository with topic workspaces" {|key|
-    let facts = (gen-claim-facts $key | upsert workspace "default" | upsert dedicated true)
+# A topic someone else started stays theirs, in any workspace.
+for-all "no new task claims a topic nobody handed over where topic workspaces exist" {|key|
+    let facts = (gen-claim-facts $key | merge { dedicated: true free: false marker: false })
     assert ((claim-verdict $facts).action != "claim")
 }
 
@@ -52,13 +54,14 @@ for-all "a session with a recorded workspace resumes unless another task owns it
     assert equal (claim-verdict $facts).action $expected
 }
 
-# Liveness in the small: a free workspace is always claimable.
+# Liveness in the small: a free workspace is always claimable, the canonical
+# checkout included.
 for-all "every free workspace can be claimed" {|key|
     let facts = (gen-claim-facts $key | merge {
-        owner: (pick-from $"($key)/free" ["none" "delivered" "discarded" "released"])
+        owner: (pick-from $"($key)/ended" ["none" "delivered" "discarded" "released"])
         claim: false
         has_state: false
+        free: true
     })
-    let shared_default = ($facts.workspace == "default" and $facts.dedicated)
-    assert equal (claim-verdict $facts).action (if $shared_default { "skip" } else { "claim" })
+    assert equal (claim-verdict $facts).action "claim"
 }

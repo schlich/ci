@@ -2657,10 +2657,12 @@ def "main start" [
 
 # Why `ci new` may not start another topic in this workspace, or null. A
 # workspace that an active task or `ci start` dedicated to one topic keeps it
-# until `finish` or `abandon`; any other one holds sibling topics.
+# until `finish` or `abandon`; any other one holds sibling topics. An empty
+# working copy that is unnamed, or that its owner claimed before naming it,
+# becomes the topic in place (`in_place`), which moves nothing.
 def new-topic-refusal [facts: record] {
-    if $facts.owner == "active" {
-        return "An active Codex task owns this workspace's change. Start concurrent work in its own workspace with `ci start NAME`."
+    if $facts.owner == "active" and not $facts.in_place {
+        return "An active agent session owns this workspace's change. Start concurrent work in a free workspace or with `ci start NAME`."
     }
     if $facts.dedicated and not $facts.topic_done {
         return "This workspace belongs to one unfinished topic from `ci start`. Finish or abandon it, or start concurrent work with `ci start NAME`."
@@ -2668,8 +2670,11 @@ def new-topic-refusal [facts: record] {
     null
 }
 
-# Start a topic as a new change on main@tangled in this workspace. The current
-# topic stays where it is, as a sibling; return to it with `jj edit`.
+# Start a topic on main@tangled in this workspace. An empty working copy that
+# is unnamed, or that an agent session claimed before naming it, becomes the
+# topic itself, so the change a session owns keeps its ID. Otherwise a new
+# change starts, and the current topic stays where it is, as a sibling; return
+# to it with `jj edit`.
 def "main new" [
     --message (-m): string # Description for the new topic
 ] {
@@ -2677,18 +2682,34 @@ def "main new" [
     let root = (git-command "locating the workspace" { ^jj root })
     let marker = (owned-workspace-marker $root)
     let facts = (topic-facts)
+    let owner = (session-owner)
+    let current = (current-topic-id)
+    let empty = (current-change "empty") == "true"
+    let unnamed = $empty and (current-change "description") == ""
+    let immutable = (current-change "immutable") == "true"
+    let in_place = $empty and not $immutable and ($unnamed or ((owner-status $owner) == "active" and $owner.change_id? == $current))
     let refusal = (new-topic-refusal {
-        owner: (owner-status (session-owner))
+        owner: (owner-status $owner)
         dedicated: ($marker | path exists)
         topic_done: ($facts.landed or not $facts.visible or $facts.topic_empty)
+        in_place: $in_place
     })
     if $refusal != null { error make { msg: $refusal } }
-    let previous = if (current-change 'empty && description == ""') == "true" {
-        null
-    } else {
-        { id: (current-change "change_id.short()") title: (current-change "description.first_line()") }
-    }
     fetch-trunk
+    if $in_place {
+        if (revset-change-ids "@- & main@tangled" | is-empty) {
+            run-command "moving the empty change onto main@tangled" { ^jj rebase -r @ -o main@tangled } | ignore
+        }
+        if $message != null {
+            run-command "naming the topic" { ^jj describe --message $message } | ignore
+        }
+        # A marker naming another topic would strand this one.
+        if ($marker | path exists) and (open $marker).change_id? != $current { rm $marker }
+        print $"Started topic (current-change 'change_id.short()') on main@tangled."
+        return
+    }
+    # Work parked on main is delivered, not a sibling to return to.
+    let previous = if $immutable { null } else { { id: (current-change "change_id.short()") title: (current-change "description.first_line()") } }
     let args = if $message == null { [] } else { [--message $message] }
     run-command "starting a topic on main@tangled" { ^jj new main@tangled ...$args } | ignore
     # A pool workspace's marker named the landed topic; the new one is not it.
@@ -2697,7 +2718,8 @@ def "main new" [
     if $previous == null {
         print $"Started topic ($created) on main@tangled."
     } else {
-        print $"Started topic ($created) on main@tangled. ($previous.id) \"($previous.title)\" stays as a sibling; return with `jj edit ($previous.id)`."
+        let title = if ($previous.title | is-empty) { "(no description)" } else { $previous.title }
+        print $"Started topic ($created) on main@tangled. ($previous.id) \"($title)\" stays as a sibling; return with `jj edit ($previous.id)`."
     }
 }
 
@@ -2818,6 +2840,25 @@ def "main unclaim" [] {
     }
 }
 
+# Hand the topic checked out here to the next agent session that edits the
+# workspace. Agents claim only a workspace idle on trunk on their own, so a
+# topic someone started by hand, or one whose session ended, stays theirs
+# until this hands it over.
+def "main adopt" [] {
+    require-jj-workspace-here
+    let root = (git-command "locating the workspace" { ^jj root })
+    let owner = (session-owner)
+    if (owner-status $owner) == "active" {
+        error make { msg: $"Agent session ($owner.session_id? | default 'unknown') owns this workspace's change ($owner.change_id? | default 'unknown' | str substring 0..7). `ci unclaim` frees it once that session has left it." }
+    }
+    if (revset-change-ids "(main@tangled..@) ~ empty()" | is-empty) {
+        error make { msg: "Nothing here to hand over: the workspace is idle on trunk, and the next session to edit it claims it anyway." }
+    }
+    let change = (current-topic-id)
+    { change_id: $change created: (date now | format date "%+") } | to json | save --force ($root | path join ".jj" "jj-ci-adopt.json")
+    print $"Handed topic ($change | str substring 0..7) \"(current-change 'description.first_line()')\" to the next agent session that edits ($root)."
+}
+
 def owner-state [root: string] {
     let path = ($root | path join ".jj" "codex-session.json")
     owner-status (if ($path | path exists) { open $path } else { null })
@@ -2837,6 +2878,17 @@ def owner-liveness [facts: record] {
     if $facts.archived { return "ended" }
     if $facts.last_write == null { return "unknown" }
     if ($facts.now - $facts.last_write) > $OWNER_QUIET { "ended" } else { "live" }
+}
+
+# A Claude Code session that claimed a workspace on its first edit records
+# its transcript, which it appends to as it runs; a Codex task is found by
+# its rollout file. Keep in step with owner-idle in context-status.nu.
+def session-transcript-facts [record: record] {
+    let transcript = ($record.transcript_path? | default "")
+    if ($transcript | is-not-empty) and ($transcript | path exists) {
+        return { archived: false last_write: (ls --long $transcript | first | get modified) }
+    }
+    codex-rollout-facts ($record.session_id? | default "")
 }
 
 def codex-rollout-facts [session_id: string] {
@@ -2871,7 +2923,7 @@ def workspace-facts [workspace: record, current: string, refresh: bool, idle: du
     let owner = (owner-state $workspace.root)
     let liveness = if $owner == "active" {
         let record = (try { open $owner_path } catch { {} })
-        owner-liveness (codex-rollout-facts ($record.session_id? | default "") | insert now (date now))
+        owner-liveness (session-transcript-facts $record | insert now (date now))
     } else { "none" }
     let last_used = if $exists { workspace-last-used $workspace.root } else { null }
     let facts = {
