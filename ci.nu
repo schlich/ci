@@ -1,0 +1,2888 @@
+use pst
+
+# Report this run's progress as OSC 7501 program status: to the terminal when
+# stdout is one, and as a JSON line to $env.PST_FILE when it is set, which
+# `watch-job` follows. A plain run writes nothing, and a report that cannot be
+# written never fails the run.
+def report-status [state: string, msg?: string, --id: string, --kind: string] {
+    let text = if $msg == null { null } else {
+        $msg | str replace --all --regex '[\x00-\x1f\x7f-\x9f]+' ' ' | str trim | str substring 0..<500
+    }
+    try {
+        pst report $state --app ci --id=$id --msg=$text --kind=$kind
+    } catch {|err|
+        print --stderr $"ci: could not report status: ($err.msg)"
+    }
+}
+
+# Run one phase under `id`, reporting it working, then done or error. The
+# phase's own error propagates unchanged.
+def phase [id: string, msg: string, body: closure] {
+    report-status working $msg --id $id
+    let result = try { do $body } catch {|err|
+        report-status error $"($msg) failed" --id $id
+        $err.raw
+    }
+    report-status done $msg --id $id
+    $result
+}
+
+# Run a whole dispatch or landing: report done or error for the run, then
+# clear its records so terminals and watchers drop them.
+def report-run [msg: string, body: closure] {
+    try { do $body } catch {|err|
+        report-status error ($err.msg | lines | get --optional 0 | default $"($msg) failed")
+        report-status clear
+        $err.raw
+    }
+    report-status done $msg
+    report-status clear
+}
+
+# JJ lists its operation heads as files that another JJ process may be
+# replacing at that moment. When one vanishes mid-read, JJ fails with
+# "Failed to read operation heads" before it changes anything, which happened
+# whenever several sessions ran JJ in the same repository (2026-10-07). Such a
+# failure is retried; every other one is final.
+const LOCAL_ATTEMPTS = 3
+const OPERATION_HEADS_RACE = 'operation heads'
+
+# How long to wait before retrying a local command whose `attempt` failed with
+# `stderr`, or null when it fails for good.
+def local-retry-delay [attempt: int, stderr: string] {
+    if $attempt >= $LOCAL_ATTEMPTS or not ($stderr | str contains $OPERATION_HEADS_RACE) { return null }
+    500ms * $attempt
+}
+
+# `complete` for a local command, retried while it loses JJ's operation-heads
+# race to another process.
+def local-complete [command: closure] {
+    mut attempt = 1
+    loop {
+        let result = (do $command | complete)
+        let delay = (local-retry-delay $attempt $result.stderr)
+        if $result.exit_code == 0 or $delay == null { return $result }
+        sleep $delay
+        $attempt += 1
+    }
+}
+
+def run-command [label: string, command: closure] {
+    report-command $label (local-complete $command)
+}
+
+# Print a finished command's output, and fail with `label` if it failed.
+def report-command [label: string, result: record] {
+    if ($result.stdout | is-not-empty) { print --no-newline $result.stdout }
+    if ($result.stderr | is-not-empty) {
+        # JJ reports a no-op fetch, bookmark move, or push only as "Nothing
+        # changed.", which says nothing about which step it was.
+        let stderr = ($result.stderr | str replace --all --regex '(?m)^Nothing changed\.$' $"($label): nothing changed.")
+        print --stderr --no-newline $stderr
+    }
+    if $result.exit_code != 0 {
+        error make { msg: $"($label) failed with exit code ($result.exit_code)" }
+    }
+    $result.stdout | str trim
+}
+
+def git-command [label: string, command: closure] {
+    let result = (local-complete $command)
+    if $result.exit_code != 0 {
+        error make { msg: $"($label) failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
+    }
+    $result.stdout | str trim
+}
+
+def git-worktree [path: string, main: string] {
+    let head = (git-command "reading worktree HEAD" { ^git -C $path rev-parse HEAD })
+    let short_head = ($head | str substring 0..6)
+    let branch_result = (^git -C $path symbolic-ref --short -q HEAD | complete)
+    let branch = if $branch_result.exit_code == 0 and ($branch_result.stdout | str trim | is-not-empty) {
+        $branch_result.stdout | str trim
+    } else {
+        "detached"
+    }
+    let dirty_result = (^git -C $path status --porcelain | complete)
+    if $dirty_result.exit_code != 0 {
+        error make { msg: $"Could not inspect worktree ($path): ($dirty_result.stderr | str trim)" }
+    }
+    let dirty = if ($dirty_result.stdout | str trim | is-empty) { "clean" } else { "dirty" }
+    let main_in_head = (^git -C $path merge-base --is-ancestor $main HEAD | complete).exit_code == 0
+    let head_in_main = (^git -C $path merge-base --is-ancestor HEAD $main | complete).exit_code == 0
+    let state = if $head == $main {
+        "current"
+    } else if $main_in_head {
+        "ahead"
+    } else if $head_in_main {
+        "behind"
+    } else {
+        "diverged"
+    }
+    let jj_result = (^jj --repository $path root | complete)
+    let vcs = if $jj_result.exit_code == 0 { "jj" } else { "git" }
+    {
+        path: $path
+        branch: $branch
+        head: $short_head
+        dirty: $dirty
+        state: $state
+        vcs: $vcs
+    }
+}
+
+def current-change [template: string] {
+    let result = (local-complete { ^jj log -r @ --no-graph -T $template })
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | str trim
+}
+
+def revision-id [revision: string] {
+    let result = (local-complete { ^jj log -r $revision --no-graph -T 'commit_id' })
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | str trim
+}
+
+def git-context [] {
+    let root = (^jj root | complete)
+    let backend = (^jj git root | complete)
+    if $root.exit_code != 0 or $backend.exit_code != 0 {
+        error make { msg: "Could not locate this JJ workspace and its Git backend." }
+    }
+    { GIT_DIR: ($backend.stdout | str trim) GIT_WORK_TREE: ($root.stdout | str trim) }
+}
+
+# Tangled hosts main and every topic branch. `ci land` is the only path to
+# main: it fast-forwards main to a head the landing gate has already passed.
+const TRUNK_REMOTE = "tangled"
+# GitHub mirrors main, and its Actions can gate a landing in the spindle's
+# place with `ci land --clearance github`. Its rules accept only fast-forwards.
+const GITHUB_REMOTE = "origin"
+const GITHUB_REQUIRED_CHECKS = ["impact classification" "nix flake checks"]
+const TANGLED_INDEX = "https://api.tangled.org"
+const TANGLED_WEB = "https://tangled.org"
+const IDENTITY_RESOLVER = "https://slingshot.microcosm.blue"
+
+# Tangled's knot refuses an address that holds too many git operations at
+# once, which happens whenever several sessions fetch or push together. The
+# refusal is transient, so a remote command waits and tries again.
+const REMOTE_ATTEMPTS = 5
+const RATE_LIMITED = 'too many concurrent operations'
+
+# How long to wait before retrying a remote command whose `attempt` failed
+# with `stderr`, or null when it fails for good: any other error, or the last
+# attempt. The wait doubles from 2 seconds.
+def remote-retry-delay [attempt: int, stderr: string] {
+    if $attempt >= $REMOTE_ATTEMPTS or not ($stderr | str contains $RATE_LIMITED) { return null }
+    2sec * (2 ** ($attempt - 1))
+}
+
+# `complete` for a fetch or push, retried while the remote rate-limits it.
+# Jitter keeps sessions refused together from retrying together. Each retry
+# is reported under `remote`, and so is a retried command that then succeeds.
+def remote-complete [label: string, command: closure] {
+    mut attempt = 1
+    loop {
+        let result = (do $command | complete)
+        let delay = (remote-retry-delay $attempt $result.stderr)
+        if $result.exit_code == 0 or $delay == null {
+            if $attempt > 1 and $result.exit_code == 0 {
+                report-status done $"($label) went through on attempt ($attempt)" --id remote
+            }
+            return $result
+        }
+        let retry = $"($label): the remote is rate-limiting this address; trying again in ($delay) \(attempt ($attempt + 1) of ($REMOTE_ATTEMPTS))."
+        print --stderr $retry
+        report-status working $retry --id remote
+        sleep ($delay + (random int 0..1000 | into duration --unit ms))
+        $attempt += 1
+    }
+}
+
+def run-remote [label: string, command: closure] {
+    report-command $label (remote-complete $label $command)
+}
+
+def xrpc [service: string, method: string, params: record] {
+    let response = (http get --full --allow-errors $"($service)/xrpc/($method)?($params | url build-query)")
+    let body = if ($response.body | describe) == "string" {
+        try { $response.body | from json } catch { $response.body }
+    } else { $response.body }
+    if $response.status != 200 {
+        error make { msg: $"($method) on ($service) failed with HTTP ($response.status): ($body | to json --raw)" }
+    }
+    $body
+}
+
+# The Tangled repository behind the trunk remote. Its URL names the owner's
+# handle and the repository; the repository record carries the repo DID that
+# the index and spindle APIs key on, and the spindle that runs its pipelines.
+def tangled-repo [] {
+    let remotes = (git-command "listing remotes" { ^jj git remote list } | lines | parse "{name} {url}")
+    let url = ($remotes | where name == $TRUNK_REMOTE | get --optional 0.url)
+    if $url == null { error make { msg: $"This repository has no ($TRUNK_REMOTE) remote." } }
+    let location = ($url | parse --regex '^(?:[^@/]+@[^:]+:|https?://[^/]+/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$' | get --optional 0)
+    if $location == null { error make { msg: $"Cannot read an owner and repository from ($url)." } }
+    let owner = ($location.owner | str trim --left --char "@")
+    let did = if ($owner | str starts-with "did:") {
+        $owner
+    } else {
+        (xrpc $IDENTITY_RESOLVER "com.atproto.identity.resolveHandle" { handle: $owner }).did
+    }
+    let record = (xrpc $TANGLED_INDEX "sh.tangled.repo.getRepo" { repo: $"at://($did)/sh.tangled.repo/($location.name)" })
+    {
+        did: $record.value.repoDid
+        spindle: ($record.value.spindle? | default "")
+        web: $"($TANGLED_WEB)/($owner)/($location.name)"
+    }
+}
+
+# Open pull requests with the branch each one proposes.
+def open-pulls [repo: record] {
+    (xrpc $TANGLED_INDEX "sh.tangled.repo.listPulls" { subject: $repo.did status: "open" limit: 100 }).items
+    | each {|item| { title: $item.value.title branch: ($item.value.source?.branch? | default "") uri: $item.uri } }
+}
+
+# The spindle's verdict on one commit: success once every workflow passed,
+# failed as soon as one failed, timed out, or was cancelled, missing before any
+# pipeline started, and running otherwise.
+def pipeline-state [repo: record, commit: string] {
+    if ($repo.spindle | is-empty) {
+        error make { msg: "The Tangled repository has no spindle, so no pipeline can gate landing. Select one in its settings." }
+    }
+    # A spindle that has not recorded the push yet omits `pipelines`.
+    let pipelines = ((xrpc $"https://($repo.spindle)" "sh.tangled.ci.queryPipelines" { repo: $repo.did commits: $commit }).pipelines? | default [])
+    let pipeline = ($pipelines | where commit == $commit | get --optional 0)
+    let workflows = if $pipeline == null { [] } else { $pipeline.workflows }
+    let state = if ($workflows | is-empty) {
+        "missing"
+    } else if ($workflows | any {|workflow| $workflow.status in ["failed" "timeout" "cancelled"] }) {
+        "failed"
+    } else if ($workflows | all {|workflow| $workflow.status == "success" }) {
+        "success"
+    } else {
+        "running"
+    }
+    { state: $state workflows: $workflows }
+}
+
+# The GitHub repository behind the mirror remote, as `owner/name`.
+def github-repo [] {
+    let remotes = (git-command "listing remotes" { ^jj git remote list } | lines | parse "{name} {url}")
+    let url = ($remotes | where name == $GITHUB_REMOTE | get --optional 0.url)
+    if $url == null { error make { msg: $"This repository has no ($GITHUB_REMOTE) remote." } }
+    let location = ($url | parse --regex 'github\.com[:/](?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$' | get --optional 0)
+    if $location == null { error make { msg: $"($url) is not a GitHub repository." } }
+    $"($location.owner)/($location.name)"
+}
+
+# GitHub's verdict on one commit, in the spindle's shape: the newest run of
+# each required check decides, and a check that has not reported is missing.
+# A skipped run proves nothing, so it counts as not having reported.
+def github-checks-state [repo: string, commit: string] {
+    let runs = (git-command "reading GitHub check runs" {
+        ^gh api --paginate $"repos/($repo)/commits/($commit)/check-runs?per_page=100" --jq '.check_runs[] | {name, status, conclusion, id}'
+    } | lines | where {|line| $line | is-not-empty } | each {|line| $line | from json }
+    | where {|run| $run.conclusion not-in ["skipped" "neutral"] })
+    let workflows = ($GITHUB_REQUIRED_CHECKS | each {|name|
+        let matching = ($runs | where name == $name)
+        let run = if ($matching | is-empty) { null } else { $matching | sort-by id | last }
+        let status = if $run == null {
+            "missing"
+        } else if $run.status != "completed" {
+            $run.status
+        } else if $run.conclusion == "success" {
+            "success"
+        } else {
+            "failed"
+        }
+        { name: $name status: $status }
+    })
+    let state = if ($workflows | any {|workflow| $workflow.status == "failed" }) {
+        "failed"
+    } else if ($workflows | all {|workflow| $workflow.status == "success" }) {
+        "success"
+    } else if ($workflows | all {|workflow| $workflow.status == "missing" }) {
+        "missing"
+    } else {
+        "running"
+    }
+    { state: $state workflows: $workflows }
+}
+
+# Local clearance and the refactor proof are the heaviest things `ci` runs:
+# the flake checks may take 9 GiB, and the proof evaluates every host twice.
+# Two sessions that landed at once exhausted this 16 GiB machine, and the
+# kernel killed one landing's checks (2026-10-07). Both therefore run under
+# one lock shared by every workspace and session: a file under the state
+# directory that names its holder.
+def local-checks-lock-path [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "local-checks.lock"
+}
+
+# A process's start time in clock ticks since boot, or null once it has
+# exited. With the pid, it names one process even after the pid is reused.
+def process-start [pid: int] {
+    try {
+        open --raw $"/proc/($pid)/stat" | split row ")" | last | str trim | split row " " | get 19
+    } catch { null }
+}
+
+# Whether a lock holder still runs: its `ci` process, or the transient unit
+# running its checks, which outlives a `ci` that was cancelled or killed.
+def lock-holder-alive [holder: record] {
+    let start = (process-start $holder.pid)
+    if $start != null and $start == $holder.start { return true }
+    if ($holder.unit? | is-empty) { return false }
+    try { (^systemctl --user is-active --quiet $holder.unit | complete).exit_code == 0 } catch { false }
+}
+
+# The topic `commit` belongs to, as its change id and title, for the wait
+# message other sessions print. Outside a JJ workspace, the commit itself.
+def lock-topic [commit: string] {
+    let named = (try {
+        ^jj log -r $commit --no-graph -T 'change_id.short(8) ++ " " ++ description.first_line().escape_json()' | complete
+    } catch { { exit_code: 1 stdout: "" } })
+    if $named.exit_code == 0 and ($named.stdout | str trim | is-not-empty) {
+        $named.stdout | str trim
+    } else {
+        $commit | str substring 0..11
+    }
+}
+
+# Replace the lock file whose contents hash to `expected` ("absent" for no
+# file) with `next`, or remove it when `next` is empty, unless another session
+# changed it first. flock(1) on a guard file serializes the comparison and the
+# write, so two sessions that both find the lock free, or its holder dead,
+# cannot both take it.
+def swap-local-checks-lock [lock: string, expected: string, next: string] {
+    let swap = 'let current = (try { open --raw $env.LOCK | into binary | hash sha256 } catch { "absent" }); if $current != $env.EXPECTED { exit 3 }; if ($env.NEXT | is-empty) { rm --force $env.LOCK } else { $env.NEXT | save --force $env.LOCK }'
+    let result = (with-env { LOCK: $lock EXPECTED: $expected NEXT: $next } {
+        ^flock $"($lock).guard" $nu.current-exe --no-config-file --commands $swap | complete
+    })
+    if $result.exit_code not-in [0 3] {
+        error make { msg: $"updating ($lock) failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
+    }
+    $result.exit_code == 0
+}
+
+# Take the lock for `claim` if it is free or its holder has died. Returns null
+# once it is taken, or else the record of the live session holding it.
+def claim-local-checks-lock [lock: string, claim: string] {
+    loop {
+        let raw = (try { open --raw $lock | into binary } catch { null })
+        let holder = (try { $raw | decode utf-8 | from json } catch { null })
+        if $holder != null and (try { lock-holder-alive $holder } catch { false }) { return $holder }
+        let current = if $raw == null { "absent" } else { $raw | hash sha256 }
+        if (swap-local-checks-lock $lock $current $claim) { return null }
+    }
+}
+
+# Run `body` under the local checks lock, waiting while another live session
+# holds it and printing that session once per holder. `unit` names the
+# transient unit that will run the checks: the lock stays held while it runs,
+# even if this process dies. The lock is released however `body` ends; if
+# this process is killed instead, the next session finds it dead and takes
+# the lock over.
+def with-local-checks-lock [commit: string, body: closure, --unit: string] {
+    let lock = (local-checks-lock-path)
+    mkdir ($lock | path dirname)
+    let claim = ({
+        topic: (lock-topic $commit)
+        pid: $nu.pid
+        start: (process-start $nu.pid)
+        unit: $unit
+        workspace: $env.PWD
+    } | to json --raw)
+    mut announced = {}
+    loop {
+        let holder = (claim-local-checks-lock $lock $claim)
+        if $holder == null { break }
+        if $holder != $announced {
+            let waiting = $"Waiting for local checks of ($holder.topic? | default 'another topic') \(pid ($holder.pid? | default '?')) to finish."
+            print $waiting
+            # Blocked on another session, not a person, so no --kind.
+            report-status blocked $waiting --id local-checks
+            $announced = $holder
+        }
+        sleep 5sec
+    }
+    if $announced != {} { report-status clear --id local-checks }
+    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err.msg } }
+    swap-local-checks-lock $lock ($claim | hash sha256) "" | ignore
+    if $outcome.error != null { error make { msg: $outcome.error } }
+    $outcome.value
+}
+
+# Two sessions that dispatched or landed the same topic at once rebased it
+# separately, splitting it into divergent copies that then stopped every
+# landing (2026-10-07). So one process at a time may move a topic: a lock per
+# change ID under the state directory, claimed the way the local checks lock
+# is, names its holder.
+def topic-lock-path [change: string] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "topics" $"($change).lock"
+}
+
+# Run `body` holding the lock for topic `change`, or fail at once naming the
+# live process that holds it: waiting would only move the topic twice.
+def with-topic-lock [change: string, body: closure] {
+    let lock = (topic-lock-path $change)
+    mkdir ($lock | path dirname)
+    let claim = ({
+        topic: (lock-topic $change)
+        pid: $nu.pid
+        start: (process-start $nu.pid)
+        workspace: $env.PWD
+    } | to json --raw)
+    let holder = (claim-local-checks-lock $lock $claim)
+    if $holder != null {
+        error make { msg: $"Another `ci` \(pid ($holder.pid? | default '?') in ($holder.workspace? | default 'another workspace')) is already dispatching or landing ($holder.topic? | default 'this topic'). Let it finish, or stop it, rather than moving the topic twice." }
+    }
+    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err.msg } }
+    swap-local-checks-lock $lock ($claim | hash sha256) "" | ignore
+    if $outcome.error != null { error make { msg: $outcome.error } }
+    $outcome.value
+}
+
+# How a nix-fast-build run that exited with `exit_code` went, judged by the
+# result file it writes once it finishes. A signal, or a failure that left no
+# failed build or evaluation there, means something killed the run rather
+# than a check failing: on this machine, almost always memory. An evaluation
+# that outgrew the memory budget counts as killed too; nix-eval-jobs reports
+# it as failed once a retry on its own runs out as well.
+def checks-outcome [exit_code: int, results: string] {
+    if $exit_code == 0 { return { status: "success" } }
+    let failed = ((try { open $results | get results } catch { [] }) | where {|result|
+        not $result.success and ($result.error? | default "") !~ "exceeded the memory budget"
+    })
+    # Nu reports death by a signal as the negated signal number; systemd-run
+    # exits 255 when the unit's main process died from one.
+    if $exit_code < 0 or $exit_code == 255 or ($failed | is-empty) {
+        let ended = if $exit_code < 0 { $"signal (-1 * $exit_code)" } else { $"exit status ($exit_code)" }
+        return { status: "killed" error: $"likely out of memory, ($ended)" }
+    }
+    let checks = ($failed | each {|result|
+        match $result.type {
+            "BUILD" => $"($result.attr) did not build"
+            "EVAL" => $"($result.attr) did not evaluate"
+            _ => $"($result.attr) failed to ($result.type | str lowercase)"
+        }
+    })
+    { status: "failed" error: ($checks | str join ", ") }
+}
+
+# The exit code of checks that ran in a transient unit, in Nu's convention (a
+# signal N as -N), from the status their shell `recorded` and systemd-run's own
+# exit status; null when the run was stopped. systemd counts a stop's SIGTERM
+# as a clean exit, so a stopped run records nothing and systemd-run exits 0,
+# while a unit killed whole records nothing and keeps systemd-run's status.
+def unit-exit-code [recorded: string, systemd_run: int] {
+    if ($recorded | is-empty) { return (if $systemd_run == 0 { null } else { $systemd_run }) }
+    let code = ($recorded | into int)
+    if $code > 128 { -1 * ($code - 128) } else { $code }
+}
+
+# Build every flake check at `commit` on this machine with the command the
+# spindle workflow runs, streaming the build log. Outputs already in the local
+# store or a binary cache are skipped, so a topic that leaves the system
+# closures alone builds only the cheap checks. Evaluation uses one worker:
+# den-host-evaluation alone needs about 6 GiB once a flake input brings its
+# own nixpkgs, the per-worker size is only a soft limit checked between
+# attributes, and two workers beside open agent sessions exhausted this
+# 16 GiB machine and froze it (2026-10-07).
+#
+# The checks run in their own transient user service with a memory cap, so
+# when memory runs out the kernel or systemd-oomd stops that unit rather than
+# the terminal or agent app that started `ci land`. They hold the local checks
+# lock, so another session's landing waits rather than running beside them.
+# systemd-run exits 0 for a service that a stop ended, which once let two
+# topics land without their checks finishing (2026-10-07), so a shell in the
+# unit records the checks' own exit status, and a run that recorded none fails.
+def local-checks-state [commit: string] {
+    let unit = if ($env.XDG_RUNTIME_DIR? | is-empty) { null } else { $"ci-local-checks-($commit | str substring 0..7)" }
+    let outcome = (with-local-checks-lock $commit --unit $unit {
+        with-commit-trees { head: $commit } {|trees|
+            let flake = $"path:($trees.head)"
+            let results = ($trees.head | path dirname | path join "checks.json")
+            let status = ($trees.head | path dirname | path join "checks.status")
+            let checks = [(which nix | get 0.path) --accept-flake-config run --inputs-from $flake nixpkgs#nix-fast-build -- --no-nom --skip-cached --eval-workers 1 --eval-max-memory-size 6144 --result-file $results --flake $"($flake)#checks.x86_64-linux"]
+            let ended = try {
+                if $unit == null {
+                    run-external ...$checks
+                } else {
+                    ^systemd-run --user --wait --pipe --collect --quiet --same-dir $"--unit=($unit)" -p MemoryHigh=7G -p MemoryMax=9G -p MemorySwapMax=2G -- /bin/sh -c '"$@"; echo $? > "$0"' $status ...$checks
+                }
+                { exit_code: 0 }
+            } catch {|err|
+                if $err.exit_code? == null { { error: $err.msg } } else { { exit_code: $err.exit_code } }
+            }
+            if $ended.error? != null { return { status: "failed" error: $ended.error } }
+            let exit_code = if $unit == null { $ended.exit_code } else {
+                unit-exit-code (try { open --raw $status | str trim } catch { "" }) $ended.exit_code
+            }
+            if $exit_code == null { return { status: "killed" error: "stopped before it finished" } }
+            checks-outcome $exit_code $results
+        }
+    })
+    let state = if $outcome.status == "success" { "success" } else { "failed" }
+    { state: $state workflows: [{ name: "flake checks" status: $outcome.status error: ($outcome.error? | default "") }] }
+}
+
+# The check that gates a landing: the flake checks built on this machine, the
+# repository's spindle, or GitHub Actions on the mirror.
+def landing-gate [gate: string, repo: record] {
+    match $gate {
+        "local" => {
+            {
+                name: $"local flake checks on (sys host | get hostname)"
+                probe: {|commit| local-checks-state $commit }
+                hint: ""
+                started_by_hand: false
+            }
+        }
+        "spindle" => {
+            if ($repo.spindle | is-empty) {
+                error make { msg: "The Tangled repository has no spindle, so no pipeline can gate landing. Select one in its settings." }
+            }
+            {
+                name: $repo.spindle
+                probe: {|commit| pipeline-state $repo $commit }
+                hint: "Pushes do not trigger the spindle; start flake-checks.yml on this branch by hand on Tangled."
+                started_by_hand: true
+            }
+        }
+        "github" => {
+            let github = (github-repo)
+            {
+                name: $"GitHub Actions on ($github)"
+                probe: {|commit| github-checks-state $github $commit }
+                hint: "If none started, check that .github/workflows/nix-ci.yml runs on pushes to jj-* branches."
+                started_by_hand: false
+            }
+        }
+        _ => { error make { msg: $"Unknown clearance ($gate); use local, spindle, or github." } }
+    }
+}
+
+# Poll the gate until it passes `commit`. Stop at the first failure; never
+# rebase or push. A gate that must be started by hand reports blocked on a
+# person while it has not started.
+def wait-for-pipeline [gate: record, commit: string, timeout: duration] {
+    let deadline = (date now) + $timeout
+    mut last = ""
+    report-status working $"Waiting for ($gate.name)" --id clearance
+    loop {
+        let pipeline = (do $gate.probe $commit)
+        if $pipeline.state == "success" {
+            report-status done $"($gate.name) passed" --id clearance
+            return
+        }
+        if $pipeline.state == "failed" {
+            let failed = ($pipeline.workflows | where status != "success" | each {|workflow|
+                let detail = if ($workflow.error? | is-empty) { "" } else { $" \(($workflow.error | lines | last))" }
+                $"($workflow.name): ($workflow.status)($detail)"
+            })
+            report-status error $"($gate.name) rejected the head" --id clearance
+            error make { msg: $"($gate.name) rejected ($commit | str substring 0..11): ($failed | str join '; '). Leave the task open." }
+        }
+        let status = if $pipeline.state == "missing" {
+            $"waiting for ($gate.name) to start. ($gate.hint)" | str trim
+        } else {
+            $"($pipeline.workflows | where status != 'success' | length) workflow\(s) running"
+        }
+        if $status != $last {
+            print $"(date now | format date '%H:%M:%S') ($status)"
+            if $pipeline.state == "missing" and $gate.started_by_hand {
+                report-status blocked $gate.hint --id clearance --kind permission
+            } else {
+                report-status working $"($gate.name): ($status)" --id clearance
+            }
+            $last = $status
+        }
+        if (date now) > $deadline {
+            report-status error $"No passing pipeline after ($timeout)" --id clearance
+            error make { msg: $"No passing pipeline for ($commit | str substring 0..11) after ($timeout). ($gate.hint)" }
+        }
+        sleep 30sec
+    }
+}
+
+def current-topic-id [] {
+    current-change 'change_id'
+}
+
+def publication-state-path [] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    $root | path join ".jj" "jj-ci-publication.json"
+}
+
+def publication-state [] {
+    let path = (publication-state-path)
+    if ($path | path exists) { open $path } else { {} }
+}
+
+def save-publication-state [state: record] {
+    $state | to json | save --force (publication-state-path)
+}
+
+def publication-topics [] {
+    (publication-state) | get topics? | default {}
+}
+
+def slugify [title: string] {
+    $title
+    | str lowercase
+    | str replace --all --regex "[^a-z0-9]+" "-"
+    | str substring 0..47
+    # Trim after truncation so a cut at a word boundary leaves no dash.
+    | str trim --char "-"
+}
+
+def publication-slug [] {
+    slugify (current-change "description.first_line()")
+}
+
+def legacy-publication-bookmark [bookmark: string] {
+    let result = (^jj log -r $"($bookmark) & @" --no-graph -T 'commit_id' | complete)
+    $result.exit_code == 0 and ($result.stdout | str trim | is-not-empty)
+}
+
+# Remembers the bookmark under the current topic's change id, so it survives
+# title edits without leaking into whatever other topic next runs in this
+# workspace (a single unscoped bookmark previously caused `publish` to reuse
+# an already-merged topic's bookmark and PR).
+def remember-publication-bookmark [bookmark: string] {
+    let topics = (publication-topics) | upsert (current-topic-id) $bookmark
+    save-publication-state { topics: $topics }
+}
+
+def forget-publication-bookmark [topic_id?: string] {
+    let topic_id = ($topic_id | default (current-topic-id))
+    let topics = (publication-topics)
+    if $topic_id in $topics {
+        save-publication-state { topics: ($topics | reject $topic_id) }
+    }
+}
+
+def publication-bookmark [topic_id?: string] {
+    let topic_id = ($topic_id | default (current-topic-id))
+    let topics = (publication-topics)
+    let remembered = if $topic_id in $topics {
+        $topics | get $topic_id
+    } else {
+        # Migrate the pre-per-topic single-bookmark state, but only if it
+        # still names the bookmark actually checked out right now — otherwise
+        # a stale entry left by a different, already-finished topic would
+        # leak onto whatever topic asks next.
+        let legacy_single = (publication-state) | get bookmark? | default ""
+        if ($legacy_single | is-not-empty) and (legacy-publication-bookmark $legacy_single) {
+            $legacy_single
+        } else {
+            ""
+        }
+    }
+    if ($remembered | is-not-empty) { return $remembered }
+
+    let legacy = $"jj-($topic_id)"
+    if (legacy-publication-bookmark $legacy) { return $legacy }
+
+    new-publication-bookmark $topic_id (publication-slug)
+}
+
+def new-publication-bookmark [topic_id: string, slug: string] {
+    let short_id = ($topic_id | str substring 0..7)
+    let label = if ($slug | is-empty) { "topic" } else { $slug }
+    $"jj-($label)-($short_id)"
+}
+
+def push-bookmark [remote: string, bookmark: string] {
+    # jj refuses to create a new bookmark on a remote it does not track.
+    run-command $"tracking ($bookmark)@($remote)" {
+        ^jj bookmark track $"($bookmark)@($remote)"
+    } | ignore
+    run-remote $"pushing ($bookmark) to ($remote)" {
+        ^jj git push --remote $remote --bookmark $bookmark
+    } | ignore
+}
+
+def push-topic-bookmark [bookmark: string] {
+    push-bookmark $TRUNK_REMOTE $bookmark
+}
+
+def remote-bookmark-revset [bookmark: string, remote: string = $TRUNK_REMOTE] {
+    $"remote_bookmarks\(exact:'($bookmark)', exact:'($remote)')"
+}
+
+# Delete a delivered topic's bookmark locally, on the trunk remote, and on the
+# GitHub mirror if a GitHub-gated landing pushed it there.
+def delete-topic-bookmark [bookmark: string] {
+    if (revset-change-ids (bookmark-revset $bookmark) | is-not-empty) {
+        run-command $"deleting ($bookmark)" { ^jj bookmark delete $bookmark } | ignore
+    }
+    for remote in [$TRUNK_REMOTE $GITHUB_REMOTE] {
+        if (revset-change-ids (remote-bookmark-revset $bookmark $remote) | is-not-empty) {
+            run-remote $"deleting ($bookmark) from ($remote)" {
+                ^jj git push --remote $remote --bookmark $bookmark
+            } | ignore
+        }
+    }
+}
+
+# Whether the trunk remote's copy of a topic bookmark is already on main.
+def topic-landed [bookmark: string] {
+    revset-change-ids $"(remote-bookmark-revset $bookmark) & ::main@tangled" | is-not-empty
+}
+
+# Published topics: every local `jj-*` bookmark that is on the trunk remote and
+# has work above main. A topic built on another one is stacked on the nearest
+# such topic below it, so the graph alone records every stack.
+def topic-bookmarks [] {
+    let listing = (git-command "listing topic bookmarks" {
+        ^jj bookmark list -T 'if(!remote && normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*'
+    })
+    let topics = ($listing | lines | where {|line| $line | is-not-empty } | each {|line|
+        let fields = ($line | split row "\t")
+        { name: ($fields | first) commit: ($fields | last) }
+    } | where {|topic|
+        let pushed = (revset-change-ids (remote-bookmark-revset $topic.name) | is-not-empty)
+        $pushed and (revset-change-ids $"main@tangled..(bookmark-revset $topic.name)" | is-not-empty)
+    })
+    $topics | each {|topic|
+        let below = ($topics | where {|other|
+            $other.commit != $topic.commit and (revset-change-ids $"(bookmark-revset $other.name) & ::(bookmark-revset $topic.name) ~ ::main@tangled" | is-not-empty)
+        })
+        let parent = if ($below | is-empty) {
+            null
+        } else {
+            let heads = (revset-change-ids $"heads\(($below | each {|other| bookmark-revset $other.name } | str join ' | '))")
+            $below | where {|other| (revset-change-ids (bookmark-revset $other.name) | first) in $heads } | first | get name
+        }
+        $topic | insert parent $parent
+    }
+}
+
+def topic-revisions [] {
+    let result = (^jj log -r 'main@tangled..@' --no-graph -T 'change_id ++ "\t" ++ commit_id ++ "\t" ++ description.first_line() ++ "\n"' | complete)
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout
+    | lines
+    | where {|line| $line | str trim | is-not-empty }
+    | reverse
+    | each {|line|
+        let fields = ($line | split row "\t")
+        {
+            change_id: ($fields | get 0)
+            commit_id: ($fields | get 1)
+            description: ($fields | skip 2 | str join "\t")
+        }
+    }
+}
+
+def push-tangled-stack [] {
+    let series = (current-topic-id)
+    let revisions = (topic-revisions)
+    if ($revisions | is-empty) {
+        error make { msg: "The current topic has no revisions above main@tangled." }
+    }
+
+    print $"Publishing ($revisions | length) Tangled stack layer\(s) for series ($series):"
+    for revision in $revisions {
+        let branch = $"stack/($series)/($revision.change_id)"
+        run-remote $"pushing ($branch) to tangled" {
+            ^jj git push --remote tangled --named $"($branch)=($revision.commit_id)"
+        } | ignore
+        print $"  ($branch): ($revision.description)"
+    }
+    print "Select `Submit as stacked PRs` in Tangled for these branches."
+}
+
+def checkpoint [label: string] {
+    let root = (run-command "locating the workspace" { ^jj root })
+    let operation = (run-command "recording a recovery point" {
+        ^jj op log -n 1 --no-graph -T 'self.id()'
+    })
+    let directory = ($root | path join ".jj" "jj-ci-checkpoints")
+    mkdir $directory
+    $operation | save --force ($directory | path join $"(date now | format date '%Y%m%dT%H%M%S%f')-($label)")
+    print $"Recovery point: jj op restore ($operation)"
+}
+
+def session-owner [] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    let path = ($root | path join ".jj" "codex-session.json")
+    if ($path | path exists) { open $path } else { null }
+}
+
+# How a Codex task's ownership record ends. `delivered` and `discarded` come
+# from `finish` and `abandon`; `released` frees a workspace whose task left its
+# change behind, and says nothing about the topic, which may continue elsewhere.
+const OWNER_ENDINGS = ["delivered" "discarded" "released"]
+
+# The state an ownership record declares: none, active, or one of the endings.
+# A record from before `state` has only `finished`, which a hand edit could set
+# as easily as `finish`, so it proves release but never delivery. Keep in step
+# with owner-status in codex-session.nu and context-status.nu.
+def owner-status [owner: any] {
+    if $owner == null { return "none" }
+    let state = ($owner.state? | default "")
+    if $state == "active" or $state in $OWNER_ENDINGS { return $state }
+    if ($owner.finished? | default false) { "released" } else { "active" }
+}
+
+# Run from a Git worktree nested in the repository, such as a Claude Code
+# worktree, `jj` resolves to the shared checkout above it, so a topic command
+# there would move or rewrite that checkout's working copy, as one session's
+# `ci new` once moved another's (2026-10-07).
+def require-jj-workspace-here [] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    let worktree = (enclosing-git-worktree $env.PWD $root)
+    if $worktree != null {
+        error make { msg: $"($worktree) is a Git worktree, not a JJ workspace, so this command would act on the shared checkout at ($root). Run `ci start NAME` here, then work in ($worktree)/.jj-workspaces/NAME." }
+    }
+}
+
+def require-owned-change [topic_id?: string] {
+    require-jj-workspace-here
+    let owner = (session-owner)
+    if (owner-status $owner) == "active" {
+        if $owner.change_id != ($topic_id | default (current-topic-id)) {
+            error make { msg: "This workspace is on a different change from its active Codex task. Resolve ownership before continuing." }
+        }
+    }
+    require-topic-checked-out
+}
+
+# Whether the working copy has wandered off the topic that `ci start`
+# recorded, as after a manual `jj new main`: it is an empty change the topic is
+# not an ancestor of, while the topic still holds unlanded work. A topic that
+# was abandoned, squashed away, or landed no longer counts, and a stack or a
+# split keeps the topic below the working copy, so neither trips this.
+def topic-stranded [facts: record] {
+    $facts.recorded and $facts.visible and not $facts.landed and not $facts.ancestor and $facts.working_copy_empty and not $facts.topic_empty
+}
+
+def topic-facts [] {
+    let root = (^jj root | complete)
+    if $root.exit_code != 0 { error make { msg: ($root.stderr | str trim) } }
+    let marker = (owned-workspace-marker ($root.stdout | str trim))
+    let topic = if ($marker | path exists) { open $marker | get change_id? } else { null }
+    if $topic == null {
+        return { recorded: false visible: false landed: false ancestor: false working_copy_empty: false topic_empty: false topic: null }
+    }
+    let has = {|revset| revset-change-ids $"change_id\(($topic)\) & \(($revset)\)" | is-not-empty }
+    {
+        recorded: true
+        visible: (do $has "all()")
+        landed: (do $has "::main@tangled")
+        ancestor: (do $has "::@")
+        working_copy_empty: ((current-change "empty") == "true")
+        topic_empty: (do $has "empty() & description(exact:\"\")")
+        topic: $topic
+    }
+}
+
+def require-topic-checked-out [] {
+    let facts = (topic-facts)
+    if not (topic-stranded $facts) { return }
+    let short = ($facts.topic | str substring 0..7)
+    let title = (revision-field $"change_id\(($facts.topic)\)" "description.first_line()")
+    let stray = (current-change "change_id.short()")
+    error make { msg: $"The working copy \(($stray)) has left this workspace's topic ($short) \"($title)\", as after `jj new main`. Return with `jj edit ($short)` and `jj abandon ($stray)`, or run `jj abandon ($short)` if the topic is meant to be dropped." }
+}
+
+def require-ready-change [] {
+    require-owned-change
+    if (current-change "conflict") == "true" {
+        error make { msg: "Resolve JJ conflicts before publishing." }
+    }
+    if (current-change "empty") == "true" {
+        error make { msg: "The current JJ change is empty." }
+    }
+    if ((current-change "description.first_line()") | is-empty) {
+        print "Describing the current JJ change."
+        run-command "describing the current JJ change" { ^jj-describe } | ignore
+        if ((current-change "description.first_line()") | is-empty) {
+            error make { msg: "jj-describe did not describe the current JJ change." }
+        }
+    }
+}
+
+def conflicted-revisions [stack: string = "::@"] {
+    let result = (^jj log -r $"conflicts\() & \(($stack)\)" --no-graph -T 'change_id ++ "\t" ++ description.first_line() ++ "\n"' | complete)
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | lines | where {|line| $line | str trim | is-not-empty } | each {|line|
+        let fields = ($line | split row "\t")
+        {
+            change_id: ($fields | first)
+            description: ($fields | skip 1 | str join "\t")
+        }
+    }
+}
+
+def print-conflicted-files [revisions: list, indent: string] {
+    for $revision in $revisions {
+        print $"($indent)($revision.change_id) ($revision.description)"
+        let files = (^jj resolve --list -r $revision.change_id | complete)
+        if $files.exit_code == 0 {
+            let paths = ($files.stdout | lines | where {|line| $line | str trim | is-not-empty })
+            for $path in $paths { print $"($indent)  ($path)" }
+        }
+    }
+}
+
+def print-conflicts [context: string] {
+    let revisions = (conflicted-revisions)
+    if ($revisions | is-empty) {
+        print $"($context): no conflicts in the current topic stack."
+        return false
+    }
+
+    print $"($context): ($revisions | length) conflicted revision\(s):"
+    print-conflicted-files $revisions "  "
+    print ""
+    print $"Topic tip before selecting a revision: (current-topic-id)"
+    print "Resolve each revision in order, then run `ci conflicts` again."
+    print "For a revision that is not @: run `jj edit CHANGE_ID`, edit or `jj resolve` its files, then return with `jj edit TOPIC_TIP`."
+    print "Do not re-run `ci rebase` until the current topic is conflict-free; the rebase already completed."
+    true
+}
+
+def fetch-trunk [] {
+    run-remote $"fetching ($TRUNK_REMOTE)" { ^jj git fetch --remote $TRUNK_REMOTE } | ignore
+}
+
+def rebase-topic [] {
+    require-owned-change
+    if (print-conflicts "Before rebase") {
+        error make { msg: "Resolve existing conflicts before rebasing onto main@tangled." }
+    }
+    checkpoint "rebase"
+    fetch-trunk
+    let moved = (other-workspaces-in 'roots(main@tangled..@)::')
+    run-command "rebasing the topic stack" {
+        ^jj rebase -s 'roots(main@tangled..@)' -o main@tangled --skip-emptied
+    } | ignore
+    update-moved-workspaces $moved
+    if (print-conflicts "Rebase completed") {
+        error make { msg: "Rebase completed with conflicts. Resolve them before continuing." }
+    }
+}
+
+def revset-change-ids [revset: string] {
+    let result = (local-complete { ^jj log -r $revset --no-graph -T 'change_id.short() ++ "\n"' })
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | lines | where {|line| $line | str trim | is-not-empty }
+}
+
+# Every change declares its effect on the built machines with an `Impact:`
+# trailer in its JJ description, ordered from least to most disruptive:
+#   refactor  every NixOS closure is unchanged (refactors, docs, CI, tooling)
+#   behavior  user-facing change; landing it cuts a CalVer release
+#   breaking  user-facing change whose description body lists manual steps
+const IMPACTS = ["refactor" "behavior" "breaking"]
+const IMPACT_TRAILER = '^(?i)impact:\s*(?P<value>\S+)\s*$'
+
+# The last `Impact:` trailer value in a description, lowercased, or "" when
+# there is none. Not null: `each` drops null results, which would hide an
+# unclassified revision from `combine-impacts`.
+def parse-impact [description: string] {
+    let values = ($description | lines | parse --regex $IMPACT_TRAILER | get value | str lowercase)
+    if ($values | is-empty) { "" } else { $values | last }
+}
+
+# A description without its subject line and `Impact:` trailer.
+def description-body [description: string] {
+    $description
+    | lines
+    | skip 1
+    | where {|line| $line | parse --regex $IMPACT_TRAILER | is-empty }
+    | str join "\n"
+    | str trim
+}
+
+# The impact of one topic from the impacts of its revisions. A topic lands as
+# a unit, so a refactor must not share one with a user-facing change: it would
+# lose its closure-neutral guarantee and ship inside a release. Returns
+# { impact, problem } with exactly one non-null.
+def combine-impacts [impacts: list] {
+    if ($impacts | is-empty) {
+        return { impact: null problem: "The topic has no revisions to classify." }
+    }
+    let invalid = ($impacts | where {|impact| $impact not-in $IMPACTS })
+    if ($invalid | is-not-empty) {
+        return { impact: null problem: $"Every revision needs an `Impact: ($IMPACTS | str join '|')` trailer." }
+    }
+    let user_facing = ($impacts | where {|impact| $impact != "refactor" })
+    if ($user_facing | is-empty) {
+        { impact: "refactor" problem: null }
+    } else if ($user_facing | length) != ($impacts | length) {
+        { impact: null problem: "This topic mixes refactor and user-facing revisions. Publish the refactor as its own topic, or as the parent layer of a stack if the change depends on it." }
+    } else if "breaking" in $user_facing {
+        { impact: "breaking" problem: null }
+    } else {
+        { impact: "behavior" problem: null }
+    }
+}
+
+# Sort key that lands refactors before user-facing changes.
+def impact-order [impact: any] {
+    if $impact == "refactor" { 0 } else { 1 }
+}
+
+# The next CalVer release for `date` (YYYY.MM.DD) given the existing tags.
+def next-version [date: string, tags: list<string>] {
+    let pattern = ('^' + ($date | str replace --all '.' '\.') + '\.(?P<serial>[0-9]+)$')
+    let serials = ($tags | parse --regex $pattern | get serial | into int)
+    let serial = if ($serials | is-empty) { 1 } else { ($serials | math max) + 1 }
+    $"($date).($serial)"
+}
+
+# Revisions in `base..@`, oldest first, with full descriptions.
+def layer-revisions [base: string] {
+    revisions-in $"($base)..@"
+}
+
+def revisions-in [revset: string] {
+    let result = (^jj log -r $revset --no-graph -T 'change_id.short() ++ "\t" ++ description.escape_json() ++ "\n"' | complete)
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout
+    | lines
+    | where {|line| $line | str trim | is-not-empty }
+    | reverse
+    | each {|line|
+        let fields = ($line | split row "\t")
+        { change_id: ($fields | first) description: ($fields | skip 1 | str join "\t" | from json) }
+    }
+}
+
+def require-impact [revisions: list] {
+    let missing = ($revisions | where {|revision| (parse-impact $revision.description) not-in $IMPACTS })
+    for revision in $missing {
+        print --stderr $"($revision.change_id): missing or invalid Impact trailer; add one with `jj describe -r ($revision.change_id)`."
+    }
+    let result = (combine-impacts ($revisions | each {|revision| parse-impact $revision.description }))
+    if $result.problem != null { error make { msg: $result.problem } }
+    let unexplained = ($revisions | where {|revision|
+        (parse-impact $revision.description) == "breaking" and (description-body $revision.description | is-empty)
+    })
+    if ($unexplained | is-not-empty) {
+        error make { msg: $"Describe the manual steps in the body of every breaking revision: ($unexplained | get change_id | str join ', ')." }
+    }
+    $result.impact
+}
+
+# Host name to toplevel derivation for every NixOS configuration in a flake.
+def closure-fingerprint [flake: string] {
+    git-command $"evaluating the NixOS closures of ($flake)" {
+        ^nix eval --json --no-update-lock-file $"($flake)#nixosConfigurations" --apply 'configs: builtins.mapAttrs (_: c: builtins.unsafeDiscardStringContext c.config.system.build.toplevel.drvPath) configs'
+    } | from json
+}
+
+# Hosts whose closure differs between two fingerprints, including added and
+# removed hosts.
+def closure-differences [base: record, head: record] {
+    $base | columns | append ($head | columns) | uniq | sort | where {|host|
+        ($base | get --optional $host) != ($head | get --optional $host)
+    }
+}
+
+def bookmark-revset [bookmark: string] {
+    $"bookmarks\(exact:'($bookmark)')"
+}
+
+# Move the commits of `tip` that are in neither `onto` nor main onto `onto`.
+# Commits that become empty were already delivered and are dropped. Returns
+# the revset of the restacked topic. With a workspace root, the rebase runs
+# there so that working copy moves with it instead of going stale.
+def restack [tip: string, onto: string, workspace?: string] {
+    let repository = if $workspace == null { [] } else { [--repository $workspace] }
+    if (revset-change-ids $"($onto) & ~::($tip)" | is-not-empty) {
+        run-command $"rebasing ($tip) onto ($onto)" {
+            ^jj ...$repository rebase -s $"roots\(::($tip) ~ ::($onto) ~ ::main@tangled)" -o $onto --skip-emptied
+        } | ignore
+    }
+    $"($onto)..($tip)"
+}
+
+# Names of the workspaces whose working copy is in `revset`.
+def workspaces-in [revset: string] {
+    let result = (^jj log -r $"\(($revset)) & working_copies\()" --no-graph -T 'working_copies.map(|w| w.name()).join("\n") ++ "\n"' | complete)
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | lines | where {|name| $name | str trim | is-not-empty } | uniq
+}
+
+def workspace-root [name: string] {
+    run-command $"locating workspace ($name)" { ^jj workspace root --name $name }
+}
+
+# Rewriting a change rebases its descendants, and every other workspace that
+# has one of them checked out goes stale: its files still show the old commit,
+# and JJ refuses to run there until `jj workspace update-stale`. Sessions kept
+# finding their workspaces stale after another session rebased or abandoned a
+# topic below theirs, and a switch once built a stale checkout (2026-10-07).
+# So a `ci` command that rewrites names the other workspaces it will move
+# before rewriting, and updates them afterwards. update-stale never
+# overwrites a file edited there since JJ last snapshotted it.
+def other-workspaces-in [revset: string] {
+    let current = (git-command "locating the workspace" { ^jj root })
+    workspaces-in $revset | where {|name|
+        let root = (^jj workspace root --name $name | complete)
+        $root.exit_code != 0 or ($root.stdout | str trim) != $current
+    }
+}
+
+# Whether `jj workspace update-stale` found nothing to do.
+def update-stale-noop [stderr: string] {
+    $stderr | str contains "working copy is not stale"
+}
+
+def update-moved-workspaces [names: list<string>] {
+    for name in $names {
+        let found = (^jj workspace root --name $name | complete)
+        let root = ($found.stdout | str trim)
+        if $found.exit_code != 0 or not ($root | path exists) { continue }
+        let updated = (local-complete { ^jj --repository $root workspace update-stale })
+        if $updated.exit_code != 0 {
+            print --stderr $"Could not update workspace ($name) at ($root): ($updated.stderr | str trim). Run `jj workspace update-stale` there."
+        } else if not (update-stale-noop $updated.stderr) {
+            print $"Updated workspace ($name), whose checked-out change this rewrite moved."
+        }
+    }
+}
+
+# Restack a topic that other workspaces have checked out. Each one is
+# snapshotted first so no unrecorded edit is lost, the rebase runs only when a
+# trial merge predicts no conflict, and the remaining workspaces are updated
+# so none is left stale. Returns { stack } or, when the topic was left
+# untouched, { reason }.
+def restack-checked-out [bookmark: string, onto: string, workspaces: list<string>] {
+    let roots = ($workspaces | each {|name| workspace-root $name })
+    let unreachable = ($roots | where {|root| not ($root | path exists) })
+    if ($unreachable | is-not-empty) {
+        return { reason: $"cannot reach ($unreachable | str join ', ')" }
+    }
+    for root in $roots {
+        run-command $"snapshotting ($root)" { ^jj --repository $root status } | ignore
+    }
+    if (conflicted-revisions $"($onto)..($bookmark)" | is-not-empty) {
+        return { reason: "already conflicted" }
+    }
+    if (trial-merge [$onto (revision-id $bookmark)]).conflict {
+        return { reason: "would conflict" }
+    }
+    let stack = (restack $bookmark $onto ($roots | first))
+    for root in ($roots | skip 1) {
+        run-command $"updating ($root)" { ^jj --repository $root workspace update-stale } | ignore
+    }
+    { stack: $stack }
+}
+
+# Whether a published topic needs rewriting. `ci land` rebases a topic
+# onto main itself, so rebasing one that merely fell behind only restarts its
+# pipeline. A stacked topic must follow its parent, and a conflicting one
+# cannot land at all.
+def refresh-needed [topic: record, all: bool] {
+    $all or $topic.parent != null or (trial-merge ["main@tangled" $topic.commit]).conflict
+}
+
+# Bring one published topic up to date with its base: main@tangled, or its
+# parent's bookmark for a stacked topic. Conflicts stay recorded in the local
+# rewrite and block the push until someone resolves them.
+def refresh-topic [topic: record, push: bool, all: bool] {
+    let bookmark = $topic.name
+    let label = $bookmark
+    let result = {|state| { branch: $bookmark state: $state } }
+    if not (refresh-needed $topic $all) {
+        return (do $result "no rebase needed")
+    }
+    let stacked = $topic.parent != null
+    let onto = if $stacked { bookmark-revset $topic.parent } else { "main@tangled" }
+    let workspaces = (workspaces-in $"\(($onto)..($bookmark))::")
+    let restacked = if ($workspaces | is-empty) {
+        { stack: (restack $bookmark $onto) }
+    } else {
+        restack-checked-out $bookmark $onto $workspaces
+    }
+    if $restacked.stack? == null {
+        print $"($label): checked out in ($workspaces | str join ', ') and ($restacked.reason); left untouched for that workspace to resolve."
+        return (do $result "checked out")
+    }
+    let stack = $restacked.stack
+    let conflicts = (conflicted-revisions $stack)
+    if ($conflicts | is-not-empty) {
+        print $"($label): ($conflicts | length) conflicted revision\(s), not pushed:"
+        print-conflicted-files $conflicts "  "
+        print "  Resolve oldest first: `jj new CHANGE_ID`, fix the files or run `jj resolve`, then `jj squash`."
+        return (do $result "conflicted")
+    }
+    let head = (revision-id $bookmark)
+    let changed = $head != (revision-id (remote-bookmark-revset $bookmark))
+    if not $push {
+        if $changed { print $"($label): restacked cleanly to ($head | str substring 0..11); not pushed." }
+        return (do $result (if $changed { "ready to push" } else { "current" }))
+    }
+    if $changed {
+        push-topic-bookmark $bookmark
+        print $"($label): pushed ($head | str substring 0..11)."
+    }
+    do $result (if $changed { "pushed" } else { "current" })
+}
+
+# Order topics so every parent is refreshed before the topics stacked on it.
+def stack-order [topics: list] {
+    mut ordered = []
+    mut known = []
+    mut remaining = $topics
+    loop {
+        let names = $known
+        let ready = ($remaining | where {|topic| $topic.parent == null or $topic.parent in $names })
+        if ($ready | is-empty) { break }
+        $ordered = ($ordered | append $ready)
+        $known = ($known | append ($ready | get name))
+        let taken = ($ready | get name)
+        $remaining = ($remaining | where {|topic| $topic.name not-in $taken })
+    }
+    $ordered
+}
+
+# Refresh topics parent-first. A topic whose parent is conflicted or otherwise
+# blocked waits, and so does everything stacked above it.
+def refresh-outcomes [ordered: list, refresh: closure] {
+    mut results = []
+    for topic in $ordered {
+        let parent = ($results | where branch == $topic.parent | get --optional 0)
+        let blocked = $parent != null and $parent.state in ["conflicted" "waiting on parent"]
+        let outcome = if $blocked {
+            { branch: $topic.name state: "waiting on parent" }
+        } else {
+            do $refresh $topic
+        }
+        $results = ($results | append $outcome)
+    }
+    $results
+}
+
+def refresh-topics [push: bool, all: bool] {
+    checkpoint "refresh"
+    fetch-trunk
+    let results = (refresh-outcomes (stack-order (topic-bookmarks)) {|topic| refresh-topic $topic $push $all })
+    print ($results | table)
+    if ($results | where state == "conflicted" | is-not-empty) {
+        error make { msg: "Some topics have conflicts. Resolve them locally, then run `ci sequence --apply` again." }
+    }
+}
+
+# Topics stacked beyond this depth wait for an earlier layer to land instead.
+const PLAN_MAX_STACK = 3
+
+def revision-field [revision: string, template: string] {
+    let result = (local-complete { ^jj log -r $revision --no-graph -T $template })
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | str trim
+}
+
+def contains-main [revision: string] {
+    revset-change-ids $"main@tangled & ::($revision)" | is-not-empty
+}
+
+# Create a headless merge of the given revisions, report whether it conflicts
+# and whether it changes main, then abandon it. Working copies are untouched.
+# The probe is abandoned however the trial ends: one that failed after JJ made
+# the merge, as when another session held .git/index.lock, left its probe
+# behind for every later plan to count as a topic (2026-10-07).
+def trial-merge [revisions: list<string>] {
+    let marker = $"jj-ci-plan-probe-(random uuid)"
+    let probes = $"description\(substring:'($marker)')"
+    let outcome = try {
+        git-command "creating a trial merge" { ^jj new --no-edit -m $marker ...$revisions } | ignore
+        let probe = (revision-field $probes 'commit_id')
+        let conflict = (revision-field $probe 'conflict') == "true"
+        let changes = (git-command "diffing the trial merge" {
+            ^jj diff --name-only --from main@tangled --to $probe
+        } | is-not-empty)
+        { value: { conflict: $conflict changes: $changes } error: null }
+    } catch {|err| { value: null error: $err.msg } }
+    let abandoned = (do { ^jj abandon $probes } | complete)
+    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $abandoned.exit_code != 0 {
+        error make { msg: $"abandoning the trial merge failed with exit code ($abandoned.exit_code): ($abandoned.stderr | str trim)" }
+    }
+    $outcome.value
+}
+
+# Name each topic tip, from rows of { commit change }, by its change ID, which
+# survives rewrites and so orders topics the same way in every workspace. The
+# copies of a divergent change share that ID, so they are told apart by
+# commit; JJ itself refuses the bare ID as a revision.
+def tip-identities [rows: list] {
+    let shared = ($rows | get change | uniq --repeated)
+    $rows | each {|row|
+        let tip = if $row.change in $shared { $"($row.change)/($row.commit | str substring 0..7)" } else { $row.change }
+        { tip: $tip commit: $row.commit }
+    }
+}
+
+def plan-topics [published: list] {
+    let roots = ($published | each {|topic| bookmark-revset $topic.name } | append 'working_copies()' | str join ' | ')
+    # A workspace parked on an empty, undescribed change contributes its parent.
+    let placeholder = '(empty() & description(exact:""))'
+    let heads = $"heads\(\(main@tangled..\(($roots))) & mutable\() ~ ($placeholder))"
+    # Every workspace's working copy is a candidate, so any of them going
+    # divergent would stop every session's landing if the plan named tips by
+    # change ID (2026-10-07). Revsets below therefore use commit IDs.
+    let rows = (git-command "listing topic tips" {
+        ^jj log -r $heads --no-graph -T 'commit_id ++ "\t" ++ change_id.short() ++ "\n"'
+    } | lines | where {|line| $line | is-not-empty } | parse "{commit}\t{change}")
+    tip-identities $rows | each {|tip|
+        let commit = $tip.commit
+        let bookmark = ($published | where {|topic| revset-change-ids $"(bookmark-revset $topic.name) & ::($commit)" | is-not-empty } | sort-by name | get --optional 0.name)
+        let workspaces = (revision-field $"\(main@tangled..($commit) | children\(($commit))) & working_copies\()" 'working_copies ++ " "'
+            | split row " " | where {|name| $name | is-not-empty } | uniq)
+        let names = (if $bookmark != null { [$bookmark] } else { [] } | append $workspaces)
+        let label = if ($names | is-empty) { $tip.tip | str substring 0..7 } else { $names | str join " " }
+        let fork = $"fork_point\(($commit) | main@tangled)"
+        {
+            label: $label
+            tip: $tip.tip
+            commit: $commit
+            bookmark: $bookmark
+            description: (revision-field $commit 'description.first_line()')
+            # Author time survives rewrites; committer time moves whenever a
+            # topic is validated or redescribed, which would reorder topics.
+            created: (revision-field $"($fork)..($commit)" 'author.timestamp().format("%s") ++ "\n"'
+                | lines | into int | math min)
+            files: (git-command "listing topic files" { ^jj diff --name-only --from $fork --to $commit } | lines)
+            current: (contains-main $commit)
+            impact: (combine-impacts (revisions-in $"($fork)..($commit)" | each {|revision| parse-impact $revision.description }) | get impact)
+        }
+    }
+}
+
+def plan-main-status [topic: record] {
+    let result = if $topic.current {
+        {
+            conflict: ((revision-field $topic.commit 'conflict') == "true")
+            changes: (git-command "diffing the topic" { ^jj diff --name-only --from main@tangled --to $topic.commit } | is-not-empty)
+        }
+    } else {
+        trial-merge [main@tangled $topic.commit]
+    }
+    if not $result.changes { "landed" } else if $result.conflict { "conflicts with main" } else { "clean" }
+}
+
+def plan-components [nodes: list<string>, edges: list] {
+    mut seen = []
+    mut components = []
+    for node in $nodes {
+        if $node in $seen { continue }
+        mut component = [$node]
+        mut frontier = [$node]
+        while ($frontier | is-not-empty) {
+            let current = ($frontier | first)
+            $frontier = ($frontier | skip 1)
+            let neighbours = ($edges
+                | where {|edge| $edge.a == $current or $edge.b == $current }
+                | each {|edge| if $edge.a == $current { $edge.b } else { $edge.a } }
+                | where {|other| $other not-in $component })
+            $component = ($component | append $neighbours)
+            $frontier = ($frontier | append $neighbours)
+        }
+        $seen = ($seen | append $component)
+        $components = ($components | append [$component])
+    }
+    $components
+}
+
+# Assign each conflict-free candidate a placement. Candidates arrive ordered
+# published-first, so a chain never stacks a published topic on unpublished work.
+def plan-proposals [candidates: list, edges: list] {
+    plan-components ($candidates | get tip) $edges | each {|component|
+        let chain = ($candidates | where tip in $component)
+        $chain | enumerate | each {|entry|
+            let action = if ($chain | length) == 1 {
+                "independent"
+            } else if $entry.index == 0 {
+                "base"
+            } else if $entry.index < $PLAN_MAX_STACK {
+                "stack"
+            } else {
+                "hold"
+            }
+            let parent = if $action == "stack" { $chain | get ($entry.index - 1) } else { null }
+            let proposal = match $action {
+                "independent" => "independent topic"
+                "base" => "base of stack"
+                "stack" => $"stack on ($parent.label)"
+                _ => $"hold until ($chain | get ($PLAN_MAX_STACK - 1) | get label) lands"
+            }
+            { tip: $entry.item.tip action: $action proposal: $proposal parent: $parent }
+        }
+    } | flatten
+}
+
+# Published topics go first so a pushed branch is never rebased onto unpublished
+# work. Within each group refactors come first, so a conflicting user-facing
+# change stacks on the refactor and each release stays a small behavior diff.
+# Every key is stable under rewrites, so concurrent topics agree on which of
+# them is the base; the change ID breaks the remaining ties.
+def plan-order [topics: list] {
+    $topics
+    | insert unpublished {|topic| $topic.bookmark == null }
+    | insert impact_order {|topic| impact-order $topic.impact }
+    | sort-by unpublished impact_order created tip
+}
+
+def build-plan [published: list] {
+    let topics = (plan-topics $published
+        | each {|topic| $topic | insert main (plan-main-status $topic) }
+        | plan-order $in)
+    let candidates = ($topics | where main == "clean")
+    let pairs = ($candidates | enumerate | each {|left|
+        $candidates | skip ($left.index + 1) | each {|right| { a: $left.item right: $right } }
+    } | flatten)
+    let edges = ($pairs
+        | where {|pair| $pair.a.files | any {|file| $file in $pair.right.files } }
+        | where {|pair|
+            let revisions = if $pair.a.current or $pair.right.current {
+                [$pair.a.commit $pair.right.commit]
+            } else {
+                [main@tangled $pair.a.commit $pair.right.commit]
+            }
+            (trial-merge $revisions).conflict
+        }
+        | each {|pair| { a: $pair.a.tip b: $pair.right.tip } })
+    let proposals = (plan-proposals $candidates $edges)
+    $topics | each {|topic|
+        let placement = match $topic.main {
+            "landed" => { action: "landed" proposal: "already in main; finish or abandon" parent: null }
+            "conflicts with main" => { action: "resolve-main" proposal: "resolve against main first (ci rebase)" parent: null }
+            _ => ($proposals | where tip == $topic.tip | get 0)
+        }
+        let conflicts = ($edges
+            | where {|edge| $edge.a == $topic.tip or $edge.b == $topic.tip }
+            | each {|edge| let other = if $edge.a == $topic.tip { $edge.b } else { $edge.a }; $topics | where tip == $other | get 0.label })
+        {
+            topic: $topic.label
+            tip: $topic.tip
+            change: ($topic.tip | str substring 0..7)
+            description: $topic.description
+            impact: $topic.impact
+            main: $topic.main
+            conflicts_with: $conflicts
+            action: $placement.action
+            proposal: $placement.proposal
+            stack_on_bookmark: ($placement.parent | get bookmark? )
+            stack_on: ($placement.parent | get label? )
+        }
+    }
+}
+
+def sync-main [] {
+    require-jj-workspace-here
+    if (owner-status (session-owner)) == "active" {
+        error make { msg: "An active Codex topic owns this workspace. Use `ci rebase`, park the topic, or `ci unclaim` a claim its task left behind before syncing." }
+    }
+    if (current-change "empty") != "true" {
+        error make { msg: "Sync needs an empty change. Use `ci rebase` to update this topic in place." }
+    }
+    checkpoint "sync"
+    fetch-trunk
+    run-command "advancing the main bookmark" { ^jj bookmark move main --to main@tangled } | ignore
+    run-command "rebasing the working copy" { ^jj rebase -r @ -o main@tangled } | ignore
+}
+
+def review-versions [] {
+    let root = (run-command "locating the workspace" { ^jj root })
+    let path = ($root | path join ".jj" "jj-ci-review-versions.json")
+    if ($path | path exists) { open $path } else { [] }
+}
+
+def review-versions-path [] {
+    let root = (run-command "locating the workspace" { ^jj root })
+    $root | path join ".jj" "jj-ci-review-versions.json"
+}
+
+# What one Prek run reported: the hooks that failed, and whether any hook
+# rewrote files, which Prek marks under the hook's status line.
+def prek-outcome [exit_code: int, output: string] {
+    let lines = ($output | ansi strip | lines)
+    {
+        exit_code: $exit_code
+        failed: ($lines | parse --regex '^\s*(?P<hook>\S.*?)\.{3,}Failed\s*$' | get hook)
+        modified: ($lines | any {|line| $line =~ 'files were modified by this hook' })
+    }
+}
+
+# Whether preflight runs Prek again, and the error it ends with (null when it
+# passes). A formatter's rewrite is the fix itself, so a first run that failed
+# after rewriting files earns one more run on the formatted tree, and that run
+# decides.
+def prek-verdict [runs: list] {
+    let last = ($runs | last)
+    if $last.exit_code == 0 { return { rerun: false error: null } }
+    if $last.modified and ($runs | length) == 1 { return { rerun: true error: null } }
+    let hooks = if ($last.failed | is-empty) { "" } else { $": ($last.failed | str join ', ')" }
+    let cause = if $last.modified {
+        " Formatters rewrote files on both runs, so one of them is not idempotent or something else is editing this workspace."
+    } else { "" }
+    { rerun: false error: $"Prek failed($hooks).($cause) Its output is above." }
+}
+
+def run-prek [context: record, paths: list<string>] {
+    let result = (do {
+        with-env $context {
+            cd $context.GIT_WORK_TREE
+            ^prek run --files ...$paths
+        }
+    } | complete)
+    if ($result.stdout | is-not-empty) { print --no-newline $result.stdout }
+    if ($result.stderr | is-not-empty) { print --stderr --no-newline $result.stderr }
+    prek-outcome $result.exit_code $"($result.stdout)\n($result.stderr)"
+}
+
+def validate-change [] {
+    run-command "fixing the current JJ change" { ^jj fix -s @ } | ignore
+    let context = (git-context)
+    let files = (do {
+        cd $context.GIT_WORK_TREE
+        ^jj file list
+    } | complete)
+    if $files.exit_code != 0 { error make { msg: ($files.stderr | str trim) } }
+    let paths = ($files.stdout | lines | where {|p| $p != "" })
+    mut runs = [(run-prek $context $paths)]
+    if (prek-verdict $runs).rerun {
+        let rerun = "Prek's formatters rewrote files; checking the formatted tree once more."
+        print $rerun
+        report-status working $rerun --id preflight
+        $runs = ($runs | append (run-prek $context $paths))
+    }
+    let verdict = (prek-verdict $runs)
+    if $verdict.error != null { error make { msg: $verdict.error } }
+    record-validation
+}
+
+def validation-path [] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    $root | path join ".jj" "jj-ci-validation.json"
+}
+
+# Remember the exact commit Prek passed. Any later edit snapshots a new commit,
+# so the record goes stale by itself; context-status reads it to report lint
+# freshness without running Prek.
+def record-validation [] {
+    {
+        change_id: (current-topic-id)
+        commit_id: (current-change "commit_id")
+        validated_at: (date now | format date "%+")
+    } | to json | save --force (validation-path)
+}
+
+# The commit a remote bookmark points at, or null when it is not on the remote.
+def remote-bookmark-commit [bookmark: string, remote: string] {
+    let result = (^jj log -r (remote-bookmark-revset $bookmark $remote) --no-graph -T 'commit_id' | complete)
+    if $result.exit_code != 0 { return null }
+    let commit = ($result.stdout | str trim)
+    if ($commit | is-empty) { null } else { $commit }
+}
+
+# One probe's verdict, or `unknown` with the reason when it could not be read.
+# A run that only timed out reports `timeout`: the gate treats it as a failure,
+# but it says nothing about the topic, and the homelab spindle's 30 minute
+# limit ends every cold run that way.
+def probe-state [probe: closure] {
+    try {
+        let result = (do $probe)
+        let statuses = ($result.workflows? | default [] | get --optional status | default [])
+        if $result.state == "failed" and "timeout" in $statuses and "failed" not-in $statuses {
+            { state: "timeout" }
+        } else {
+            $result | select state
+        }
+    } catch {|err| { state: "unknown" error: $err.msg } }
+}
+
+# A topic's trip to main uses flight words: `new`, `sequence`, `preflight`
+# and `sim`, `dispatch`, `land --clearance`, then `park` (or `cancel`), and
+# `verify` once the release runs. Preflight is everything before activation;
+# inflight is everything on a running machine. Tools keep plain VCS words.
+def main [] {
+    print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact check`, `ci release`, `ci version`."
+}
+
+# The control tower: a live terminal view of every workspace's topic, each
+# run's phases and log, and trunk's releases, from which a key runs the next
+# step. Runs it starts are ordinary ci MCP jobs that agents can follow.
+def --wrapped "main tower" [...args] {
+    if (which ci-tower | is-empty) {
+        error make { msg: "ci-tower is not on PATH; it ships in the ci package, or run `nix run path:.#ci-tower` in the ci repository." }
+    }
+    exec ci-tower ...$args
+}
+
+# Old command names keep working for a while and point at the new ones.
+def renamed [old: string, new: string] {
+    print --stderr $"`ci ($old)` is now `ci ($new)`."
+}
+
+def "main status" [] {
+    ^jj status
+    let repo = (tangled-repo)
+    let pulls = (open-pulls $repo)
+    topic-bookmarks | each {|topic|
+        {
+            topic: $topic.name
+            stacked_on: $topic.parent
+            pipeline: (pipeline-state $repo $topic.commit).state
+            pull: ($pulls | where branch == $topic.name | get --optional 0.title)
+        }
+    }
+}
+
+# The current topic's publication and pipeline facts as JSON. It reads the
+# remotes' last-fetched state and the forges' APIs; it never fetches, pushes,
+# or rewrites anything, so a background status refresh can run it safely.
+def "main ci-state" [] {
+    let topic_id = (current-topic-id)
+    let topics = (publication-topics)
+    let branch = if $topic_id in $topics { $topics | get $topic_id } else { null }
+    let head = if $branch == null { null } else { remote-bookmark-commit $branch $TRUNK_REMOTE }
+    let base = {
+        change_id: $topic_id
+        branch: $branch
+        published_head: $head
+        landed: false
+        pull: null
+        spindle: null
+        github: null
+    }
+    if $head == null { return ($base | to json) }
+    let repo = (try { tangled-repo } catch { null })
+    let github = if (remote-bookmark-commit $branch $GITHUB_REMOTE) == $head {
+        probe-state { github-checks-state (github-repo) $head }
+    } else { null }
+    $base | merge {
+        landed: (topic-landed $branch)
+        pull: (if $repo == null { null } else {
+            try { open-pulls $repo | where branch == $branch | get --optional 0.title } catch { null }
+        })
+        spindle: (if $repo == null { { state: "unknown" error: "Could not read the Tangled repository." } } else {
+            probe-state { pipeline-state $repo $head }
+        })
+        github: $github
+    } | to json
+}
+
+def "main sync" [] {
+    sync-main
+}
+
+def "main worktree-status" [] {
+    let root = (git-command "locating the Git repository" { ^git rev-parse --show-toplevel })
+    let main = (git-command "locating tangled/main" { ^git -C $root rev-parse refs/remotes/tangled/main })
+    let main_short = ($main | str substring 0..6)
+    let listing = (git-command "listing Git worktrees" { ^git -C $root worktree list --porcelain })
+    let worktrees = ($listing
+        | split row "\n\n"
+        | where {|entry| ($entry | str trim | is-not-empty) }
+        | each {|entry|
+            let path_line = ($entry | lines | where {|line| $line starts-with "worktree " } | first)
+            git-worktree ($path_line | str substring 9..) $main
+        })
+    print $"tangled/main: ($main_short)"
+    for worktree in $worktrees {
+        let details = $"($worktree.dirty), ($worktree.vcs)"
+        print $"($worktree.state) ($worktree.branch) ($worktree.head) ($details) ($worktree.path)"
+    }
+}
+
+# Every check that runs before activation, on the current change.
+def "main preflight" [] {
+    require-ready-change
+    validate-change
+}
+
+def "main validate" [] {
+    renamed "validate" "preflight"
+    main preflight
+}
+
+def "main review snapshot" [label: string] {
+    require-ready-change
+    let versions = (review-versions)
+    if (($versions | where label == $label | is-not-empty)) {
+        error make { msg: $"A review snapshot named '($label)' already exists in this workspace." }
+    }
+    let entry = {
+        label: $label
+        base: (revision-id "main@tangled")
+        tip: (revision-id "@")
+        bookmark: (publication-bookmark)
+        created_at: (date now | format date "%Y-%m-%dT%H:%M:%S%:z")
+    }
+    (review-versions | append $entry | to json) | save --force (review-versions-path)
+    print $"Saved review snapshot '($label)': ($entry.base)..($entry.tip)"
+}
+
+def "main interdiff" [old: string, new: string] {
+    let versions = (review-versions)
+    let old_matches = ($versions | where label == $old)
+    let new_matches = ($versions | where label == $new)
+    if ($old_matches | is-empty) {
+        error make { msg: $"No review snapshot named '($old)' exists in this workspace." }
+    }
+    if ($new_matches | is-empty) {
+        error make { msg: $"No review snapshot named '($new)' exists in this workspace." }
+    }
+    let old_version = ($old_matches | first)
+    let new_version = ($new_matches | first)
+    let old_range = $"($old_version.base)..($old_version.tip)"
+    let new_range = $"($new_version.base)..($new_version.tip)"
+    let context = (git-context)
+    print $"Interdiff: ($old) -> ($new)"
+    print $"  old: ($old_range)"
+    print $"  new: ($new_range)"
+    run-command "computing interdiff" {
+        with-env $context {
+            cd $context.GIT_WORK_TREE
+            ^git range-diff $old_range $new_range
+        }
+    } | ignore
+}
+
+def "main rebase" [] {
+    rebase-topic
+}
+
+# Like air traffic control ordering arrivals: show how in-flight topics stack
+# on the ones they conflict with, or with --apply, restack them.
+def "main sequence" [
+    --json # Print the sequence as JSON
+    --apply # Restack stacked or conflicting topics, pushing conflict-free rebases
+    --no-push # With --apply, rebase and report conflicts without pushing
+    --all # With --apply, also rebase conflict-free topics merely behind main
+] {
+    if $apply {
+        refresh-topics (not $no_push) $all
+        return
+    }
+    fetch-trunk
+    let plan = (build-plan (topic-bookmarks | where parent == null))
+    if $json {
+        print ($plan | to json)
+        return
+    }
+    if ($plan | is-empty) {
+        print "No in-flight topics."
+        return
+    }
+    for entry in $plan {
+        let description = if ($entry.description | is-empty) { "(no description)" } else { $entry.description }
+        print $"($entry.topic) [($entry.change)] ($description)"
+        print $"  impact: ($entry.impact | default 'unclassified')"
+        print $"  main: ($entry.main)"
+        if ($entry.conflicts_with | is-not-empty) {
+            print $"  conflicts with: ($entry.conflicts_with | str join ', ')"
+        }
+        print $"  plan: ($entry.proposal)"
+        let parent = ($plan | where topic == ($entry.stack_on | default "") | get 0?)
+        if $entry.impact == "refactor" and $parent != null and $parent.impact != "refactor" {
+            print $"  note: this refactor stacks on user-facing ($parent.topic) only because that topic is already published."
+        }
+    }
+}
+
+def "main plan" [
+    --json # Print the sequence as JSON
+] {
+    renamed "plan" "sequence"
+    main sequence --json=$json
+}
+
+# Home Manager is embedded in this host; there is no standalone homeConfigurations output.
+const PREVIEW_ATTRIBUTE = "nixosConfigurations.asus.config.home-manager.users.schlich.home.activationPackage"
+
+def preview-link [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "preview-home"
+}
+
+# Published topics to preview: the requested ones, or every behavior or
+# breaking topic (all of them with `all`). Refactors leave every closure
+# unchanged, so they add merge risk without anything to try.
+def preview-topics [names: list<string>, all: bool] {
+    let topics = (topic-bookmarks | each {|topic|
+        let revset = (bookmark-revset $topic.name)
+        # A stacked topic is classified by its own layer; the merge still
+        # includes its parent, since the parent is an ancestor of its head.
+        let base = if $topic.parent == null { "main@tangled" } else { bookmark-revset $topic.parent }
+        $topic
+        | insert revset $revset
+        | insert title (revision-field $revset 'description.first_line()')
+        | insert impact (combine-impacts (revisions-in $"($base)..($revset)" | each {|revision| parse-impact $revision.description }) | get impact)
+    })
+    if ($names | is-not-empty) {
+        let missing = ($names | where {|name| $name not-in ($topics | get name) })
+        if ($missing | is-not-empty) {
+            error make { msg: $"Not published topics: ($missing | str join ', ')" }
+        }
+        return ($topics | where name in $names)
+    }
+    if $all { return $topics }
+    $topics | where impact in ["behavior" "breaking"]
+}
+
+# Configuration files that differ between two Home Manager generations. Each
+# entry is a symlink into the store, so a changed target is a changed file;
+# comparing targets also tolerates links whose destination no longer exists.
+def preview-changed-files [current: string, preview: string] {
+    let old = ($current | path join "home-files" | path expand)
+    let new = ($preview | path join "home-files" | path expand)
+    let result = (^diff --recursive --brief --no-dereference $old $new | complete)
+    if $result.exit_code > 1 { error make { msg: $"comparing configuration files failed: ($result.stderr | str trim)" } }
+    $result.stdout | lines | each {|line|
+        let only = ($line | parse --regex '^Only in (?P<directory>.+): (?P<name>.+)$')
+        if ($only | is-not-empty) {
+            let entry = ($only | first)
+            let status = if ($entry.directory | str starts-with $new) { "added" } else { "removed" }
+            let path = ($entry.directory | str replace $new "" | str replace $old "" | path join $entry.name)
+            { status: $status path: $"~($path)" }
+        } else {
+            let path = ($line | parse --regex $"($old | str replace --all '.' '\.')\(?P<path>/[^’'\\s]*\)" | get 0?.path | default "")
+            { status: "changed" path: $"~($path)" }
+        }
+    }
+}
+
+# Build the Home Manager generation that trunk plus in-flight topics would
+# produce, without activating it. The merge exists only in a temporary
+# workspace and is abandoned afterwards; nothing is pushed or rewritten.
+def "main preview" [
+    ...topics: string # Topic branches to include (default: every published behavior or breaking topic)
+    --all # Include refactor topics when no branches are given
+    --shell # Open Nushell with the simulation's programs first on PATH
+    --config # With --shell, also read configuration from the simulation (read-only)
+    --active # Compare against the active generation instead of trunk's
+] {
+    renamed "preview" "sim"
+    main sim ...$topics --all=$all --shell=$shell --config=$config --active=$active
+}
+
+def "main sim" [
+    ...topics: string # Topic branches to include (default: every published behavior or breaking topic)
+    --all # Include refactor topics when no branches are given
+    --shell # Open Nushell with the simulation's programs first on PATH
+    --config # With --shell, also read configuration from the simulation (read-only)
+    --active # Compare against the active generation instead of trunk's
+] {
+    fetch-trunk
+    let included = (preview-topics $topics $all)
+    if ($included | is-empty) {
+        print "No published user-facing topics to preview."
+        return
+    }
+    for topic in $included { print $"Including ($topic.name) ($topic.title)" }
+
+    let heads = ($included | get revset | append "main@tangled" | str join " | ")
+    let parents = (git-command "resolving topic heads" {
+        ^jj log -r $"heads\(($heads))" --no-graph -T 'commit_id ++ "\n"'
+    } | lines)
+    let marker = $"jj-ci-preview-(random uuid)"
+    git-command "creating the preview merge" { ^jj new --no-edit -m $marker ...$parents } | ignore
+    let merge = (revision-field $"description\(substring:'($marker)')" 'commit_id')
+    let discard = {|| git-command "abandoning the preview merge" { ^jj abandon $"($merge)::" } | ignore }
+
+    if (revision-field $merge 'conflict') == "true" {
+        let files = (git-command "listing conflicted files" { ^jj resolve --list -r $merge })
+        do $discard
+        print "The selected topics conflict when merged:"
+        print ($files | lines | each {|line| $"  ($line)" } | str join "\n")
+        error make { msg: "Preview a subset with `ci sim BRANCH ...`, or see `ci sequence` for how to stack them." }
+    }
+
+    let name = ($marker | str substring 0..21)
+    let directory = (mktemp --directory --tmpdir "jj-ci-preview.XXXXXX")
+    let tree = ($directory | path join "tree")
+    let link = (preview-link)
+    mkdir ($link | path dirname)
+    let built = (try {
+        git-command "checking out the preview" { ^jj workspace add --revision $merge --name $name $tree } | ignore
+        ^nix build --no-update-lock-file --out-link $link $"path:($tree)#($PREVIEW_ATTRIBUTE)"
+        if not $active {
+            git-command "checking out trunk" { ^jj --repository $tree new main@tangled } | ignore
+            ^nix build --no-update-lock-file --out-link $"($link)-trunk" $"path:($tree)#($PREVIEW_ATTRIBUTE)"
+        }
+        null
+    } catch {|error| $error.msg })
+    do { ^jj workspace forget $name } | complete | ignore
+    rm --recursive --force $directory
+    do $discard
+    if $built != null { error make { msg: $"Building the preview failed: ($built)" } }
+
+    let preview = ($link | path expand)
+    let baseline = if $active {
+        { name: "the active generation" path: ($env.HOME | path join ".local" "state" "home-manager" "gcroots" "current-home") }
+    } else {
+        { name: "trunk" path: $"($link)-trunk" }
+    }
+    print $"\nPreview generation: ($preview)"
+    if ($baseline.path | path expand) == $preview {
+        print $"\nNo Home Manager changes against ($baseline.name)."
+    } else if ($baseline.path | path exists) {
+        print $"\nPackage changes against ($baseline.name):"
+        ^nix store diff-closures $baseline.path $preview
+        let files = (preview-changed-files ($baseline.path | path expand) $preview)
+        print "\nConfiguration file changes:"
+        print (if ($files | is-empty) { "  none" } else { $files | each {|file| $"  ($file.status | fill --width 8)($file.path)" } | str join "\n" })
+    }
+    if not $shell {
+        print $"\nTry programs from ($preview | path join 'home-path' 'bin'), or re-run with --shell."
+        return
+    }
+    let overrides = { PATH: ($env.PATH | prepend ($preview | path join "home-path" "bin")) JJ_CI_PREVIEW: $preview }
+    let overrides = if $config {
+        $overrides | insert XDG_CONFIG_HOME ($preview | path join "home-files" ".config")
+    } else {
+        $overrides
+    }
+    print "\nEntering the preview shell. Exit to return; nothing was activated."
+    with-env $overrides { ^nu }
+}
+
+def "main refresh" [
+    --no-push # Rebase and report conflicts without pushing
+    --all # Also rebase conflict-free topics that are merely behind main
+] {
+    renamed "refresh" "sequence --apply"
+    refresh-topics (not $no_push) $all
+}
+
+def "main conflicts" [] {
+    require-owned-change
+    if (print-conflicts "Conflict status") {
+        error make { msg: "The current topic has unresolved conflicts." }
+    }
+}
+
+# Choose the branch a topic should stack on. A topic built on top of another
+# published topic depends on it and stacks on the nearest one; otherwise
+# `ci sequence` decides. Returns null when the topic can go straight to main.
+def plan-parent-for-current-topic [branch: string] {
+    let published = (topic-bookmarks | where name != $branch)
+    let below = ($published | where {|topic|
+        revset-change-ids $"(bookmark-revset $topic.name) & ::@- ~ ::main@tangled" | is-not-empty
+    })
+    if ($below | is-not-empty) {
+        let heads = (revset-change-ids $"heads\(($below | each {|topic| bookmark-revset $topic.name } | str join ' | '))")
+        let nearest = ($below | where {|topic| (revset-change-ids (bookmark-revset $topic.name) | first) in $heads } | first)
+        print $"Built on ($nearest.name); stacking on it."
+        return $nearest.name
+    }
+    let tip = (current-change 'change_id.short()')
+    let entry = (build-plan ($published | where parent == null) | where tip == $tip | get 0?)
+    if $entry == null { return null }
+    match $entry.action {
+        "hold" => {
+            error make { msg: $"This topic conflicts with a stack that is already ($PLAN_MAX_STACK) layers deep \(($entry.proposal)). Hold it locally until a layer lands." }
+        }
+        "stack" => {
+            # Waiting on a topic that is not published can block indefinitely
+            # when its task is idle. Publish independently; whichever lands
+            # second resolves the conflict when it rebases.
+            if $entry.stack_on_bookmark == null {
+                print $"Conflicts with unpublished work in ($entry.stack_on); publishing as an independent topic. Whichever lands second resolves the conflict."
+                return null
+            }
+            print $"Conflicts with ($entry.conflicts_with | str join ', '); stacking on ($entry.stack_on_bookmark)."
+            $entry.stack_on_bookmark
+        }
+        _ => null
+    }
+}
+
+def restack-topic [parent: string] {
+    require-owned-change
+    if (print-conflicts "Before restack") {
+        error make { msg: "Resolve existing conflicts before restacking." }
+    }
+    let onto = (bookmark-revset $parent)
+    if (revset-change-ids $onto | is-empty) {
+        error make { msg: $"The parent branch ($parent) has no local bookmark. Fetch and track it first." }
+    }
+    checkpoint "restack"
+    let moved = (other-workspaces-in $"roots\(::@ ~ ::($onto) ~ ::main@tangled)::")
+    let stack = (restack "@" $onto)
+    update-moved-workspaces $moved
+    let conflicts = (conflicted-revisions $stack)
+    if ($conflicts | is-not-empty) {
+        print $"Restacked onto ($parent) with ($conflicts | length) conflicted revision\(s):"
+        print-conflicted-files $conflicts "  "
+        error make { msg: "Resolve these conflicts locally, oldest first, then run `ci dispatch` again." }
+    }
+}
+
+# Rebase or restack the current topic, validate it, and push its bookmark to
+# the trunk remote. A topic keeps one bookmark for its whole life, so every
+# publish updates the same branch and any pull request opened from it.
+def publish-topic [] {
+    require-ready-change
+    let branch = (publication-bookmark)
+    fetch-trunk
+    if (topic-landed $branch) {
+        error make { msg: "This topic already landed on main. Park it with `ci park` before starting new work." }
+    }
+    let parent = (plan-parent-for-current-topic $branch)
+    let base = if $parent == null { "main@tangled" } else { bookmark-revset $parent }
+    # Classify before rewriting anything so an unclassified topic fails fast.
+    let impact = (require-impact (layer-revisions $base))
+    let onto = if $parent == null { "main@tangled" } else { $parent }
+    phase rebase $"Rebasing onto ($onto)" {
+        if $parent == null { rebase-topic } else { restack-topic $parent }
+    }
+    require-ready-change
+    phase preflight "Running preflight" { validate-change }
+    run-command "setting the publication bookmark" { ^jj bookmark set $branch -r @ } | ignore
+    remember-publication-bookmark $branch
+    phase push $"Pushing ($branch)" { push-topic-bookmark $branch }
+    { branch: $branch parent: $parent impact: $impact head: (current-change "commit_id") }
+}
+
+# Land a published topic. A declared refactor must leave every closure
+# unchanged, and the gate must pass the exact head; main then fast-forwards
+# to that commit, so main only ever holds tested trees. If main moved while the
+# gate ran, landing would not be a fast-forward of what was tested, so this
+# returns false without touching main and the caller starts over from the new
+# main. Delivery is never a squash, rebase, or merge on a forge: both remotes
+# receive the same commits.
+def land-published [published: record, repo: record, timeout: duration, gate: string] {
+    if $published.parent != null {
+        error make { msg: $"This topic is stacked on ($published.parent). Land that topic first, then land this one." }
+    }
+    let checker = (landing-gate $gate $repo)
+    let base = (revision-id "main@tangled")
+    if $published.impact == "refactor" {
+        phase closures "Proving every NixOS closure unchanged" { require-closure-neutral $base $published.head }
+    }
+    if $gate == "github" { push-bookmark $GITHUB_REMOTE $published.branch }
+    print $"Waiting for ($checker.name) to pass ($published.head | str substring 0..11)."
+    wait-for-pipeline $checker $published.head $timeout
+    # Other workspaces share this repository and may have landed meanwhile.
+    fetch-trunk
+    if not (contains-main $published.head) { return false }
+    run-command "advancing main" { ^jj bookmark set main -r $published.head } | ignore
+    let pushed = (remote-complete "advancing main" { ^jj git push --remote $TRUNK_REMOTE --bookmark main })
+    if $pushed.exit_code != 0 {
+        # The lease lost a race with a landing after the fetch above. Put the
+        # local bookmark back on the trunk so the retry starts from it.
+        fetch-trunk
+        if not (contains-main $published.head) {
+            run-command "resetting main" { ^jj bookmark set main -r main@tangled --allow-backwards } | ignore
+            return false
+        }
+        error make { msg: $"landing on ($TRUNK_REMOTE) failed with exit code ($pushed.exit_code): ($pushed.stderr | str trim)" }
+    }
+    report-status done $"Landed ($published.branch) on main at ($published.head | str substring 0..11)" --id land
+    mirror-main
+    cut-releases $"($base)..($published.head)" false
+    print $"Landed ($published.branch) on main. `ci park` frees the workspace."
+    true
+}
+
+# Land a published topic, starting over when main moves under it. Each retry
+# republishes (rebasing onto the new main and validating) and waits for the
+# gate to pass the new head; a rebase conflict or a failing gate still stops.
+def land-with-retries [published: record, repo: record, timeout: duration, gate: string, attempts: int] {
+    if $attempts < 1 { error make { msg: "--attempts must be at least 1." } }
+    mut current = $published
+    for attempt in 1..$attempts {
+        if (land-published $current $repo $timeout $gate) { return }
+        if $attempt == $attempts { break }
+        let retry = $"main moved while the gate ran; rebasing onto the new main and trying again \(attempt ($attempt + 1) of ($attempts))."
+        print $retry
+        report-status working $retry --id land
+        $current = (publish-topic)
+    }
+    error make { msg: $"main moved during each of ($attempts) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+}
+
+# Fast-forward GitHub's main to the trunk's. Tangled is authoritative, so a
+# rejected mirror push leaves the landing in place and reports how to retry,
+# as an error under `mirror` that does not fail the run.
+def mirror-main [] {
+    let fetched = (do { ^jj git fetch --remote $GITHUB_REMOTE --branch main } | complete)
+    let pushed = if $fetched.exit_code == 0 {
+        do { ^jj git push --remote $GITHUB_REMOTE --bookmark main } | complete
+    } else { $fetched }
+    if $pushed.exit_code != 0 {
+        let failure = $"Landed on ($TRUNK_REMOTE), but mirroring main to ($GITHUB_REMOTE) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($GITHUB_REMOTE) --bookmark main`."
+        print --stderr $failure
+        report-status error $failure --id mirror
+    } else {
+        report-status done $"Mirrored main to ($GITHUB_REMOTE)" --id mirror
+    }
+}
+
+# Clear the topic for departure: rebase, run preflight, and push its branch,
+# where it waits to land. --stack pushes each layer as its own branch for
+# stacked review on Tangled instead.
+def "main dispatch" [
+    --land # Land the topic once it has clearance
+    --clearance: string = "local" # What must pass the head before --land: local, spindle, or github
+    --timeout: duration = 2hr # How long --land waits for the pipeline
+    --attempts: int = 5 # How many times --land starts over when main moves
+    --stack # Push one branch per revision for Tangled's stacked pull requests
+] {
+    if $stack {
+        if $land { error make { msg: "--stack is for review only; land the topic with `ci land`." } }
+        dispatch-stack
+        return
+    }
+    report-run (if $land { "Landed the topic" } else { "Dispatched the topic" }) {
+        with-topic-lock (current-topic-id) {
+            let published = (publish-topic)
+            let repo = (tangled-repo)
+            let pull = (open-pulls $repo | where branch == $published.branch | get --optional 0)
+            if $pull == null {
+                let form = ({ source: "branch" sourceBranch: $published.branch targetBranch: "main" } | url build-query)
+                print $"Pushed ($published.branch). Open a pull request to review it on Tangled: ($repo.web)/pulls/new?($form)"
+            } else {
+                print $"Pushed ($published.branch), which updates the pull request \"($pull.title)\"."
+            }
+            if $published.parent != null {
+                print $"Stacked on ($published.parent); it lands after that topic."
+            }
+            print $"Impact: ($published.impact)"
+            if $land {
+                land-with-retries $published $repo $timeout $clearance $attempts
+            } else {
+                print "Dispatched this topic in place. Further edits update the same JJ series and branch; `ci land` delivers it."
+            }
+        }
+    }
+}
+
+def "main publish" [
+    --land # Land the topic once it has clearance
+    --gate: string = "local" # What must pass the head before --land: local, spindle, or github
+    --timeout: duration = 2hr # How long --land waits for the pipeline
+    --attempts: int = 5 # How many times --land starts over when main moves
+] {
+    renamed "publish" "dispatch"
+    main dispatch --land=$land --clearance $gate --timeout $timeout --attempts $attempts
+}
+
+def "main land" [
+    --clearance: string = "local" # What must pass the head: local, spindle, or github
+    --gate: string # Renamed to --clearance
+    --timeout: duration = 2hr # How long to wait for the pipeline
+    --attempts: int = 5 # How many times to start over when main moves
+] {
+    let cleared_by = if $gate == null { $clearance } else {
+        print --stderr "`ci land --gate` is now `ci land --clearance`."
+        $gate
+    }
+    report-run "Landed the topic" {
+        with-topic-lock (current-topic-id) {
+            let published = (publish-topic)
+            land-with-retries $published (tangled-repo) $timeout $cleared_by $attempts
+        }
+    }
+}
+
+# Export each revision in `revisions` (a record of name to commit) into its own
+# temporary directory, run `body` with a record of name to path, and remove
+# the directories again. An export holds exactly the commit's tree and no
+# `.git`, so a check that reads its own source as a flake cannot follow a Git
+# pointer out of the Nix store. In a JJ workspace the commits live in its Git
+# backend, so Git is pointed there; a plain Git checkout needs nothing extra.
+# Only the export sees that Git environment, not `body`.
+def with-commit-trees [revisions: record, body: closure] {
+    let backend = (try { ^jj git root | complete } catch { { exit_code: 1 stdout: "" } })
+    let environment = if $backend.exit_code == 0 { { GIT_DIR: ($backend.stdout | str trim) } } else { {} }
+    let root = (mktemp --directory --tmpdir "jj-ci-tree.XXXXXX")
+    let trees = ($revisions | columns | reduce --fold {} {|name, trees| $trees | insert $name ($root | path join $name) })
+    let outcome = try {
+        with-env $environment {
+            for name in ($revisions | columns) {
+                let tree = ($trees | get $name)
+                mkdir $tree
+                let exported = (do { ^git archive --format=tar ($revisions | get $name) | ^tar -x -C $tree } | complete)
+                if $exported.exit_code != 0 {
+                    error make { msg: $"exporting ($name) failed: ($exported.stderr | str trim)" }
+                }
+            }
+        }
+        { value: (do $body $trees) error: null }
+    } catch {|err|
+        { value: null error: $err.msg }
+    }
+    rm --recursive --force $root
+    if $outcome.error != null { error make { msg: $outcome.error } }
+    $outcome.value
+}
+
+# Prove every NixOS closure at `head` matches `base`, or fail naming the hosts
+# that changed. Evaluating every host twice is heavy, so the proof holds the
+# local checks lock.
+def require-closure-neutral [base: string, head: string] {
+    let differences = (with-local-checks-lock $head {
+        with-commit-trees { base: $base head: $head } {|trees|
+            closure-differences (closure-fingerprint $"path:($trees.base)") (closure-fingerprint $"path:($trees.head)")
+        }
+    })
+    if ($differences | is-not-empty) {
+        error make { msg: $"Declared refactor, but these host closures changed: ($differences | str join ', '). Make the change closure-neutral or reclassify it as behavior or breaking." }
+    }
+    print "Every NixOS closure matches the base."
+}
+
+# Classify `base..head` from its commit trailers and, for a refactor, prove
+# that every NixOS closure matches the merge base. Uses Git and Nix only, so it
+# runs without a JJ workspace; `ci land` runs the same proof itself.
+def "main impact check" [base: string, head: string] {
+    let log = (git-command "reading the topic commits" {
+        ^git log --no-merges --format=%h%x1f%B%x1e $"($base)..($head)"
+    })
+    let revisions = ($log | split row "\u{1e}" | str trim | where {|entry| $entry | is-not-empty } | each {|entry|
+        let fields = ($entry | split row "\u{1f}")
+        { change_id: ($fields | first) description: ($fields | skip 1 | str join "\u{1f}") }
+    })
+    let impact = (require-impact $revisions)
+    print $"Impact: ($impact)"
+    if $impact != "refactor" { return }
+    require-closure-neutral (git-command "finding the merge base" { ^git merge-base $base $head }) $head
+}
+
+const RELEASE_TAG_GLOB = "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].*"
+
+# Tag a CalVer release on every user-facing revision in `range`, oldest first,
+# and push each tag to the trunk remote. The tag names the release; the
+# revision description, with its Impact trailer, is its notes.
+def cut-releases [range: string, dry_run: bool] {
+    let tags = (git-command "listing release tags" {
+        ^jj tag list -T 'name ++ "\n"' $"glob:'($RELEASE_TAG_GLOB)'"
+    } | lines | uniq)
+    let revisions = (git-command "listing unreleased revisions" {
+        ^jj log -r $range --reversed --no-graph -T 'commit_id ++ "\t" ++ committer.timestamp().utc().format("%Y.%m.%d") ++ "\t" ++ description.escape_json() ++ "\n"'
+    } | lines | where {|line| $line | is-not-empty } | each {|line|
+        let fields = ($line | split row "\t")
+        { commit: ($fields | first) date: ($fields | get 1) description: ($fields | skip 2 | str join "\t" | from json) }
+    })
+    mut known = $tags
+    for revision in $revisions {
+        let impact = (parse-impact $revision.description)
+        if $impact not-in ["behavior" "breaking"] { continue }
+        let version = (next-version $revision.date $known)
+        let title = $"($version): ($revision.description | lines | first)"
+        if $dry_run {
+            print $"would release ($title) at ($revision.commit | str substring 0..11)"
+        } else {
+            run-command $"tagging ($version)" { ^jj tag set $version -r $revision.commit } | ignore
+            run-remote $"pushing ($version) to ($TRUNK_REMOTE)" { ^jj git push --remote $TRUNK_REMOTE --tag $version } | ignore
+            print $"released ($title)"
+            report-status done $"Released ($title)" --id $"release/($version)"
+        }
+        $known = ($known | append $version)
+    }
+}
+
+# Release every user-facing revision on main since the newest release. `ci
+# land` releases what it lands; this catches up after a failed tag push.
+# Without an earlier release, only main itself is considered.
+def "main release" [--dry-run] {
+    let newest = (^jj log -r $"latest\(tags\(glob:'($RELEASE_TAG_GLOB)') & ::main@tangled)" --no-graph -T commit_id | complete)
+    let range = if $newest.exit_code == 0 and ($newest.stdout | str trim | is-not-empty) {
+        $"($newest.stdout | str trim)..main@tangled"
+    } else {
+        "main@tangled"
+    }
+    cut-releases $range $dry_run
+}
+
+# The newest CalVer release contained in the current revision.
+def "main version" [] {
+    let commit = (current-change "commit_id")
+    run-command "describing the current revision" {
+        with-env (git-context) { ^git describe --tags --match $RELEASE_TAG_GLOB $commit }
+    }
+}
+
+# A verification records that a person tried a release on a real machine. The
+# landing gate proves only that each closure builds, so this is the evidence
+# that the running configuration behaves as the release describes. Each host
+# keeps its own under the state directory and sends a copy to homelab, whose
+# SSH account for it can only append one record.
+const VERIFICATION_REMOTE = "config-verifications@homelab"
+# OpenSSH's second port on homelab; Tailscale SSH owns port 22 there and
+# would ignore the account's forced command.
+const VERIFICATION_PORT = "2222"
+# Written by the activation script in modules/nixos/core.nix.
+const ACTIVATION_LOG = "/var/log/nixos-activations.jsonl"
+
+def verification-dir [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "config-verifications"
+}
+
+def read-jsonl [path: string] {
+    if not ($path | path exists) { return [] }
+    open --raw $path | lines | where {|line| $line | str trim | is-not-empty } | each {|line| $line | from json }
+}
+
+# Release tags, newest first, with their commits and titles.
+def releases [] {
+    let tags = (git-command "listing releases" {
+        ^jj tag list -T 'name ++ "\t" ++ normal_target.commit_id() ++ "\t" ++ normal_target.description().first_line() ++ "\n"' $"glob:'($RELEASE_TAG_GLOB)'"
+    } | lines | where {|line| $line | is-not-empty } | parse "{release}\t{commit}\t{title}")
+    $tags | insert order {|tag| $tag.release | split row "." | into int } | sort-by order --reverse | reject order
+}
+
+# The toplevel store path `host` would run at `commit`. Evaluates; builds nothing.
+def release-toplevel [commit: string, host: string] {
+    with-commit-trees { release: $commit } {|trees|
+        git-command $"evaluating ($host) at ($commit | str substring 0..11)" {
+            ^nix eval --raw --no-update-lock-file $"path:($trees.release)#nixosConfigurations.($host).config.system.build.toplevel.outPath"
+        }
+    }
+}
+
+# Send queued verifications to homelab in order, stopping at the first
+# failure so an unreachable homelab keeps the rest queued.
+def flush-verifications [] {
+    let outbox = (verification-dir | path join "outbox.jsonl")
+    if not ($outbox | path exists) { return }
+    let pending = (open --raw $outbox | lines | where {|line| $line | str trim | is-not-empty })
+    mut sent = 0
+    mut failure = ""
+    # Name the user config explicitly, as git's core.sshCommand does: inside
+    # Claude Desktop's sandbox ssh rejects the store-owned ~/.ssh/config.
+    let user_config = ($env.HOME | path join ".ssh" "config")
+    let config_args = if ($user_config | path exists) { ["-F" $user_config] } else { [] }
+    for line in $pending {
+        let result = ($line | ^ssh ...$config_args -T -p $VERIFICATION_PORT -o BatchMode=yes -o ConnectTimeout=10 $VERIFICATION_REMOTE | complete)
+        if $result.exit_code != 0 {
+            $failure = ($result.stderr | str trim)
+            break
+        }
+        $sent += 1
+    }
+    let remaining = ($pending | skip $sent)
+    if ($remaining | is-empty) {
+        rm $outbox
+    } else {
+        $remaining | each {|line| $"($line)\n" } | str join | save --force $outbox
+    }
+    if $sent > 0 { print $"Sent ($sent) verification\(s) to homelab." }
+    if ($remaining | is-not-empty) {
+        print --stderr $"Could not reach homelab \(($failure)); ($remaining | length) verification\(s) stay queued. Retry with `ci verify flush`."
+    }
+}
+
+# Record that this host runs RELEASE and that you tested it, then send the
+# record to homelab. Refuses unless the running system is exactly that
+# release's toplevel for this host.
+def "main verify" [
+    release?: string # The CalVer release to verify; defaults to the newest
+    --message (-m): string # How you tested it
+] {
+    if ($message | default "" | str trim | is-empty) {
+        error make { msg: "Say how you tested the release with --message." }
+    }
+    let host = (sys host | get hostname)
+    let running = ("/run/current-system" | path expand)
+    let target = if $release == null {
+        # A newer release may not be activated yet, so take the newest recent
+        # one that this host is running. Each candidate costs an evaluation.
+        mut found = []
+        for tag in (releases | first 5) {
+            print --stderr $"Checking ($tag.release)…"
+            if (release-toplevel $tag.commit $host) == $running {
+                $found = [$tag]
+                break
+            }
+        }
+        if ($found | is-empty) {
+            error make { msg: $"None of the 5 newest releases builds the running system ($running) for ($host). Name the release with `ci verify RELEASE`." }
+        }
+        $found | first
+    } else {
+        let tag = (releases | where release == $release | get --optional 0)
+        if $tag == null { error make { msg: $"No release named ($release)." } }
+        let expected = (release-toplevel $tag.commit $host)
+        if $expected != $running {
+            error make { msg: $"This host is not running ($release): it runs ($running), but ($release) builds ($expected) for ($host). Activate the release first." }
+        }
+        $tag
+    }
+    # The latest switch to this toplevel, if the activation hook saw one.
+    let activation = (read-jsonl $ACTIVATION_LOG | where toplevel == $running | reverse | get --optional 0)
+    let record = {
+        host: $host
+        release: $target.release
+        commit: $target.commit
+        title: $target.title
+        toplevel: $running
+        profile: ($activation.profile? | default null)
+        activated_at: ($activation.time? | default null)
+        verified_at: (date now | format date "%+")
+        note: ($message | str trim)
+    }
+    let dir = (verification-dir)
+    mkdir $dir
+    let line = $"($record | to json --raw)\n"
+    $line | save --append ($dir | path join "verified.jsonl")
+    $line | save --append ($dir | path join "outbox.jsonl")
+    print $"Verified ($target.release) on ($host): ($record.note)"
+    flush-verifications
+}
+
+# Resend verifications that have not reached homelab yet.
+def "main verify flush" [] {
+    flush-verifications
+}
+
+# Recent releases and whether this host has verified them.
+def "main verify list" [
+    --count: int = 10 # How many releases to show
+] {
+    let host = (sys host | get hostname)
+    let dir = (verification-dir)
+    let verified = (read-jsonl ($dir | path join "verified.jsonl") | where host == $host)
+    let queued = (read-jsonl ($dir | path join "outbox.jsonl") | length)
+    if $queued > 0 { print --stderr $"($queued) verification\(s) not yet sent to homelab; run `ci verify flush`." }
+    releases | first $count | each {|tag|
+        let latest = ($verified | where release == $tag.release | reverse | get --optional 0)
+        {
+            release: $tag.release
+            title: $tag.title
+            verified: ($latest.verified_at? | default null)
+            note: ($latest.note? | default null)
+        }
+    }
+}
+
+def dispatch-stack [] {
+    require-ready-change
+    rebase-topic
+    require-ready-change
+    validate-change
+    push-tangled-stack
+}
+
+def "main tangled stack-publish" [] {
+    renamed "tangled stack-publish" "dispatch --stack"
+    dispatch-stack
+}
+
+def list-workspaces [] {
+    git-command "listing workspaces" {
+        ^jj workspace list -T 'name ++ "\t" ++ root ++ "\n"'
+    } | lines | where {|line| $line | is-not-empty } | each {|line|
+        let fields = ($line | split row "\t")
+        { name: ($fields | first) root: ($fields | last) }
+    }
+}
+
+def current-workspace [] {
+    let root = (run-command "locating the workspace" { ^jj root })
+    list-workspaces | where root == $root | first
+}
+
+# `ci start` writes this marker. A workspace that carries it belongs to its
+# topic, and `finish` or `abandon` removes it when the topic ends.
+def owned-workspace-marker [root: string] {
+    $root | path join ".jj" "jj-ci-workspace.json"
+}
+
+# Forget a workspace and delete its directory. JJ abandons its empty working
+# copy; the operation log keeps every other commit recoverable. The caller
+# moves to the default checkout, since the dropped one may be its own.
+def --env drop-workspace [workspace: record] {
+    let default_root = (workspace-root "default")
+    run-command $"forgetting ($workspace.name)" {
+        ^jj --repository $default_root workspace forget $workspace.name
+    } | ignore
+    cd $default_root
+    if ($workspace.root | path exists) { rm --recursive $workspace.root }
+}
+
+# The Codex hook's per-session record, which maps a task to its workspace.
+def codex-session-state-path [session_id: string] {
+    let state_dir = ($env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state"))
+    $state_dir | path join "codex-jj-sessions" $"($session_id).json"
+}
+
+# End a Codex task's ownership record with `outcome`, in the workspace and in
+# the task's session record, and remove the claim that serialized its startup.
+# `finished` stays for hooks built before `state` existed.
+def end-ownership [root: string, outcome: string] {
+    let owner_path = ($root | path join ".jj" "codex-session.json")
+    if ($owner_path | path exists) {
+        let owner = (open $owner_path | upsert state $outcome | upsert finished true)
+        $owner | to json | save --force $owner_path
+        let session_id = ($owner.session_id? | default "")
+        if $session_id =~ '^[a-zA-Z0-9_-]+$' {
+            let session_path = (codex-session-state-path $session_id)
+            if ($session_path | path exists) {
+                open $session_path | upsert state $outcome | upsert finished true | to json | save --force $session_path
+            }
+        }
+    }
+    let claim = ($root | path join ".jj" "codex-session-claim")
+    if ($claim | path exists) { rm --recursive $claim }
+}
+
+# Release the topic onto an empty change on main. A workspace that `ci start`
+# created is then dropped; any other one stays and its Codex owner records
+# `outcome` (delivered or discarded).
+def --env release-workspace [summary: string, change: string, keep: bool, outcome: string] {
+    let workspace = (current-workspace)
+    run-command "leaving a clean workspace on main" { ^jj new main@tangled } | ignore
+    let marker = (owned-workspace-marker $workspace.root)
+    if not $keep and $workspace.name != "default" and ($marker | path exists) {
+        drop-workspace $workspace
+        print $"($summary) Removed workspace ($workspace.name); continue from ($env.PWD)."
+        return
+    }
+    # A kept workspace joins the pool: its next task starts a fresh topic, so
+    # the finished topic's marker must not pin the next session to it.
+    if ($marker | path exists) { rm $marker }
+    let owner_path = ($workspace.root | path join ".jj" "codex-session.json")
+    if ($owner_path | path exists) and (open $owner_path).change_id? == $change {
+        end-ownership $workspace.root $outcome
+    }
+    print $"($summary) Workspace is on main; the Codex task can now be archived."
+}
+
+# What `ci unclaim` may do, from the ownership record's status, whether the
+# owner's change is still checked out here, and whether a claim remains. It
+# never releases a change that is checked out: `finish` or `abandon` owns that.
+def unclaim-verdict [facts: record] {
+    # An ended record from before `state` is rewritten as released, so no
+    # reader can mistake its `finished` for delivery.
+    let nothing = { release: false clear_claim: false normalize: (($facts.legacy? | default false) and $facts.status != "active") refuse: null }
+    match $facts.status {
+        "none" => (if $facts.claim {
+            $nothing | upsert clear_claim true
+        } else {
+            $nothing | upsert refuse "No Codex task owns this workspace."
+        })
+        "active" => (if $facts.at_owner_change {
+            $nothing | upsert refuse "The owning task's change is checked out here. Use `ci park` or `ci cancel` to end the topic."
+        } else {
+            { release: true clear_claim: true normalize: false refuse: null }
+        })
+        _ => ($nothing | upsert clear_claim $facts.claim)
+    }
+}
+
+# The changes this workspace holds: @, and its parent when @ is an empty,
+# undescribed scratch change on top of it.
+def checked-out-changes [] {
+    let scratch = (current-change 'empty && description == ""') == "true"
+    let revset = if $scratch { "@ | @-" } else { "@" }
+    git-command "reading the checked-out changes" {
+        ^jj log -r $revset --no-graph -T 'change_id ++ "\n"'
+    } | lines | where {|line| $line | is-not-empty }
+}
+
+# The linked Git worktree that holds `dir` inside the JJ workspace `root`, or
+# null. Claude Code's desktop app gives each session such a worktree under
+# .claude/worktrees and refuses edits outside it. Keep in step with
+# enclosing-git-worktree in context-status.nu.
+def enclosing-git-worktree [dir: path, root: path] {
+    mut current = ($dir | path expand)
+    while ($current | str starts-with $"($root)/") {
+        if ($current | path join ".git" | path type) == "file" { return $current }
+        $current = ($current | path dirname)
+    }
+    null
+}
+
+# Where `ci start` puts a workspace: inside the Git worktree it runs from, so
+# a session confined to that worktree can edit it, or else beside the default
+# checkout.
+def start-parent [default_root: string, worktree: any] {
+    $worktree | default $default_root | path join ".jj-workspaces"
+}
+
+def "main start" [
+    name: string # Workspace and topic name
+] {
+    if $name !~ '^[a-z0-9][a-z0-9-]*$' {
+        error make { msg: "Use a lowercase name of letters, digits, and hyphens." }
+    }
+    if $name in (list-workspaces | get name) {
+        error make { msg: $"Workspace ($name) already exists. Park or cancel its topic first, or start a topic there with `ci new`." }
+    }
+    let default_root = (workspace-root "default")
+    let root = (start-parent $default_root (enclosing-git-worktree $env.PWD $default_root) | path join $name)
+    if ($root | path exists) {
+        error make { msg: $"($root) already exists. Inspect it with `ci prune` before reusing the name." }
+    }
+    fetch-trunk
+    mkdir ($root | path dirname)
+    run-command $"creating workspace ($name)" {
+        ^jj --repository $default_root workspace add --revision main@tangled --name $name $root
+    } | ignore
+    # The working-copy change JJ just created is the topic; recording it lets
+    # later commands notice when the working copy leaves it.
+    let topic = (^jj --repository $root log -r @ --no-graph -T change_id | complete)
+    if $topic.exit_code != 0 { error make { msg: ($topic.stderr | str trim) } }
+    { name: $name created: (date now | format date "%+") change_id: ($topic.stdout | str trim) } | to json | save (owned-workspace-marker $root)
+    print $"Created ($root) on main@tangled. Edit and run `jj` and `ci` there; `ci park` or `ci cancel` removes it when the topic ends."
+}
+
+# Why `ci new` may not start another topic in this workspace, or null. A
+# workspace that an active task or `ci start` dedicated to one topic keeps it
+# until `finish` or `abandon`; any other one holds sibling topics.
+def new-topic-refusal [facts: record] {
+    if $facts.owner == "active" {
+        return "An active Codex task owns this workspace's change. Start concurrent work in its own workspace with `ci start NAME`."
+    }
+    if $facts.dedicated and not $facts.topic_done {
+        return "This workspace belongs to one unfinished topic from `ci start`. Finish or abandon it, or start concurrent work with `ci start NAME`."
+    }
+    null
+}
+
+# Start a topic as a new change on main@tangled in this workspace. The current
+# topic stays where it is, as a sibling; return to it with `jj edit`.
+def "main new" [
+    --message (-m): string # Description for the new topic
+] {
+    require-jj-workspace-here
+    let root = (git-command "locating the workspace" { ^jj root })
+    let marker = (owned-workspace-marker $root)
+    let facts = (topic-facts)
+    let refusal = (new-topic-refusal {
+        owner: (owner-status (session-owner))
+        dedicated: ($marker | path exists)
+        topic_done: ($facts.landed or not $facts.visible or $facts.topic_empty)
+    })
+    if $refusal != null { error make { msg: $refusal } }
+    let previous = if (current-change 'empty && description == ""') == "true" {
+        null
+    } else {
+        { id: (current-change "change_id.short()") title: (current-change "description.first_line()") }
+    }
+    fetch-trunk
+    let args = if $message == null { [] } else { [--message $message] }
+    run-command "starting a topic on main@tangled" { ^jj new main@tangled ...$args } | ignore
+    # A pool workspace's marker named the landed topic; the new one is not it.
+    if ($marker | path exists) { rm $marker }
+    let created = (current-change "change_id.short()")
+    if $previous == null {
+        print $"Started topic ($created) on main@tangled."
+    } else {
+        print $"Started topic ($created) on main@tangled. ($previous.id) \"($previous.title)\" stays as a sibling; return with `jj edit ($previous.id)`."
+    }
+}
+
+# The topic that `finish` closes. Landing fast-forwards main onto the topic
+# head, which makes the working-copy commit immutable, so jj parks the
+# workspace on a new empty child. That child has no publication of its own;
+# the landed parent it sits on is the topic.
+def finish-topic-id [] {
+    let current = (current-topic-id)
+    if (current-change "empty") != "true" or (current-change "description") != "" {
+        return $current
+    }
+    let parent = (^jj log -r "@- ~ root()" --no-graph -T 'change_id ++ "\n"' | complete)
+    let parents = ($parent.stdout | lines | where {|line| $line | is-not-empty })
+    if $parent.exit_code == 0 and ($parents | length) == 1 and ($parents | first) in (publication-topics) {
+        $parents | first
+    } else {
+        $current
+    }
+}
+
+# Taxi in and shut down: confirm the topic landed, then free its workspace.
+def --env "main park" [
+    --keep # Keep a workspace that `ci start` created
+] {
+    let change = (finish-topic-id)
+    require-owned-change $change
+    let branch = (publication-bookmark $change)
+    let empty = (current-change "empty") == "true"
+    checkpoint "park"
+    fetch-trunk
+    # An empty working copy is either an unpublished topic or one parked on top
+    # of its landed work; a published branch must be on main either way.
+    let published = (revset-change-ids (remote-bookmark-revset $branch) | is-not-empty)
+    if $empty {
+        if $published and not (topic-landed $branch) {
+            error make { msg: $"($branch) is dispatched but not on main. Land it or cancel it explicitly before parking." }
+        }
+    } else if (revset-change-ids "@ & ::main@tangled" | is-empty) {
+        error make { msg: "The current revision is not on main. Land it with `ci land`, and leave the task open until it has." }
+    }
+    delete-topic-bookmark $branch
+    forget-publication-bookmark $change
+    run-command "advancing main" { ^jj bookmark move main --to main@tangled } | ignore
+    let summary = if $published { $"Parked ($branch)." } else { "Parked an undispatched topic." }
+    # Past the checks above, a published or non-empty topic is on main.
+    release-workspace $summary $change $keep (if $published or not $empty { "delivered" } else { "discarded" })
+    report-status done $summary --id park
+}
+
+def --env "main finish" [
+    --keep # Keep a workspace that `ci start` created
+] {
+    renamed "finish" "park"
+    main park --keep=$keep
+}
+
+def --env "main abandon" [
+    --keep # Keep a workspace that `ci start` created
+] {
+    renamed "abandon" "cancel"
+    main cancel --keep=$keep
+}
+
+# Scrub the flight: abandon the topic's revisions and free its workspace.
+def --env "main cancel" [
+    --keep # Keep a workspace that `ci start` created
+] {
+    require-owned-change
+    let change = (current-change "change_id")
+    let branch = (publication-bookmark)
+    let open = (open-pulls (tangled-repo) | where branch == $branch)
+    if ($open | is-not-empty) {
+        error make { msg: $"The pull request \"($open | first | get title)\" is still open. Close it deliberately before cancelling the topic." }
+    }
+    let revisions = (topic-revisions)
+    checkpoint "cancel"
+    forget-publication-bookmark
+    delete-topic-bookmark $branch
+    if ($revisions | is-not-empty) {
+        let moved = (other-workspaces-in $"\(($revisions | get commit_id | str join ' | '))::")
+        run-command "abandoning the topic" { ^jj abandon ...($revisions | get change_id) } | ignore
+        update-moved-workspaces $moved
+    }
+    release-workspace $"Cancelled the topic and abandoned ($revisions | length) revision\(s)." $change $keep "discarded"
+}
+
+# Release a Codex task's claim on this workspace when the task left its change
+# behind without `finish` or `abandon`, or clear a claim left without an owner.
+# The topic itself is untouched: its revisions, branch, and pull request stay
+# where they are, and it can continue in another workspace.
+def "main unclaim" [] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    let owner = (session-owner)
+    let claim = ($root | path join ".jj" "codex-session-claim")
+    let verdict = (unclaim-verdict {
+        status: (owner-status $owner)
+        at_owner_change: ($owner != null and ($owner.change_id? in (checked-out-changes)))
+        claim: ($claim | path exists)
+        legacy: ($owner != null and ($owner.state? | default "") == "")
+    })
+    if $verdict.refuse != null { error make { msg: $verdict.refuse } }
+    if $verdict.normalize {
+        # end-ownership also removes the claim.
+        end-ownership $root "released"
+        print $"Marked the pre-`state` record for change ($owner.change_id? | default 'unknown' | str substring 0..7) as vacated; it no longer reads as parked."
+    } else if $verdict.release {
+        end-ownership $root "released"
+        # This workspace no longer holds the topic, so its publication entry
+        # would only mislead a later task here.
+        forget-publication-bookmark $owner.change_id
+        print $"Vacated change ($owner.change_id | str substring 0..7) from Codex task ($owner.session_id? | default 'unknown'). Its revisions and branch are unchanged."
+    } else if $verdict.clear_claim {
+        rm --recursive $claim
+        print "Removed a session claim that no active task holds."
+    } else {
+        print "Nothing to vacate."
+    }
+}
+
+def owner-state [root: string] {
+    let path = ($root | path join ".jj" "codex-session.json")
+    owner-status (if ($path | path exists) { open $path } else { null })
+}
+
+# The facts prune decides from. Running JJ inside a workspace snapshots any
+# unrecorded edits first. A stale workspace is updated only when `refresh` is
+# set, because updating rewrites its files.
+def workspace-facts [workspace: record, current: string, refresh: bool] {
+    let facts = {
+        name: $workspace.name
+        current: ($workspace.root == $current)
+        exists: ($workspace.root | path exists)
+        git_worktree: ($workspace.root | path join ".git" | path exists)
+        codex_worktree: ($workspace.root | str starts-with ($env.CODEX_HOME? | default ($env.HOME | path join ".codex") | path join "worktrees"))
+        owner: (owner-state $workspace.root)
+        stale: false
+        error: null
+        pending: false
+    }
+    if $workspace.name == "default" or $facts.current or not $facts.exists or $facts.git_worktree or $facts.codex_worktree or $facts.owner == "active" {
+        return $facts
+    }
+    let probe = {|| do { ^jj --repository $workspace.root log -r @ --no-graph -T commit_id } | complete }
+    mut state = (do $probe)
+    if $state.exit_code != 0 and ($state.stderr | str contains "stale") {
+        if not $refresh { return ($facts | upsert stale true) }
+        let updated = (do { ^jj --repository $workspace.root workspace update-stale } | complete)
+        if $updated.exit_code != 0 { return ($facts | upsert error ($updated.stderr | str trim)) }
+        $state = (do $probe)
+    }
+    if $state.exit_code != 0 { return ($facts | upsert error ($state.stderr | str trim | lines | first)) }
+    # Everything above trunk except an empty, undescribed working copy. Landed
+    # work is on main itself, so it never counts.
+    let pending = (do {
+        ^jj --repository $workspace.root log -r 'heads((main@tangled..@) ~ (@ & empty() & description(exact:"")))' --no-graph -T 'change_id ++ "\n"'
+    } | complete)
+    if $pending.exit_code != 0 { return ($facts | upsert error ($pending.stderr | str trim | lines | first)) }
+    $facts | upsert pending ($pending.stdout | str trim | is-not-empty)
+}
+
+# Why prune must keep a workspace, or null when nothing in it is live: it is
+# missing, or nothing above trunk remains except an empty undescribed working
+# copy.
+def prune-verdict [facts: record] {
+    if $facts.name == "default" { return "default workspace" }
+    if $facts.current { return "current workspace" }
+    if not $facts.exists { return null }
+    if $facts.git_worktree { return "Git worktree; remove it with its owner" }
+    if $facts.codex_worktree { return "Codex worktree; archive its task instead" }
+    if $facts.owner == "active" { return "owned by an active task" }
+    if $facts.stale { return "stale; `ci prune --apply` updates it and decides again" }
+    if $facts.error != null { return $"unreadable: ($facts.error)" }
+    if $facts.pending { return "has undelivered changes" }
+    null
+}
+
+def prune-checkpoints [root: string, cutoff: datetime, apply: bool] {
+    let directory = ($root | path join ".jj" "jj-ci-checkpoints")
+    if not ($directory | path exists) { return 0 }
+    let old = (ls $directory | where modified < $cutoff)
+    if $apply { $old | each {|file| rm $file.name } | ignore }
+    $old | length
+}
+
+# Prune is the backstop for owners that never released their workspace: a
+# crashed task, or a workspace created before `ci start`.
+def --env "main prune" [
+    --apply # Update stale workspaces, then forget and delete the listed ones and checkpoints
+    --keep-days: int = 14 # Keep checkpoints newer than this
+] {
+    fetch-trunk
+    let current = (git-command "locating the workspace" { ^jj root })
+    if $apply { checkpoint "prune" }
+    let reviewed = (list-workspaces | each {|workspace|
+        let facts = (workspace-facts $workspace $current $apply)
+        $workspace | insert keep (prune-verdict $facts)
+    })
+    let removable = ($reviewed | where keep == null)
+    let kept = ($reviewed | where keep != null)
+    let cutoff = (date now) - ($keep_days * 1day)
+    for workspace in $removable {
+        if $apply { drop-workspace $workspace }
+        print $"(if $apply { 'removed' } else { 'would remove' }) ($workspace.name): ($workspace.root)"
+    }
+    for workspace in $kept {
+        print $"kept ($workspace.name): ($workspace.keep)"
+    }
+    let checkpoints = ($kept | where {|workspace| $workspace.root | path exists } | each {|workspace| prune-checkpoints $workspace.root $cutoff $apply } | math sum)
+    print $"(if $apply { 'Removed' } else { 'Would remove' }) ($checkpoints) checkpoint\(s) older than ($keep_days) days."
+    if not $apply { print "Dry run only. Re-run with `ci prune --apply` to remove them." }
+}
