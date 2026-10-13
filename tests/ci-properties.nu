@@ -544,6 +544,24 @@ for-all "a Prek failure names every failed hook" {|key|
     for hook in $run.failed { assert ($verdict.error | default "" | str contains $hook) $"did not name ($hook)" }
 }
 
+# Preflight skips Prek only where Prek would find no configuration: none in
+# the work tree or any directory above it.
+for-all "prek-config finds the nearest configuration at or above the work tree" {|key|
+    let base = (mktemp --directory --tmpdir "ci-prek-config.XXXXXX" | path expand)
+    let dirs = [$base ($base | path join "repo") ($base | path join "repo" "sub")]
+    for dir in $dirs { mkdir $dir }
+    let placed = ($dirs | enumerate | each {|dir|
+        let name = (pick-from $"($key)/name/($dir.index)" ([null] ++ $PREK_CONFIGS))
+        if $name != null { "" | save ($dir.item | path join $name) }
+        if $name == null { null } else { $dir.item | path join $name }
+    })
+    let expected = ($placed | reverse | compact | get --optional 0)
+    let found = (prek-config ($base | path join "repo" "sub"))
+    rm --recursive $base
+    # A configuration above the temporary directory would also count.
+    if $expected != null { assert equal $found $expected }
+}
+
 for-all "unclaim leaves no claim without an active owner" {|key|
     let facts = (gen-unclaim-facts $key)
     let verdict = (unclaim-verdict $facts)

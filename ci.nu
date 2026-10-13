@@ -1528,6 +1528,23 @@ def prek-verdict [runs: list] {
     { rerun: false error: $"Prek failed($hooks).($cause) Its output is above." }
 }
 
+# The files Prek reads its hooks from, in the directory it runs in or the
+# nearest parent that has one.
+const PREK_CONFIGS = ["prek.toml" ".pre-commit-config.yaml" ".pre-commit-config.yml"]
+
+# The Prek configuration that applies in `dir`, or null when there is none.
+def prek-config [dir: path] {
+    mut current = ($dir | path expand)
+    loop {
+        let dir = $current
+        let found = ($PREK_CONFIGS | each {|name| $dir | path join $name } | where {|path| $path | path exists })
+        if ($found | is-not-empty) { return ($found | first) }
+        let parent = ($current | path dirname)
+        if $parent == $current { return null }
+        $current = $parent
+    }
+}
+
 def run-prek [context: record, paths: list<string>] {
     let result = (do {
         with-env $context {
@@ -1543,6 +1560,13 @@ def run-prek [context: record, paths: list<string>] {
 def validate-change [] {
     run-command "fixing the current JJ change" { ^jj fix -s @ } | ignore
     let context = (git-context)
+    # A repository without hooks has nothing for Prek to run, and Prek
+    # fails there instead of passing; its flake checks still gate landing.
+    if (prek-config $context.GIT_WORK_TREE) == null {
+        print $"No Prek configuration in ($context.GIT_WORK_TREE); no hooks to run."
+        record-validation
+        return
+    }
     let files = (do {
         cd $context.GIT_WORK_TREE
         ^jj file list

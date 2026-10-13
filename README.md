@@ -380,7 +380,11 @@ manual resolutions.
 `ci preflight` and `ci dispatch` record the commit Prek passed in
 `.jj/jj-ci-validation.json`. JJ snapshots every edit as a new commit, so the
 record stops matching the working copy as soon as the topic changes; comparing
-the two answers whether lint is fresh without running Prek again.
+the two answers whether lint is fresh without running Prek again. A
+repository with no Prek configuration (`prek.toml` or
+`.pre-commit-config.yaml` in the work tree or a directory above it) has no
+hooks to run: preflight says so and records the commit as passed, and the
+flake checks remain the landing gate.
 
 `ci ci-state` prints the current topic's dispatch branch, the head
 Tangled holds for it, whether it landed, its open pull request, and the
