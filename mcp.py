@@ -379,8 +379,8 @@ async def prune_dry_run(
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
-    """`ci prune`: list leaked workspaces and old checkpoints that
-    `ci prune --apply` would delete. Deletes nothing."""
+    """`ci prune`: list leaked workspaces, landed topic branches, and old
+    checkpoints that `ci prune --apply` would delete. Deletes nothing."""
     return await run(
         ["prune", "--keep-days", str(keep_days)],
         workspace,

@@ -2799,22 +2799,72 @@ def owner-state [root: string] {
     owner-status (if ($path | path exists) { open $path } else { null })
 }
 
+# A Codex task archived or abandoned without `ci park` leaves its record
+# active, and prune kept such workspaces forever: three from 2026-10-01 were
+# still held five days later. Codex appends to the task's rollout file while
+# the task runs, so a rollout quiet for this long, or archived, ends the claim
+# as far as prune is concerned. Work above trunk is kept either way.
+const OWNER_QUIET = 2day
+
+# Whether a Codex task still runs, from its rollout file: `ended` when the
+# rollout was archived or has been quiet past OWNER_QUIET, `live` when it was
+# written since, and `unknown` when no rollout names the session.
+def owner-liveness [facts: record] {
+    if $facts.archived { return "ended" }
+    if $facts.last_write == null { return "unknown" }
+    if ($facts.now - $facts.last_write) > $OWNER_QUIET { "ended" } else { "live" }
+}
+
+def codex-rollout-facts [session_id: string] {
+    let home = ($env.CODEX_HOME? | default ($env.HOME | path join ".codex"))
+    if $session_id !~ '^[a-zA-Z0-9_-]+$' { return { archived: false last_write: null } }
+    let live = (glob $"($home)/sessions/**/*($session_id).jsonl")
+    let archived = (glob $"($home)/archived_sessions/**/*($session_id).jsonl")
+    {
+        archived: ($archived | is-not-empty)
+        last_write: (if ($live | is-empty) { null } else { $live | each {|file| ls --long $file | first | get modified } | math max })
+    }
+}
+
+# When this workspace was last used: the newer of its `ci start` marker and
+# JJ's tree state, which a snapshot that found edits or a checkout rewrites.
+# (Its `checkout` file is no guide: operations in other workspaces rewrite
+# it.) Read from the filesystem, so asking never snapshots anyone's edits.
+def workspace-last-used [root: string] {
+    let dot_jj = ($root | path join ".jj")
+    let candidates = [($dot_jj | path join "jj-ci-workspace.json") ($dot_jj | path join "working_copy" "tree_state")]
+    let times = ($candidates | where {|path| $path | path exists } | each {|path| ls --long $path | first | get modified })
+    if ($times | is-empty) { null } else { $times | math max }
+}
+
 # The facts prune decides from. Running JJ inside a workspace snapshots any
-# unrecorded edits first. A stale workspace is updated only when `refresh` is
+# unrecorded edits first, so a workspace used within `idle` is kept before
+# any JJ call reaches it. A stale workspace is updated only when `refresh` is
 # set, because updating rewrites its files.
-def workspace-facts [workspace: record, current: string, refresh: bool] {
+def workspace-facts [workspace: record, current: string, refresh: bool, idle: duration] {
+    let exists = ($workspace.root | path exists)
+    let owner_path = ($workspace.root | path join ".jj" "codex-session.json")
+    let owner = (owner-state $workspace.root)
+    let liveness = if $owner == "active" {
+        let record = (try { open $owner_path } catch { {} })
+        owner-liveness (codex-rollout-facts ($record.session_id? | default "") | insert now (date now))
+    } else { "none" }
+    let last_used = if $exists { workspace-last-used $workspace.root } else { null }
     let facts = {
         name: $workspace.name
         current: ($workspace.root == $current)
-        exists: ($workspace.root | path exists)
+        exists: $exists
         git_worktree: ($workspace.root | path join ".git" | path exists)
         codex_worktree: ($workspace.root | str starts-with ($env.CODEX_HOME? | default ($env.HOME | path join ".codex") | path join "worktrees"))
-        owner: (owner-state $workspace.root)
+        owner: $owner
+        owner_ended: ($liveness == "ended")
+        last_used: $last_used
+        recent: ($last_used != null and ((date now) - $last_used) < $idle)
         stale: false
         error: null
         pending: false
     }
-    if $workspace.name == "default" or $facts.current or not $facts.exists or $facts.git_worktree or $facts.codex_worktree or $facts.owner == "active" {
+    if $workspace.name == "default" or $facts.current or not $facts.exists or $facts.git_worktree or $facts.codex_worktree or $facts.recent or ($facts.owner == "active" and not $facts.owner_ended) {
         return $facts
     }
     let probe = {|| do { ^jj --repository $workspace.root log -r @ --no-graph -T commit_id } | complete }
@@ -2844,7 +2894,8 @@ def prune-verdict [facts: record] {
     if not $facts.exists { return null }
     if $facts.git_worktree { return "Git worktree; remove it with its owner" }
     if $facts.codex_worktree { return "Codex worktree; archive its task instead" }
-    if $facts.owner == "active" { return "owned by an active task" }
+    if ($facts.recent? | default false) { return "used recently; `--idle` keeps it" }
+    if $facts.owner == "active" and not ($facts.owner_ended? | default false) { return "owned by an active task" }
     if $facts.stale { return "stale; `ci prune --apply` updates it and decides again" }
     if $facts.error != null { return $"unreadable: ($facts.error)" }
     if $facts.pending { return "has undelivered changes" }
@@ -2859,28 +2910,71 @@ def prune-checkpoints [root: string, cutoff: datetime, apply: bool] {
     $old | length
 }
 
+# Topic branches whose every copy, local or on a remote, is already on main,
+# from rows of { name, landed } per copy. A topic landed without `ci park`
+# kept its branch: seventeen such `jj-*` branches stood on 2026-10-07.
+# Branches a remaining workspace still records for its topic stay for its
+# `ci park`, which reads them to tell a delivered topic from a discarded one.
+def landed-branches [copies: list, in_use: list] {
+    $copies | group-by name | transpose name rows
+    | where {|branch| ($branch.rows | all {|copy| $copy.landed }) and $branch.name not-in $in_use }
+    | get name
+}
+
+def topic-branch-copies [] {
+    git-command "listing topic branches" {
+        ^jj bookmark list --all-remotes -T 'if(normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*'
+    } | lines | where {|line| $line | is-not-empty } | parse "{name}\t{commit}" | uniq
+    | each {|copy| { name: $copy.name landed: (revset-change-ids $"($copy.commit) & ::main@tangled" | is-not-empty) } }
+}
+
+# The branches a workspace's `ci` publication state records for its topics.
+def recorded-branches [root: string] {
+    let path = ($root | path join ".jj" "jj-ci-publication.json")
+    if not ($path | path exists) { return [] }
+    try { open $path | get topics? | default {} | values } catch { [] }
+}
+
 # Prune is the backstop for owners that never released their workspace: a
-# crashed task, or a workspace created before `ci start`.
+# crashed or archived task, a topic landed without `ci park`, or a workspace
+# created before `ci start`. The daily `ci-prune` user timer runs it with
+# `--apply --idle 1day`.
 def --env "main prune" [
-    --apply # Update stale workspaces, then forget and delete the listed ones and checkpoints
+    --apply # Update stale workspaces, then forget and delete the listed workspaces, branches, and checkpoints
     --keep-days: int = 14 # Keep checkpoints newer than this
+    --idle: duration = 0sec # Keep workspaces used more recently than this, without running JJ in them
 ] {
     fetch-trunk
     let current = (git-command "locating the workspace" { ^jj root })
     if $apply { checkpoint "prune" }
     let reviewed = (list-workspaces | each {|workspace|
-        let facts = (workspace-facts $workspace $current $apply)
-        $workspace | insert keep (prune-verdict $facts)
+        let facts = (workspace-facts $workspace $current $apply $idle)
+        $workspace | insert keep (prune-verdict $facts) | insert owner_ended $facts.owner_ended | insert last_used $facts.last_used
     })
     let removable = ($reviewed | where keep == null)
     let kept = ($reviewed | where keep != null)
     let cutoff = (date now) - ($keep_days * 1day)
     for workspace in $removable {
-        if $apply { drop-workspace $workspace }
-        print $"(if $apply { 'removed' } else { 'would remove' }) ($workspace.name): ($workspace.root)"
+        if $apply {
+            # Close an ended task's record so its session state agrees.
+            if $workspace.owner_ended and ($workspace.root | path exists) { end-ownership $workspace.root "released" }
+            drop-workspace $workspace
+        }
+        let why = if $workspace.owner_ended { " (its Codex task ended without parking)" } else { "" }
+        print $"(if $apply { 'removed' } else { 'would remove' }) ($workspace.name): ($workspace.root)($why)"
     }
     for workspace in $kept {
-        print $"kept ($workspace.name): ($workspace.keep)"
+        # Work nobody has touched for days needs a person: land it or cancel it.
+        let untouched = if $workspace.last_used == null { null } else { (date now) - $workspace.last_used }
+        let age = if $untouched != null and $untouched > 1day { $", untouched for ($untouched // 1day) days" } else { "" }
+        print $"kept ($workspace.name): ($workspace.keep)($age)"
+    }
+    let in_use = ($kept | where {|workspace| $workspace.root | path exists } | each {|workspace| recorded-branches $workspace.root } | flatten)
+    for branch in (landed-branches (topic-branch-copies) $in_use) {
+        if $apply {
+            try { delete-topic-bookmark $branch } catch {|err| print --stderr $"could not delete ($branch): ($err.msg)" }
+        }
+        print $"(if $apply { 'deleted' } else { 'would delete' }) landed branch ($branch)"
     }
     let checkpoints = ($kept | where {|workspace| $workspace.root | path exists } | each {|workspace| prune-checkpoints $workspace.root $cutoff $apply } | math sum)
     print $"(if $apply { 'Removed' } else { 'Would remove' }) ($checkpoints) checkpoint\(s) older than ($keep_days) days."

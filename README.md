@@ -87,7 +87,7 @@ ci cancel
 # After activating the release:
 ci verify -m "how you tested it"
 # Occasionally, from any workspace:
-ci prune                    # List leaked workspaces; --apply removes them.
+ci prune                    # List leaked workspaces and landed branches; --apply removes them.
 ci sim --shell              # Try trunk plus dispatched user-facing topics, unactivated.
 ```
 
@@ -279,7 +279,22 @@ counts as pending. It also lists JJ checkpoints older than
 `--apply` first runs `jj workspace update-stale` there and decides again. `--apply` then forgets the listed
 workspaces, deletes their directories, and deletes the old checkpoints. Prune
 always keeps the default and current workspaces, Git and Codex worktrees, and
-anything with undelivered changes.
+anything with undelivered changes; a kept workspace untouched for more than
+a day says for how long, since such work needs someone to land or cancel it.
+
+A Codex task archived without `park` leaves its ownership record active.
+Prune treats that claim as ended once the task's rollout under
+`$CODEX_HOME/sessions` has been archived or quiet for two days, releases the
+record, and removes the workspace if nothing in it is pending. Prune also
+deletes topic branches whose every copy, local, on Tangled, and on GitHub,
+is already on `main`, unless a remaining workspace still records the branch
+for its topic, whose `park` needs it.
+
+`--idle DURATION` keeps every workspace used more recently than that, judged
+from its `ci start` marker and JJ's tree state on disk, before any JJ command
+runs there, so a live session's working copy is never snapshotted under it.
+The `ci-prune` user timer runs `ci prune --apply --idle 1day` in the default
+checkout once a day.
 
 ### Rebasing with conflicts
 

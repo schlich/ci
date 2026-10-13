@@ -298,6 +298,8 @@ def gen-workspace-facts [key: string] {
         git_worktree: (do $flag git)
         codex_worktree: (do $flag codex)
         owner: (pick-from $"($key)/owner" ["none" "active" "delivered" "discarded" "released"])
+        owner_ended: (do $flag ended)
+        recent: (do $flag recent)
         stale: (do $flag stale)
         error: (if (do $flag error) { "unreadable" } else { null })
         pending: (do $flag pending)
@@ -312,7 +314,8 @@ for-all "prune never removes a workspace that is live or unknown" {|key|
         if $facts.exists {
             assert (not $facts.git_worktree) "prune removed a Git worktree"
             assert (not $facts.codex_worktree) "prune removed a Codex worktree"
-            assert ($facts.owner != "active") "prune removed an owned workspace"
+            assert (not $facts.recent) "prune removed a workspace used within --idle"
+            assert ($facts.owner != "active" or $facts.owner_ended) "prune removed a live task's workspace"
             assert (not $facts.stale) "prune removed an unrefreshed workspace"
             assert ($facts.error == null) "prune removed an unreadable workspace"
             assert (not $facts.pending) "prune removed undelivered work"
@@ -320,10 +323,43 @@ for-all "prune never removes a workspace that is live or unknown" {|key|
     }
 }
 
+for-all "prune reclaims an ended task's workspace unless it holds work" {|key|
+    let facts = (gen-workspace-facts $key | merge {
+        name: "topic" current: false exists: true git_worktree: false codex_worktree: false
+        recent: false stale: false error: null owner: "active" owner_ended: true
+    })
+    assert equal ((prune-verdict $facts) == null) (not $facts.pending)
+}
+
+for-all "a Codex task ends when archived or quiet past OWNER_QUIET" {|key|
+    let now = (2026-10-07T12:00:00Z | into datetime)
+    let quiet = (pick-from $"($key)/quiet" [null 1min 1day ($OWNER_QUIET + 1min) 5day])
+    let facts = {
+        archived: (flag $"($key)/archived")
+        last_write: (if $quiet == null { null } else { $now - $quiet })
+        now: $now
+    }
+    let expected = if $facts.archived { "ended" } else if $quiet == null { "unknown" } else if $quiet > $OWNER_QUIET { "ended" } else { "live" }
+    assert equal (owner-liveness $facts) $expected
+}
+
+for-all "only branches landed in every copy and recorded by no workspace are deleted" {|key|
+    let names = (0..<(1 + (pick $"($key)/branches" 5)) | each {|i| $"jj-topic-($i)" })
+    let copies = ($names | each {|name|
+        0..<(1 + (pick $"($key)/($name)/copies" 3)) | each {|i| { name: $name landed: (flag $"($key)/($name)/landed/($i)") } }
+    } | flatten)
+    let in_use = ($names | where {|name| flag $"($key)/($name)/used" })
+    let deleted = (landed-branches $copies $in_use)
+    for name in $names {
+        let landed = ($copies | where name == $name | all {|copy| $copy.landed })
+        assert equal ($name in $deleted) ($landed and $name not-in $in_use) $name
+    }
+}
+
 for-all "prune reclaims every released, delivered workspace" {|key|
     let facts = (gen-workspace-facts $key | merge {
         name: "topic" current: false exists: true git_worktree: false codex_worktree: false
-        stale: false error: null
+        recent: false owner_ended: false stale: false error: null
     })
     let owner = (pick-from $"($key)/released" ["none" "delivered" "discarded" "released"])
     let delivered = not $facts.pending
