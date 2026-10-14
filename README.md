@@ -159,7 +159,9 @@ Tangled is the trunk remote: `main@tangled` is the base of every topic.
 Another repository's trunk remote is the one JJ's `ci.trunk-remote` setting
 names (`jj config set --repo ci.trunk-remote NAME`), else `tangled`, else
 `origin`, else its only remote; until main is first pushed there, topics
-start from the root. GitHub (`origin`) is a mirror of `main` that `ci land`
+start from the root. `ci` saves that base in the repository's config as the
+revset alias `ci_trunk()`, which also works in your own revsets, such as
+`jj log -r 'ci_trunk()..@'`. GitHub (`origin`) is a mirror of `main` that `ci land`
 fast-forwards after each landing when it is not the trunk itself, and an
 optional landing clearance; `ci dispatch` never pushes there.
 `ci dispatch` rebases,

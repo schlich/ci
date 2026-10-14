@@ -247,11 +247,20 @@ def trunk-remote [] {
     error make { msg: $msg }
 }
 
-# The revset of the trunk remote's main, or the root before main is first
-# pushed there.
+const TRUNK_ALIAS = "ci_trunk()"
+
+# The trunk remote's main, or the root before main is first pushed there. The
+# repository's config saves the revset as `ci_trunk()`, so commands, messages,
+# and the user's own revsets name it; where the config cannot be written, the
+# revset itself stands in.
 def trunk-main [remote?: string] {
     let name = if $remote == null { trunk-remote } else { $remote }
-    $"coalesce\((remote-bookmark-revset main $name), root\())"
+    let revset = $"coalesce\((remote-bookmark-revset main $name), root\())"
+    let key = $"revset-aliases.\"($TRUNK_ALIAS)\""
+    let saved = (do { ^jj config get $key } | complete)
+    if $saved.exit_code == 0 and ($saved.stdout | str trim) == $revset { return $TRUNK_ALIAS }
+    let set = (do { ^jj config set --repo $key $revset } | complete)
+    if $set.exit_code == 0 { $TRUNK_ALIAS } else { $revset }
 }
 
 # Where a Tangled remote URL points: `{owner name}` for an owner's handle or
