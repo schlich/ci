@@ -9,8 +9,9 @@
   `ci-lifecycle`, and `ci-properties` check them against each other.
 - The tower (`tower/`), `context-status.nu`, and the MCP server read the
   records `ci.nu` writes (`.jj/jj-ci-*.json`, the ci MCP job store, OSC 7501
-  status files, and the locks under `$XDG_STATE_HOME/jj-ci`). Change a
-  record's shape in every reader at once.
+  status files, the locks under `$XDG_STATE_HOME/jj-ci`, and the OTLP/JSON
+  ci log at `$XDG_STATE_HOME/ci/log.otlp.jsonl`). Change a record's shape in
+  every reader at once.
 - Other repositories run the `ci.nu` their flake.lock pins. Keep
   `ci-launch.nu`'s choice rules in step with `tests/ci-launch-properties.nu`,
   and test a workflow change from another repository with

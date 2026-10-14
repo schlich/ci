@@ -426,6 +426,21 @@ pushed it there) as JSON. A run that only timed out reports `timeout` rather
 than `failed`, since it says nothing about the topic. It reads the last-fetched remote state and the forge
 APIs only; it never fetches, pushes, or rewrites anything.
 
+### The ci log
+
+Every status report `ci` makes, the same ones it sends as OSC 7501 records,
+is also an OpenTelemetry log record in `$XDG_STATE_HOME/ci/log.otlp.jsonl`
+(`CI_LOG` moves it). Each line is one OTLP/JSON `ExportLogsServiceRequest`,
+which the OpenTelemetry Collector's `otlpjsonfile` receiver reads as is. The
+records carry the event name (`ci.status` for a status report), the state,
+phase id, and message, the process id that groups one run, and the working
+directory. One log serves every repository and workspace on the machine.
+
+When `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set, `ci` also posts each record to that OTLP/HTTP endpoint (`/v1/logs` under
+the general one). A record that cannot be written or exported never fails the
+run.
+
 ### Context status
 
 `context-status` summarizes the current workspace's topic: its stage in the

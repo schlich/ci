@@ -10,6 +10,9 @@ source pbt.nu
 source ../ci.nu
 source ../guard.nu
 
+# Keep every record the suite logs out of the user's ci log.
+$env.CI_LOG = (mktemp --tmpdir ci-properties-log-XXXXXX)
+
 const BLOCKING = ["conflicted" "waiting on parent"]
 const REFRESH_STATES = [
     "current" "pushed" "ready to push" "conflicted"
@@ -201,6 +204,50 @@ for-all "plan proposals respect the stack limit and publication order" {|key|
             }
         }
     }
+}
+
+# The ci log: OTLP/JSON log records round-trip through the file.
+
+def gen-attribute-value [key: string] {
+    match (pick $"($key)/kind" 6) {
+        0 => (gen-title $"($key)/string")
+        1 => (pick $"($key)/int" 1000)
+        2 => ((pick $"($key)/bool" 2) == 0)
+        3 => (0..<(pick $"($key)/count" 3) | each {|i| gen-title $"($key)/item/($i)" })
+        4 => { nested: (gen-title $"($key)/nested") }
+        _ => null
+    }
+}
+
+for-all "otlp-value round-trips attribute values" {|key|
+    let value = (gen-attribute-value $key)
+    if $value != null {
+        assert equal (from-otlp-value (otlp-value $value)) $value
+    }
+}
+
+for-all "log-event appends records that read-ci-log returns in order" {|key|
+    let log = (mktemp --tmpdir ci-log-XXXXXX)
+    let events = (0..<(1 + (pick $"($key)/count" 4)) | each {|i|
+        {
+            event: (pick-from $"($key)/event/($i)" ["ci.status" "ci.impact.set"])
+            body: (gen-title $"($key)/body/($i)")
+            attributes: { "ci.value": (gen-attribute-value $"($key)/value/($i)") "ci.index": $i }
+        }
+    })
+    with-env { CI_LOG: $log OTEL_EXPORTER_OTLP_ENDPOINT: "" OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "" } {
+        for event in $events { log-event $event.event $event.body $event.attributes }
+        let records = (read-ci-log)
+        assert equal ($records | get event) ($events | get event)
+        assert equal ($records | get body) ($events | get body)
+        assert equal ($records | get attributes | get "ci.index") ($events | get attributes | get "ci.index")
+        for pair in ($records | zip $events) {
+            assert equal ($pair.0.attributes | get --optional "ci.value") ($pair.1.attributes | get "ci.value")
+            assert equal $pair.0.attributes."process.pid" $nu.pid
+        }
+        assert ($records | get time | window 2 | all {|pair| $pair.0 <= $pair.1 }) "records keep their order"
+    }
+    rm $log
 }
 
 # Impact classes: trailers, PR classification, release numbering, and plan order.

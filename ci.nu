@@ -13,6 +13,125 @@ def report-status [state: string, msg?: string, --id: string, --kind: string] {
     } catch {|err|
         print --stderr $"ci: could not report status: ($err.msg)"
     }
+    if $state != "clear" {
+        let severity = match $state { "error" => "ERROR" "blocked" => "WARN" _ => "INFO" }
+        log-event "ci.status" ($text | default $state) { "ci.status.state": $state "ci.status.id": $id "ci.status.kind": $kind } --severity $severity
+    }
+}
+
+# Every ci action is also an OpenTelemetry log record: each line of the ci log
+# is one OTLP/JSON ExportLogsServiceRequest, the format the Collector's
+# otlpjsonfile receiver reads. When OTEL_EXPORTER_OTLP_LOGS_ENDPOINT or
+# OTEL_EXPORTER_OTLP_ENDPOINT is set, each record is also posted there. The
+# log is this machine's record of what ci did, shared by every repository and
+# workspace; CI_LOG moves it. context-status.nu and tower/src/log.rs read it
+# too, so change a record's shape in every reader at once.
+const SEVERITY_NUMBERS = { DEBUG: 5 INFO: 9 WARN: 13 ERROR: 17 }
+
+def ci-log-path [] {
+    if ($env.CI_LOG? | is-not-empty) { return $env.CI_LOG }
+    let state_dir = ($env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state"))
+    $state_dir | path join "ci" "log.otlp.jsonl"
+}
+
+# The OTLP AnyValue for a Nushell value.
+def otlp-value [value: any] {
+    match ($value | describe | str replace --regex '<.*' '') {
+        "string" => { stringValue: $value }
+        "int" => { intValue: ($value | into string) }
+        "float" => { doubleValue: $value }
+        "bool" => { boolValue: $value }
+        "list" | "table" => { arrayValue: { values: ($value | each {|item| otlp-value $item }) } }
+        "record" => { kvlistValue: { values: (otlp-attributes $value) } }
+        _ => { stringValue: ($value | to nuon) }
+    }
+}
+
+# OTLP key-value attributes for a record, without its null fields.
+def otlp-attributes [attributes: record] {
+    $attributes
+    | transpose key value
+    | where value != null
+    | each {|attribute| { key: $attribute.key value: (otlp-value $attribute.value) } }
+}
+
+def from-otlp-value [value: record] {
+    let kind = ($value | columns | first)
+    let inner = ($value | get $kind)
+    match $kind {
+        "intValue" => ($inner | into int)
+        "arrayValue" => ($inner.values? | default [] | each {|item| from-otlp-value $item })
+        "kvlistValue" => (from-otlp-attributes ($inner.values? | default []))
+        _ => $inner
+    }
+}
+
+def from-otlp-attributes [attributes: list] {
+    $attributes | reduce --fold {} {|attribute, record| $record | upsert $attribute.key (from-otlp-value $attribute.value) }
+}
+
+# The OTLP/JSON request that carries one log record.
+def otlp-log-request [event: string, body: string, attributes: record, severity: string, time: int] {
+    {
+        resourceLogs: [{
+            resource: { attributes: (otlp-attributes { "service.name": "ci" "host.name": (sys host | get hostname) }) }
+            scopeLogs: [{
+                scope: { name: "ci" }
+                logRecords: [{
+                    timeUnixNano: ($time | into string)
+                    observedTimeUnixNano: ($time | into string)
+                    severityNumber: ($SEVERITY_NUMBERS | get $severity)
+                    severityText: $severity
+                    eventName: $event
+                    body: { stringValue: $body }
+                    attributes: (otlp-attributes ({ "process.pid": $nu.pid "process.working_directory": $env.PWD } | merge $attributes))
+                }]
+            }]
+        }]
+    }
+}
+
+# Append the log record `event` to the ci log and export it. A record that
+# cannot be written never fails the run.
+def log-event [event: string, body: string, attributes: record, --severity: string = "INFO"] {
+    let request = (otlp-log-request $event $body $attributes $severity (date now | into int))
+    try {
+        let path = (ci-log-path)
+        mkdir ($path | path dirname)
+        $"($request | to json --raw)\n" | save --append $path
+    } catch {|err|
+        print --stderr $"ci: could not write the ci log: ($err.msg)"
+    }
+    let base = ($env.OTEL_EXPORTER_OTLP_ENDPOINT? | default "" | str trim --right --char "/")
+    let endpoint = ($env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT? | default (if ($base | is-empty) { "" } else { $"($base)/v1/logs" }))
+    if ($endpoint | is-not-empty) {
+        try {
+            http post --content-type application/json --max-time 2sec $endpoint $request | ignore
+        } catch {|err|
+            print --stderr $"ci: could not export a log record to ($endpoint): ($err.msg)"
+        }
+    }
+}
+
+# The ci log's records, oldest first, as { time, event, severity, body,
+# attributes }. A line another writer is still appending is skipped.
+def read-ci-log [] {
+    let path = (ci-log-path)
+    if not ($path | path exists) { return [] }
+    open --raw $path
+    | lines
+    | each {|line| try { $line | from json } catch { null } }
+    | each {|request| $request.resourceLogs? | default [] | each {|resource| $resource.scopeLogs? | default [] | each {|scope| $scope.logRecords? | default [] } } }
+    | flatten | flatten | flatten
+    | each {|record|
+        {
+            time: ($record.timeUnixNano | into int)
+            event: ($record.eventName? | default "")
+            severity: ($record.severityText? | default "")
+            body: (from-otlp-value ($record.body? | default { stringValue: "" }))
+            attributes: (from-otlp-attributes ($record.attributes? | default []))
+        }
+    }
 }
 
 # Run one phase under `id`, reporting it working, then done or error. The
