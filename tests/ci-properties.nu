@@ -876,22 +876,39 @@ for-all "remote retries back off by doubling from two seconds" {|key|
     assert equal (remote-retry-delay 1 $RATE_LIMITED) 2sec
 }
 
-# The trunk remote is the configured one, else a preferred name, else the only
-# remote. A configured name that is not a remote, or several remotes with no
-# preferred one among them, is refused rather than guessed.
-for-all "the trunk remote is configured, preferred, or the only remote" {|key|
+# Where only JJ's default defines trunk(), ci defines it on a preferred remote,
+# else the only remote. Several remotes with no preferred one among them are
+# refused rather than guessed.
+for-all "an undefined trunk goes on a preferred remote or the only one" {|key|
     let names = (["tangled" "origin" "upstream" "knot"] | where {|name| flag $"($key)/has/($name)" })
-    let configured = (pick-from $"($key)/configured" [null "" "upstream" "knot"])
     let preferred = ($TRUNK_REMOTES | where {|name| $name in $names } | get --optional 0)
-    let expected = if ($configured | is-not-empty) {
-        if $configured in $names { $configured } else { null }
-    } else if $preferred != null {
+    let expected = if $preferred != null {
         $preferred
     } else if ($names | length) == 1 {
         $names | first
     } else { null }
-    assert equal (choose-trunk-remote $names $configured) $expected
+    assert equal (choose-trunk-remote $names) $expected
 }
+
+# A trunk() definition must name exactly one remote bookmark for ci to land on.
+const TRUNK_SYMBOL_CASES = [
+    [definition expected];
+    ["main@tangled" { bookmark: "main" remote: "tangled" }]
+    ["latest(present(main@tangled) | root())" { bookmark: "main" remote: "tangled" }]
+    ["release/1.x@origin" { bookmark: "release/1.x" remote: "origin" }]
+    ['remote_bookmarks(exact:"master", exact:"origin")' { bookmark: "master" remote: "origin" }]
+    ["remote_bookmarks(exact:'main', exact:'knot')" { bookmark: "main" remote: "knot" }]
+    ["main@origin | main@origin" { bookmark: "main" remote: "origin" }]
+    ["main@origin | main@upstream" null]
+    ["root()" null]
+    ["latest(::@ & ~mutable())" null]
+    ["trunk()..@-" null]
+]
+
+for case in $TRUNK_SYMBOL_CASES {
+    assert equal (trunk-symbol $case.definition) $case.expected $"trunk-symbol ($case.definition)"
+}
+print $"ok trunk\() definitions \(($TRUNK_SYMBOL_CASES | length) cases)"
 
 const TANGLED_LOCATION_CASES = [
     [url expected];

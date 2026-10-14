@@ -152,11 +152,14 @@ def git-context [] {
     { GIT_DIR: ($backend.stdout | str trim) GIT_WORK_TREE: ($root.stdout | str trim) }
 }
 
-# The trunk remote hosts main and every topic branch. `ci land` is the only
-# path to main: it fast-forwards main to a head the landing gate has already
-# passed. JJ's `ci.trunk-remote` setting names it; otherwise the first of these
-# that the repository has, or its only remote.
+# JJ's `trunk()` alias names the trunk: one remote bookmark, BOOKMARK@REMOTE,
+# whose remote also hosts every topic branch. `ci land` is the only path to it:
+# it fast-forwards the bookmark to a head the landing gate has already passed.
+# Where only JJ's default defines `trunk()`, ci defines it in the repository's
+# config as `main` on the first of these remotes that the repository has, or
+# on its only remote.
 const TRUNK_REMOTES = ["tangled" "origin"]
+const TRUNK_KEY = 'revset-aliases."trunk()"'
 # GitHub mirrors main, and its Actions can gate a landing in the spindle's
 # place with `ci land --clearance github`. Its rules accept only fast-forwards.
 const GITHUB_REMOTE = "origin"
@@ -220,47 +223,68 @@ def remotes [] {
     git-command "listing remotes" { ^jj git remote list } | lines | parse "{name} {url}"
 }
 
-# The trunk remote among `names`: the `configured` one, else the first
-# preferred one present, else the only remote. Null when none qualifies.
-def choose-trunk-remote [names: list<string>, configured: any] {
-    if ($configured | is-not-empty) {
-        return (if $configured in $names { $configured } else { null })
-    }
+# The remote to define the trunk on among `names`: the first preferred one
+# present, else the only remote. Null when none qualifies.
+def choose-trunk-remote [names: list<string>] {
     let preferred = ($TRUNK_REMOTES | where {|name| $name in $names } | get --optional 0)
     if $preferred != null { return $preferred }
     if ($names | length) == 1 { $names | first } else { null }
 }
 
-def trunk-remote [] {
-    let names = (remotes | get name)
-    let setting = (do { ^jj config get ci.trunk-remote } | complete)
-    let configured = if $setting.exit_code == 0 { $setting.stdout | str trim } else { null }
-    let remote = (choose-trunk-remote $names $configured)
-    if $remote != null { return $remote }
-    let msg = if ($configured | is-not-empty) {
-        $"ci.trunk-remote names ($configured), which is not a remote of this repository."
-    } else if ($names | is-empty) {
-        "This repository has no remote to host main and the topic branches."
-    } else {
-        $"Cannot tell which remote is trunk among ($names | str join ', '). Name it with `jj config set --repo ci.trunk-remote NAME`."
-    }
-    error make { msg: $msg }
+# The one remote bookmark a `trunk()` definition names, as `{bookmark remote}`,
+# or null when it names none or several. `main@origin` and
+# `remote_bookmarks(exact:"main", exact:"origin")` both name one.
+def trunk-symbol [definition: string] {
+    let symbols = ($definition | parse --regex '(?:^|[^\w./@-])(?P<bookmark>\w[\w./-]*)@(?P<remote>\w[\w.-]*)')
+    let calls = ($definition | parse --regex r#'remote_bookmarks\(\s*(?:exact:)?["'](?P<bookmark>[^"']+)["']\s*,\s*(?:exact:)?["'](?P<remote>[^"']+)["']\s*\)'#)
+    let found = ($symbols | append $calls | uniq)
+    if ($found | length) == 1 { $found | first } else { null }
 }
 
-const TRUNK_ALIAS = "ci_trunk()"
+# The definition of `trunk()` that JJ uses here, and where it comes from:
+# `default` for JJ's own, or the config layer that sets it.
+def trunk-definition [] {
+    let listing = (git-command "reading trunk()" {
+        ^jj config list --include-defaults -T 'source ++ "\t" ++ value ++ "\n"' $TRUNK_KEY
+    })
+    let entry = ($listing | parse --regex '(?s)^(?P<source>[^\t]*)\t(?P<value>.*)$' | first)
+    { source: $entry.source value: ($"value = ($entry.value)" | from toml | get value) }
+}
 
-# The trunk remote's main, or the root before main is first pushed there. The
-# repository's config saves the revset as `ci_trunk()`, so commands, messages,
-# and the user's own revsets name it; where the config cannot be written, the
-# revset itself stands in.
-def trunk-main [remote?: string] {
-    let name = if $remote == null { trunk-remote } else { $remote }
-    let revset = $"coalesce\((remote-bookmark-revset main $name), root\())"
-    let key = $"revset-aliases.\"($TRUNK_ALIAS)\""
-    let saved = (do { ^jj config get $key } | complete)
-    if $saved.exit_code == 0 and ($saved.stdout | str trim) == $revset { return $TRUNK_ALIAS }
-    let set = (do { ^jj config set --repo $key $revset } | complete)
-    if $set.exit_code == 0 { $TRUNK_ALIAS } else { $revset }
+# The trunk as `{bookmark remote}`. A `trunk()` that the user or repository
+# defines must name one remote bookmark. Otherwise ci defines it here, as main
+# on the chosen remote, or the root until main is first pushed there: a bare
+# `main@REMOTE` would fail every revset naming `trunk()` before then, JJ's
+# immutable heads included.
+def trunk [] {
+    let definition = (trunk-definition)
+    if $definition.source != "default" {
+        let symbol = (trunk-symbol $definition.value)
+        if $symbol == null {
+            error make { msg: $"trunk\() is `($definition.value | str trim)` in the ($definition.source) config, which names no single BOOKMARK@REMOTE to land on. Define it as one, as in `jj config set --repo '($TRUNK_KEY)' main@origin`." }
+        }
+        return $symbol
+    }
+    let names = (remotes | get name)
+    let remote = (choose-trunk-remote $names)
+    if $remote == null {
+        let found = if ($names | is-empty) { "This repository has no remote" } else { $"Cannot tell which of ($names | str join ', ') is trunk" }
+        error make { msg: $"($found). Define trunk\() as the remote bookmark to land on, as in `jj config set --repo '($TRUNK_KEY)' main@origin`." }
+    }
+    run-command $"defining trunk\() as main@($remote)" {
+        ^jj config set --repo $TRUNK_KEY $"latest\(present\(main@($remote)) | root\())"
+    } | ignore
+    { bookmark: "main" remote: $remote }
+}
+
+def trunk-remote [] {
+    (trunk).remote
+}
+
+# The trunk's revset, once `trunk()` is known to name it.
+def trunk-revset [] {
+    trunk | ignore
+    "trunk()"
 }
 
 # Where a Tangled remote URL points: `{owner name}` for an owner's handle or
@@ -947,8 +971,7 @@ def delete-topic-bookmark [bookmark: string] {
 
 # Whether the trunk remote's copy of a topic bookmark is already on main.
 def topic-landed [bookmark: string] {
-    let remote = (trunk-remote)
-    revset-change-ids $"(remote-bookmark-revset $bookmark $remote) & ::(trunk-main $remote)" | is-not-empty
+    revset-change-ids $"(remote-bookmark-revset $bookmark) & ::(trunk-revset)" | is-not-empty
 }
 
 # Published topics: every local `jj-*` bookmark that is on the trunk remote and
@@ -956,7 +979,7 @@ def topic-landed [bookmark: string] {
 # such topic below it, so the graph alone records every stack.
 def topic-bookmarks [] {
     let remote = (trunk-remote)
-    let trunk = (trunk-main $remote)
+    let trunk = "trunk()"
     let listing = (git-command "listing topic bookmarks" {
         ^jj bookmark list -T 'if(!remote && normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*'
     })
@@ -982,7 +1005,7 @@ def topic-bookmarks [] {
 }
 
 def topic-revisions [] {
-    let result = (^jj log -r $"(trunk-main)..@" --no-graph -T 'change_id ++ "\t" ++ commit_id ++ "\t" ++ description.first_line() ++ "\n"' | complete)
+    let result = (^jj log -r $"(trunk-revset)..@" --no-graph -T 'change_id ++ "\t" ++ commit_id ++ "\t" ++ description.first_line() ++ "\n"' | complete)
     if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
     $result.stdout
     | lines
@@ -1094,7 +1117,7 @@ def topic-facts [] {
     {
         recorded: true
         visible: (do $has "all()")
-        landed: (do $has $"::(trunk-main)")
+        landed: (do $has $"::(trunk-revset)")
         ancestor: (do $has "::@")
         working_copy_empty: ((current-change "empty") == "true")
         topic_empty: (do $has "empty() & description(exact:\"\")")
@@ -1180,7 +1203,7 @@ def rebase-topic [] {
     }
     checkpoint "rebase"
     fetch-trunk
-    let trunk = (trunk-main)
+    let trunk = (trunk-revset)
     let moved = (other-workspaces-in $"roots\(($trunk)..@)::")
     run-command "rebasing the topic stack" {
         ^jj rebase -s $"roots\(($trunk)..@)" -o $trunk --skip-emptied
@@ -1321,7 +1344,7 @@ def restack [tip: string, onto: string, workspace?: string] {
     let repository = if $workspace == null { [] } else { [--repository $workspace] }
     if (revset-change-ids $"($onto) & ~::($tip)" | is-not-empty) {
         run-command $"rebasing ($tip) onto ($onto)" {
-            ^jj ...$repository rebase -s $"roots\(::($tip) ~ ::($onto) ~ ::(trunk-main))" -o $onto --skip-emptied
+            ^jj ...$repository rebase -s $"roots\(::($tip) ~ ::($onto) ~ ::(trunk-revset))" -o $onto --skip-emptied
         } | ignore
     }
     $"($onto)..($tip)"
@@ -1405,7 +1428,7 @@ def restack-checked-out [bookmark: string, onto: string, workspaces: list<string
 # pipeline. A stacked topic must follow its parent, and a conflicting one
 # cannot land at all.
 def refresh-needed [topic: record, all: bool] {
-    $all or $topic.parent != null or (trial-merge [(trunk-main) $topic.commit]).conflict
+    $all or $topic.parent != null or (trial-merge [(trunk-revset) $topic.commit]).conflict
 }
 
 # Bring one published topic up to date with its base: the trunk's main, or its
@@ -1419,7 +1442,7 @@ def refresh-topic [topic: record, push: bool, all: bool] {
         return (do $result "no rebase needed")
     }
     let stacked = $topic.parent != null
-    let onto = if $stacked { bookmark-revset $topic.parent } else { (trunk-main) }
+    let onto = if $stacked { bookmark-revset $topic.parent } else { (trunk-revset) }
     let workspaces = (workspaces-in $"\(($onto)..($bookmark))::")
     let restacked = if ($workspaces | is-empty) {
         { stack: (restack $bookmark $onto) }
@@ -1505,7 +1528,7 @@ def revision-field [revision: string, template: string] {
 }
 
 def contains-main [revision: string] {
-    revset-change-ids $"(trunk-main) & ::($revision)" | is-not-empty
+    revset-change-ids $"(trunk-revset) & ::($revision)" | is-not-empty
 }
 
 # Create a headless merge of the given revisions, report whether it conflicts
@@ -1521,7 +1544,7 @@ def trial-merge [revisions: list<string>] {
         let probe = (revision-field $probes 'commit_id')
         let conflict = (revision-field $probe 'conflict') == "true"
         let changes = (git-command "diffing the trial merge" {
-            ^jj diff --name-only --from (trunk-main) --to $probe
+            ^jj diff --name-only --from (trunk-revset) --to $probe
         } | is-not-empty)
         { value: { conflict: $conflict changes: $changes } error: null }
     } catch {|err| { value: null error: $err.msg } }
@@ -1549,7 +1572,7 @@ def plan-topics [published: list] {
     let roots = ($published | each {|topic| bookmark-revset $topic.name } | append 'working_copies()' | str join ' | ')
     # A workspace parked on an empty, undescribed change contributes its parent.
     let placeholder = '(empty() & description(exact:""))'
-    let trunk = (trunk-main)
+    let trunk = (trunk-revset)
     let heads = $"heads\(\(($trunk)..\(($roots))) & mutable\() ~ ($placeholder))"
     # Every workspace's working copy is a candidate, so any of them going
     # divergent would stop every session's landing if the plan named tips by
@@ -1586,10 +1609,10 @@ def plan-main-status [topic: record] {
     let result = if $topic.current {
         {
             conflict: ((revision-field $topic.commit 'conflict') == "true")
-            changes: (git-command "diffing the topic" { ^jj diff --name-only --from (trunk-main) --to $topic.commit } | is-not-empty)
+            changes: (git-command "diffing the topic" { ^jj diff --name-only --from (trunk-revset) --to $topic.commit } | is-not-empty)
         }
     } else {
-        trial-merge [(trunk-main) $topic.commit]
+        trial-merge [(trunk-revset) $topic.commit]
     }
     if not $result.changes { "landed" } else if $result.conflict { "conflicts with main" } else { "clean" }
 }
@@ -1670,7 +1693,7 @@ def build-plan [published: list] {
             let revisions = if $pair.a.current or $pair.right.current {
                 [$pair.a.commit $pair.right.commit]
             } else {
-                [(trunk-main) $pair.a.commit $pair.right.commit]
+                [(trunk-revset) $pair.a.commit $pair.right.commit]
             }
             (trial-merge $revisions).conflict
         }
@@ -1711,8 +1734,9 @@ def sync-main [] {
     }
     checkpoint "sync"
     fetch-trunk
-    run-command "advancing the main bookmark" { ^jj bookmark move main --to (trunk-main) } | ignore
-    run-command "rebasing the working copy" { ^jj rebase -r @ -o (trunk-main) } | ignore
+    let trunk = (trunk)
+    run-command $"advancing the ($trunk.bookmark) bookmark" { ^jj bookmark move $trunk.bookmark --to "trunk()" } | ignore
+    run-command "rebasing the working copy" { ^jj rebase -r @ -o "trunk()" } | ignore
 }
 
 def review-versions [] {
@@ -1929,7 +1953,7 @@ def "main sync" [] {
 
 def "main worktree-status" [] {
     let root = (git-command "locating the Git repository" { ^git rev-parse --show-toplevel })
-    let trunk = $"(trunk-remote)/main"
+    let trunk = (trunk | $"($in.remote)/($in.bookmark)")
     let main = (git-command $"locating ($trunk)" { ^git -C $root rev-parse $"refs/remotes/($trunk)" })
     let main_short = ($main | str substring 0..6)
     let listing = (git-command "listing Git worktrees" { ^git -C $root worktree list --porcelain })
@@ -1966,7 +1990,7 @@ def "main review snapshot" [label: string] {
     }
     let entry = {
         label: $label
-        base: (revision-id (trunk-main))
+        base: (revision-id (trunk-revset))
         tip: (revision-id "@")
         bookmark: (publication-bookmark)
         created_at: (date now | format date "%Y-%m-%dT%H:%M:%S%:z")
@@ -2065,7 +2089,7 @@ def preview-topics [names: list<string>, all: bool] {
         let revset = (bookmark-revset $topic.name)
         # A stacked topic is classified by its own layer; the merge still
         # includes its parent, since the parent is an ancestor of its head.
-        let base = if $topic.parent == null { (trunk-main) } else { bookmark-revset $topic.parent }
+        let base = if $topic.parent == null { (trunk-revset) } else { bookmark-revset $topic.parent }
         $topic
         | insert revset $revset
         | insert title (revision-field $revset 'description.first_line()')
@@ -2133,7 +2157,7 @@ def "main sim" [
     }
     for topic in $included { print $"Including ($topic.name) ($topic.title)" }
 
-    let heads = ($included | get revset | append (trunk-main) | str join " | ")
+    let heads = ($included | get revset | append (trunk-revset) | str join " | ")
     let parents = (git-command "resolving topic heads" {
         ^jj log -r $"heads\(($heads))" --no-graph -T 'commit_id ++ "\n"'
     } | lines)
@@ -2159,7 +2183,7 @@ def "main sim" [
         git-command "checking out the preview" { ^jj workspace add --revision $merge --name $name $tree } | ignore
         ^nix build --no-update-lock-file --out-link $link $"path:($tree)#($PREVIEW_ATTRIBUTE)"
         if not $active {
-            git-command "checking out trunk" { ^jj --repository $tree new (trunk-main) } | ignore
+            git-command "checking out trunk" { ^jj --repository $tree new (trunk-revset) } | ignore
             ^nix build --no-update-lock-file --out-link $"($link)-trunk" $"path:($tree)#($PREVIEW_ATTRIBUTE)"
         }
         null
@@ -2220,7 +2244,7 @@ def "main conflicts" [] {
 def plan-parent-for-current-topic [branch: string] {
     let published = (topic-bookmarks | where name != $branch)
     let below = ($published | where {|topic|
-        revset-change-ids $"(bookmark-revset $topic.name) & ::@- ~ ::(trunk-main)" | is-not-empty
+        revset-change-ids $"(bookmark-revset $topic.name) & ::@- ~ ::(trunk-revset)" | is-not-empty
     })
     if ($below | is-not-empty) {
         let heads = (revset-change-ids $"heads\(($below | each {|topic| bookmark-revset $topic.name } | str join ' | '))")
@@ -2260,7 +2284,7 @@ def restack-topic [parent: string] {
         error make { msg: $"The parent branch ($parent) has no local bookmark. Fetch and track it first." }
     }
     checkpoint "restack"
-    let moved = (other-workspaces-in $"roots\(::@ ~ ::($onto) ~ ::(trunk-main))::")
+    let moved = (other-workspaces-in $"roots\(::@ ~ ::($onto) ~ ::(trunk-revset))::")
     let stack = (restack "@" $onto)
     update-moved-workspaces $moved
     let conflicts = (conflicted-revisions $stack)
@@ -2282,10 +2306,10 @@ def publish-topic [] {
         error make { msg: "This topic already landed on main. Park it with `ci park` before starting new work." }
     }
     let parent = (plan-parent-for-current-topic $branch)
-    let base = if $parent == null { (trunk-main) } else { bookmark-revset $parent }
+    let base = if $parent == null { (trunk-revset) } else { bookmark-revset $parent }
     # Classify before rewriting anything so an unclassified topic fails fast.
     let impact = (require-impact (layer-revisions $base))
-    let onto = if $parent == null { (trunk-main) } else { $parent }
+    let onto = if $parent == null { (trunk-revset) } else { $parent }
     phase rebase $"Rebasing onto ($onto)" {
         if $parent == null { rebase-topic } else { restack-topic $parent }
     }
@@ -2309,8 +2333,10 @@ def land-published [published: record, timeout: duration, gate: string] {
         error make { msg: $"This topic is stacked on ($published.parent). Land that topic first, then land this one." }
     }
     let checker = (landing-gate $gate)
-    let remote = (trunk-remote)
-    let base = (revision-id (trunk-main $remote))
+    let trunk = (trunk)
+    let remote = $trunk.remote
+    let main = $trunk.bookmark
+    let base = (revision-id "trunk()")
     if $published.impact == "refactor" {
         phase closures "Proving every NixOS closure unchanged" { require-closure-neutral $base $published.head }
     }
@@ -2320,19 +2346,19 @@ def land-published [published: record, timeout: duration, gate: string] {
     # Other workspaces share this repository and may have landed meanwhile.
     fetch-trunk
     if not (contains-main $published.head) { return false }
-    run-command "advancing main" { ^jj bookmark set main -r $published.head } | ignore
-    # The first landing creates main on the trunk remote, which jj pushes
-    # only once the bookmark is tracked there.
-    if (revset-change-ids (remote-bookmark-revset main $remote) | is-empty) {
-        run-command $"tracking main@($remote)" { ^jj bookmark track $"main@($remote)" } | ignore
+    run-command $"advancing ($main)" { ^jj bookmark set $main -r $published.head } | ignore
+    # The first landing creates the bookmark on the trunk remote, which jj
+    # pushes only once the bookmark is tracked there.
+    if (revset-change-ids (remote-bookmark-revset $main $remote) | is-empty) {
+        run-command $"tracking ($main)@($remote)" { ^jj bookmark track $"($main)@($remote)" } | ignore
     }
-    let pushed = (remote-complete "advancing main" { ^jj git push --remote $remote --bookmark main })
+    let pushed = (remote-complete $"advancing ($main)" { ^jj git push --remote $remote --bookmark $main })
     if $pushed.exit_code != 0 {
         # The lease lost a race with a landing after the fetch above. Put the
         # local bookmark back on the trunk so the retry starts from it.
         fetch-trunk
         if not (contains-main $published.head) {
-            run-command "resetting main" { ^jj bookmark set main -r (trunk-main $remote) --allow-backwards } | ignore
+            run-command $"resetting ($main)" { ^jj bookmark set $main -r "trunk()" --allow-backwards } | ignore
             return false
         }
         error make { msg: $"landing on ($remote) failed with exit code ($pushed.exit_code): ($pushed.stderr | str trim)" }
@@ -2366,18 +2392,19 @@ def land-with-retries [published: record, timeout: duration, gate: string, attem
 # as an error under `mirror` that does not fail the run. A repository without
 # a separate mirror has nothing to do.
 def mirror-main [] {
-    let remote = (trunk-remote)
-    if $remote == $GITHUB_REMOTE or $GITHUB_REMOTE not-in (remotes | get name) { return }
-    let fetched = (do { ^jj git fetch --remote $GITHUB_REMOTE --branch main } | complete)
+    let trunk = (trunk)
+    let main = $trunk.bookmark
+    if $trunk.remote == $GITHUB_REMOTE or $GITHUB_REMOTE not-in (remotes | get name) { return }
+    let fetched = (do { ^jj git fetch --remote $GITHUB_REMOTE --branch $main } | complete)
     let pushed = if $fetched.exit_code == 0 {
-        do { ^jj git push --remote $GITHUB_REMOTE --bookmark main } | complete
+        do { ^jj git push --remote $GITHUB_REMOTE --bookmark $main } | complete
     } else { $fetched }
     if $pushed.exit_code != 0 {
-        let failure = $"Landed on ($remote), but mirroring main to ($GITHUB_REMOTE) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($GITHUB_REMOTE) --bookmark main`."
+        let failure = $"Landed on ($trunk.remote), but mirroring ($main) to ($GITHUB_REMOTE) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($GITHUB_REMOTE) --bookmark ($main)`."
         print --stderr $failure
         report-status error $failure --id mirror
     } else {
-        report-status done $"Mirrored main to ($GITHUB_REMOTE)" --id mirror
+        report-status done $"Mirrored ($main) to ($GITHUB_REMOTE)" --id mirror
     }
 }
 
@@ -2408,7 +2435,7 @@ def "main dispatch" [
             if $repo == null {
                 print $"Pushed ($published.branch) to (trunk-remote)."
             } else if $pull == null {
-                let form = ({ source: "branch" sourceBranch: $published.branch targetBranch: "main" } | url build-query)
+                let form = ({ source: "branch" sourceBranch: $published.branch targetBranch: (trunk).bookmark } | url build-query)
                 print $"Pushed ($published.branch). Open a pull request to review it on Tangled: ($repo.web)/pulls/new?($form)"
             } else {
                 print $"Pushed ($published.branch), which updates the pull request \"($pull.title)\"."
@@ -2556,11 +2583,11 @@ def cut-releases [range: string, dry_run: bool] {
 # land` releases what it lands; this catches up after a failed tag push.
 # Without an earlier release, only main itself is considered.
 def "main release" [--dry-run] {
-    let newest = (^jj log -r $"latest\(tags\(glob:'($RELEASE_TAG_GLOB)') & ::(trunk-main))" --no-graph -T commit_id | complete)
+    let newest = (^jj log -r $"latest\(tags\(glob:'($RELEASE_TAG_GLOB)') & ::(trunk-revset))" --no-graph -T commit_id | complete)
     let range = if $newest.exit_code == 0 and ($newest.stdout | str trim | is-not-empty) {
-        $"($newest.stdout | str trim)..(trunk-main)"
+        $"($newest.stdout | str trim)..(trunk-revset)"
     } else {
-        (trunk-main)
+        (trunk-revset)
     }
     cut-releases $range $dry_run
 }
@@ -2802,7 +2829,7 @@ def end-ownership [root: string, outcome: string] {
 # `outcome` (delivered or discarded).
 def --env release-workspace [summary: string, change: string, keep: bool, outcome: string] {
     let workspace = (current-workspace)
-    run-command "leaving a clean workspace on main" { ^jj new (trunk-main) } | ignore
+    run-command "leaving a clean workspace on main" { ^jj new (trunk-revset) } | ignore
     let marker = (owned-workspace-marker $workspace.root)
     if not $keep and $workspace.name != "default" and ($marker | path exists) {
         drop-workspace $workspace
@@ -2887,16 +2914,16 @@ def "main start" [
     }
     fetch-trunk
     mkdir ($root | path dirname)
-    let remote = (trunk-remote)
+    let trunk = (trunk)
     run-command $"creating workspace ($name)" {
-        ^jj --repository $default_root workspace add --revision (trunk-main $remote) --name $name $root
+        ^jj --repository $default_root workspace add --revision "trunk()" --name $name $root
     } | ignore
     # The working-copy change JJ just created is the topic; recording it lets
     # later commands notice when the working copy leaves it.
     let topic = (^jj --repository $root log -r @ --no-graph -T change_id | complete)
     if $topic.exit_code != 0 { error make { msg: ($topic.stderr | str trim) } }
     { name: $name created: (date now | format date "%+") change_id: ($topic.stdout | str trim) } | to json | save (owned-workspace-marker $root)
-    print $"Created ($root) on main@($remote). Edit and run `jj` and `ci` there; `ci park` or `ci cancel` removes it when the topic ends."
+    print $"Created ($root) on ($trunk.bookmark)@($trunk.remote). Edit and run `jj` and `ci` there; `ci park` or `ci cancel` removes it when the topic ends."
 }
 
 # Why `ci new` may not start another topic in this workspace, or null. A
@@ -2940,32 +2967,32 @@ def "main new" [
     })
     if $refusal != null { error make { msg: $refusal } }
     fetch-trunk
-    let remote = (trunk-remote)
-    let trunk = (trunk-main $remote)
+    let at = (trunk | $"($in.bookmark)@($in.remote)")
+    let trunk = "trunk()"
     if $in_place {
         if (revset-change-ids $"@- & ($trunk)" | is-empty) {
-            run-command $"moving the empty change onto main@($remote)" { ^jj rebase -r @ -o $trunk } | ignore
+            run-command $"moving the empty change onto ($at)" { ^jj rebase -r @ -o $trunk } | ignore
         }
         if $message != null {
             run-command "naming the topic" { ^jj describe --message $message } | ignore
         }
         # A marker naming another topic would strand this one.
         if ($marker | path exists) and (open $marker).change_id? != $current { rm $marker }
-        print $"Started topic (current-change 'change_id.short()') on main@($remote)."
+        print $"Started topic (current-change 'change_id.short()') on ($at)."
         return
     }
     # Work parked on main is delivered, not a sibling to return to.
     let previous = if $immutable { null } else { { id: (current-change "change_id.short()") title: (current-change "description.first_line()") } }
     let args = if $message == null { [] } else { [--message $message] }
-    run-command $"starting a topic on main@($remote)" { ^jj new $trunk ...$args } | ignore
+    run-command $"starting a topic on ($at)" { ^jj new $trunk ...$args } | ignore
     # A pool workspace's marker named the landed topic; the new one is not it.
     if ($marker | path exists) { rm $marker }
     let created = (current-change "change_id.short()")
     if $previous == null {
-        print $"Started topic ($created) on main@($remote)."
+        print $"Started topic ($created) on ($at)."
     } else {
         let title = if ($previous.title | is-empty) { "(no description)" } else { $previous.title }
-        print $"Started topic ($created) on main@($remote). ($previous.id) \"($title)\" stays as a sibling; return with `jj edit ($previous.id)`."
+        print $"Started topic ($created) on ($at). ($previous.id) \"($title)\" stays as a sibling; return with `jj edit ($previous.id)`."
     }
 }
 
@@ -3004,12 +3031,13 @@ def --env "main park" [
         if $published and not (topic-landed $branch) {
             error make { msg: $"($branch) is dispatched but not on main. Land it or cancel it explicitly before parking." }
         }
-    } else if (revset-change-ids $"@ & ::(trunk-main)" | is-empty) {
+    } else if (revset-change-ids $"@ & ::(trunk-revset)" | is-empty) {
         error make { msg: "The current revision is not on main. Land it with `ci land`, and leave the task open until it has." }
     }
     delete-topic-bookmark $branch
     forget-publication-bookmark $change
-    run-command "advancing main" { ^jj bookmark move main --to (trunk-main) } | ignore
+    let main = (trunk).bookmark
+    run-command $"advancing ($main)" { ^jj bookmark move $main --to "trunk()" } | ignore
     let summary = if $published { $"Parked ($branch)." } else { "Parked an undispatched topic." }
     # Past the checks above, a published or non-empty topic is on main.
     release-workspace $summary $change $keep (if $published or not $empty { "delivered" } else { "discarded" })
@@ -3101,7 +3129,7 @@ def "main adopt" [] {
     if (owner-status $owner) == "active" {
         error make { msg: $"Agent session ($owner.session_id? | default 'unknown') owns this workspace's change ($owner.change_id? | default 'unknown' | str substring 0..7). `ci unclaim` frees it once that session has left it." }
     }
-    if (revset-change-ids $"\((trunk-main)..@) ~ empty\()" | is-empty) {
+    if (revset-change-ids $"\((trunk-revset)..@) ~ empty\()" | is-empty) {
         error make { msg: "Nothing here to hand over: the workspace is idle on trunk, and the next session to edit it claims it anyway." }
     }
     let change = (current-topic-id)
@@ -3205,7 +3233,7 @@ def workspace-facts [workspace: record, current: string, refresh: bool, idle: du
     # Everything above trunk except an empty, undescribed working copy. Landed
     # work is on main itself, so it never counts.
     let pending = (do {
-        ^jj --repository $workspace.root log -r $"heads\(\((trunk-main)..@) ~ \(@ & empty\() & description\(exact:\"\")))" --no-graph -T 'change_id ++ "\n"'
+        ^jj --repository $workspace.root log -r $"heads\(\((trunk-revset)..@) ~ \(@ & empty\() & description\(exact:\"\")))" --no-graph -T 'change_id ++ "\n"'
     } | complete)
     if $pending.exit_code != 0 { return ($facts | upsert error ($pending.stderr | str trim | lines | first)) }
     $facts | upsert pending ($pending.stdout | str trim | is-not-empty)
@@ -3248,7 +3276,7 @@ def landed-branches [copies: list, in_use: list] {
 }
 
 def topic-branch-copies [] {
-    let trunk = (trunk-main)
+    let trunk = (trunk-revset)
     git-command "listing topic branches" {
         ^jj bookmark list --all-remotes -T 'if(normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*'
     } | lines | where {|line| $line | is-not-empty } | parse "{name}\t{commit}" | uniq

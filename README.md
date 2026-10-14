@@ -155,13 +155,17 @@ range-diff command supplies the true interdiff between review rounds.
 an owned workspace. Use `ci rebase` during an active topic; it fetches trunk
 and rebases the whole series in place.
 
-Tangled is the trunk remote: `main@tangled` is the base of every topic.
-Another repository's trunk remote is the one JJ's `ci.trunk-remote` setting
-names (`jj config set --repo ci.trunk-remote NAME`), else `tangled`, else
-`origin`, else its only remote; until main is first pushed there, topics
-start from the root. `ci` saves that base in the repository's config as the
-revset alias `ci_trunk()`, which also works in your own revsets, such as
-`jj log -r 'ci_trunk()..@'`. GitHub (`origin`) is a mirror of `main` that `ci land`
+JJ's `trunk()` is the trunk: the base of every topic and the one remote
+bookmark `ci land` advances, `main@tangled` here. Its remote also hosts the
+topic branches. `ci` reads the bookmark and remote from a `trunk()` that your
+config or the repository's defines, which must name exactly one, such as
+`main@origin` or `remote_bookmarks(exact:"master", exact:"origin")`. Where
+only JJ's default defines it, `ci` defines it in the repository's config as
+`main` on `tangled`, else `origin`, else the only remote, written as
+`latest(present(main@REMOTE) | root())` so that topics start from the root
+until main is first pushed there. Change it with
+`jj config set --repo 'revset-aliases."trunk()"' main@REMOTE`.
+GitHub (`origin`) is a mirror of the trunk bookmark that `ci land`
 fast-forwards after each landing when it is not the trunk itself, and an
 optional landing clearance; `ci dispatch` never pushes there.
 `ci dispatch` rebases,
