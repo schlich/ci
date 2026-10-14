@@ -699,7 +699,8 @@ enum Station {
 }
 
 fn phase_station(id: &str) -> usize {
-    match id {
+    // Local clearance reports each check it builds as `clearance/<check>`.
+    match id.split('/').next().unwrap_or(id) {
         "rebase" | "preflight" => 1,
         "push" | "remote" => 2,
         "closures" | "clearance" | "local-checks" => 3,
@@ -2307,4 +2308,16 @@ fn draw_toast(frame: &mut Frame, body: Rect, app: &App) {
         ])),
         inner,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_records_sit_at_clearance() {
+        assert_eq!(phase_station("clearance"), 3);
+        assert_eq!(phase_station("clearance/den-host-evaluation"), 3);
+        assert_eq!(phase_station("land"), 4);
+    }
 }

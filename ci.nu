@@ -482,6 +482,128 @@ def unit-exit-code [recorded: string, systemd_run: int] {
     if $code > 128 { -1 * ($code - 128) } else { $code }
 }
 
+# The memory one evaluation worker may take, in MiB, before nix-eval-jobs
+# restarts it and retries the check alone.
+const EVAL_MEMORY_MIB = 6144
+
+# The status record for one check: a child of `clearance`, its name cut to
+# the characters and length an OSC 7501 id segment allows.
+def check-status-id [attr: string] {
+    $"clearance/($attr | str replace --all --regex '[^A-Za-z0-9_.+-]+' '-' | str substring 0..<32)"
+}
+
+# Local clearance progress, before nix-fast-build reports anything. `names`
+# lists the checks, or is null when listing them failed.
+def checks-progress-start [names: any] {
+    { names: $names seen: [] building: [] built: [] failed: [] }
+}
+
+# The `clearance` record for `progress`: the newest build and its place
+# among the checks, or how many have been evaluated while none builds.
+def checks-progress-summary [progress: record] {
+    let of = if $progress.names == null { "" } else { $"/($progress.names | length)" }
+    let msg = if ($progress.building | is-empty) {
+        $"evaluated ($progress.seen | length)($of) checks"
+    } else {
+        let newest = ($progress.building | last)
+        let more = ($progress.building | length) - 1
+        let others = if $more > 0 { $" and ($more) more" } else { "" }
+        $"building ($newest.attr)($others) \(($newest.ordinal)($of))"
+    }
+    { state: "working" id: "clearance" msg: $msg }
+}
+
+# Fold one result nix-fast-build streamed into `progress`. Returns the next
+# progress and the status reports it calls for, as { state id msg } records.
+# A check that needs building starts once evaluated, since a free build job
+# takes it at once; a cached one needs no report. nix-fast-build builds a
+# derivation once, so a second check with the same derivation never starts.
+def checks-progress-step [progress: record, result: record] {
+    let attr = ($result.attr? | default "unknown-attribute")
+    let id = (check-status-id $attr)
+    match ($result.type? | default "") {
+        "EVAL" => {
+            let ordinal = ($progress.seen | length) + 1
+            let progress = ($progress | update seen ($progress.seen ++ [$attr]))
+            if not ($result.success? | default false) {
+                let error = ($result.error? | default "")
+                let msg = if $error =~ "exceeded the memory budget" {
+                    $"($attr) exceeded ($EVAL_MEMORY_MIB // 1024) GiB"
+                } else {
+                    let reason = ($error | lines | where {|line| $line | str trim | is-not-empty } | last | default "" | str trim)
+                    if ($reason | is-empty) { $"($attr) did not evaluate" } else { $"($attr) did not evaluate: ($reason)" }
+                }
+                return {
+                    progress: ($progress | update failed ($progress.failed ++ [$msg]))
+                    reports: [{ state: "error" id: $id msg: $msg }]
+                }
+            }
+            let drv = ($result.drvPath? | default $attr)
+            let cached = (($result.cacheStatus? | default "notBuilt") in ["cached" "local"]) or ($result.skipped? | default false)
+            if $cached or $drv in $progress.built or ($progress.building | any {|build| $build.drv == $drv }) {
+                return { progress: $progress reports: [] }
+            }
+            let progress = ($progress | update building ($progress.building ++ [{ attr: $attr drv: $drv ordinal: $ordinal }]))
+            {
+                progress: $progress
+                reports: [
+                    { state: "working" id: $id msg: $"building ($attr)" }
+                    (checks-progress-summary $progress)
+                ]
+            }
+        }
+        "BUILD" => {
+            let drv = ($progress.building | where attr == $attr | get --optional 0.drv | default $attr)
+            let progress = ($progress
+                | update building ($progress.building | where attr != $attr)
+                | update built ($progress.built ++ [$drv]))
+            if ($result.success? | default false) {
+                let took = (($result.duration? | default 0 | math round) * 1sec)
+                {
+                    progress: $progress
+                    reports: [
+                        { state: "done" id: $id msg: $"($attr) built in ($took)" }
+                        (checks-progress-summary $progress)
+                    ]
+                }
+            } else {
+                let msg = $"($attr) did not build"
+                {
+                    progress: ($progress | update failed ($progress.failed ++ [$msg]))
+                    reports: [
+                        { state: "error" id: $id msg: $msg }
+                        (checks-progress-summary $progress)
+                    ]
+                }
+            }
+        }
+        _ => { { progress: $progress reports: [] } }
+    }
+}
+
+# A killed run's outcome, naming what it cut short: the builds under way and
+# the check being evaluated, which with one worker is the first in name order
+# not yet reported, and any check already over the memory budget. Each check
+# cut short reports error under its own record.
+def checks-killed [error: string, progress: record] {
+    let next = if $progress.names == null { null } else {
+        $progress.names | where {|name| $name not-in $progress.seen } | get --optional 0
+    }
+    let building = ($progress.building | get attr)
+    let cut = ([
+        (if ($building | is-empty) { null } else { $"building ($building | str join ', ')" })
+        (if $next == null { null } else { $"evaluating ($next)" })
+    ] | compact)
+    let during = if ($cut | is-empty) { "" } else { $", while ($cut | str join ' and ')" }
+    let over = ($progress.failed | where {|msg| $msg =~ ' exceeded \d+ GiB$' })
+    let budget = if ($over | is-empty) { "" } else { $" \(($over | str join ', '))" }
+    {
+        outcome: { status: "killed" error: $"($error)($during)($budget)" }
+        reports: (($building | each {|attr| { state: "error" id: (check-status-id $attr) msg: $"($attr) was killed while building" } })
+            ++ (if $next == null { [] } else { [{ state: "error" id: (check-status-id $next) msg: $"($next) was killed while evaluating" }] }))
+    }
+}
+
 # Build every flake check at `commit` on this machine with the command the
 # spindle workflow runs, streaming the build log. Outputs already in the local
 # store or a binary cache are skipped, so a topic that leaves the system
@@ -498,30 +620,60 @@ def unit-exit-code [recorded: string, systemd_run: int] {
 # systemd-run exits 0 for a service that a stop ended, which once let two
 # topics land without their checks finishing (2026-10-07), so a shell in the
 # unit records the checks' own exit status, and a run that recorded none fails.
+#
+# nix-fast-build streams each check's result to stdout as a JSON line, which
+# this reads as it arrives and reports under `clearance`, while its build log
+# goes to stderr as before. Nu drops the exit status of a command that feeds
+# a pipeline, so another shell records it, systemd-run's own when there is a
+# unit. The checks are listed first, by name only, to number them.
 def local-checks-state [commit: string] {
     let unit = if ($env.XDG_RUNTIME_DIR? | is-empty) { null } else { $"ci-local-checks-($commit | str substring 0..7)" }
     let outcome = (with-local-checks-lock $commit --unit $unit {
         with-commit-trees { head: $commit } {|trees|
             let flake = $"path:($trees.head)"
+            let attrs = $"($flake)#checks.x86_64-linux"
             let results = ($trees.head | path dirname | path join "checks.json")
             let status = ($trees.head | path dirname | path join "checks.status")
-            let checks = [(which nix | get 0.path) --accept-flake-config run --inputs-from $flake nixpkgs#nix-fast-build -- --no-nom --skip-cached --eval-workers 1 --eval-max-memory-size 6144 --result-file $results --flake $"($flake)#checks.x86_64-linux"]
-            let ended = try {
-                if $unit == null {
-                    run-external ...$checks
-                } else {
-                    ^systemd-run --user --wait --pipe --collect --quiet --same-dir $"--unit=($unit)" -p MemoryHigh=7G -p MemoryMax=9G -p MemorySwapMax=2G -- /bin/sh -c '"$@"; echo $? > "$0"' $status ...$checks
-                }
-                { exit_code: 0 }
-            } catch {|err|
-                if $err.exit_code? == null { { error: $err.msg } } else { { exit_code: $err.exit_code } }
+            let ran = ($trees.head | path dirname | path join "checks.ran")
+            let nix = (which nix | get 0.path)
+            let listed = (try { ^$nix --accept-flake-config eval --json $attrs --apply builtins.attrNames | complete } catch { { exit_code: 1 } })
+            let names = if $listed.exit_code == 0 { try { $listed.stdout | from json } catch { null } } else { null }
+            let checks = [$nix --accept-flake-config run --inputs-from $flake nixpkgs#nix-fast-build -- --no-nom --skip-cached --stream-json-lines --eval-workers 1 --eval-max-memory-size $EVAL_MEMORY_MIB --result-file $results --flake $attrs]
+            let command = if $unit == null { $checks } else {
+                [systemd-run --user --wait --pipe --collect --quiet --same-dir $"--unit=($unit)" -p MemoryHigh=7G -p MemoryMax=9G -p MemorySwapMax=2G -- /bin/sh -c '"$@"; echo $? > "$0"' $status ...$checks]
             }
-            if $ended.error? != null { return { status: "failed" error: $ended.error } }
-            let exit_code = if $unit == null { $ended.exit_code } else {
-                unit-exit-code (try { open --raw $status | str trim } catch { "" }) $ended.exit_code
+            let streamed = try {
+                let progress = (^/bin/sh -c '"$@"; echo $? > "$0"' $ran ...$command
+                    | lines
+                    | reduce --fold (checks-progress-start $names) {|line, progress|
+                        let result = (try { $line | from json } catch { null })
+                        if ($result | describe) !~ '^record' {
+                            print $line
+                            $progress
+                        } else {
+                            let step = (checks-progress-step $progress $result)
+                            for report in $step.reports { report-status $report.state $report.msg --id $report.id }
+                            $step.progress
+                        }
+                    })
+                { progress: $progress }
+            } catch {|err| { error: $err.msg } }
+            if $streamed.error? != null { return { status: "failed" error: $streamed.error } }
+            let progress = $streamed.progress
+            let recorded = (try { open --raw $ran | str trim } catch { "" })
+            let exit_code = if $unit == null { unit-exit-code $recorded 0 } else {
+                let systemd_run = (try { $recorded | into int } catch { 0 })
+                unit-exit-code (try { open --raw $status | str trim } catch { "" }) $systemd_run
             }
-            if $exit_code == null { return { status: "killed" error: "stopped before it finished" } }
-            checks-outcome $exit_code $results
+            let outcome = if $exit_code == null {
+                { status: "killed" error: "stopped before it finished" }
+            } else {
+                checks-outcome $exit_code $results
+            }
+            if $outcome.status != "killed" { return $outcome }
+            let killed = (checks-killed $outcome.error $progress)
+            for report in $killed.reports { report-status $report.state $report.msg --id $report.id }
+            $killed.outcome
         }
     })
     let state = if $outcome.status == "success" { "success" } else { "failed" }
@@ -582,7 +734,7 @@ def wait-for-pipeline [gate: record, commit: string, timeout: duration] {
                 let detail = if ($workflow.error? | is-empty) { "" } else { $" \(($workflow.error | lines | last))" }
                 $"($workflow.name): ($workflow.status)($detail)"
             })
-            report-status error $"($gate.name) rejected the head" --id clearance
+            report-status error $"($gate.name) rejected the head: ($failed | str join '; ')" --id clearance
             error make { msg: $"($gate.name) rejected ($commit | str substring 0..11): ($failed | str join '; '). Leave the task open." }
         }
         let status = if $pipeline.state == "missing" {

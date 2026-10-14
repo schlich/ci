@@ -213,6 +213,17 @@ leaves them unchanged (every refactor, for instance) builds only the cheap
 checks. The first landing after a large input update pays for the full
 system builds. Nix's configured remote builders apply as usual.
 
+Local clearance reports each check as it goes, as OSC 7501 records that
+`watch-job` and `ci tower` follow. The `clearance` record names the newest
+build and its place among the checks, such as `building desktop-primary
+(3/14)`. Each check that needs building gets its own `clearance/<check>`
+record: working when it starts, then done with its build time, or error when
+it does not build or evaluate. An evaluation that outgrows its worker's
+memory budget reports as an error under its own name, such as
+`den-host-evaluation exceeded 6 GiB`. A run killed outright reports the
+builds and the evaluation it cut short as errors, and names them in the
+clearance failure. Checks substituted from a cache report nothing.
+
 Local clearance and a refactor's closure proof hold one lock for the whole
 machine, `$XDG_STATE_HOME/jj-ci/local-checks.lock` (under `~/.local/state` by
 default), shared by every workspace and session, since two of them at once

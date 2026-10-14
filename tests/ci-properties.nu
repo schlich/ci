@@ -628,6 +628,100 @@ for case in $UNIT_EXIT_CASES {
 }
 print $"ok unit exit codes \(($UNIT_EXIT_CASES | length) cases)"
 
+# Local clearance progress, folded from the JSON lines nix-fast-build streams.
+# A landing where one check was substituted, one built, one evaluation ran
+# over the memory budget, and one check shared the built check's derivation.
+def fold-progress [names: any, results: list] {
+    $results | reduce --fold { progress: (checks-progress-start $names) reports: [] } {|result, acc|
+        let step = (checks-progress-step $acc.progress $result)
+        { progress: $step.progress reports: ($acc.reports ++ $step.reports) }
+    }
+}
+
+let landing = (fold-progress ["cached" "desktop-primary" "den-host-evaluation" "alias"] [
+    { type: "EVAL" attr: "cached" success: true error: null drvPath: "/d/0" cacheStatus: "cached" }
+    { type: "EVAL" attr: "desktop-primary" success: true error: null drvPath: "/d/1" cacheStatus: "notBuilt" }
+    { type: "EVAL" attr: "den-host-evaluation" success: false error: $MEMORY_BUDGET_ERROR }
+    { type: "BUILD" attr: "desktop-primary" success: true error: null duration: 62.4 }
+    { type: "EVAL" attr: "alias" success: true error: null drvPath: "/d/1" cacheStatus: "notBuilt" }
+])
+assert equal $landing.reports [
+    { state: "working" id: "clearance/desktop-primary" msg: "building desktop-primary" }
+    { state: "working" id: "clearance" msg: "building desktop-primary (2/4)" }
+    { state: "error" id: "clearance/den-host-evaluation" msg: "den-host-evaluation exceeded 6 GiB" }
+    { state: "done" id: "clearance/desktop-primary" msg: "desktop-primary built in 1min 2sec" }
+    { state: "working" id: "clearance" msg: "evaluated 3/4 checks" }
+]
+assert equal $landing.progress.building []
+
+let failing = (fold-progress null [
+    { type: "EVAL" attr: "broken" success: false error: "error:\n       … while evaluating the attribute 'checks'\n\n       error: attribute 'x' missing\n" }
+    { type: "EVAL" attr: "tests" success: true error: null drvPath: "/d/2" }
+    { type: "BUILD" attr: "tests" success: false error: "build exited with 1" duration: 3.0 }
+])
+assert equal ($failing.reports | where state == "error" | get msg) ["broken did not evaluate: error: attribute 'x' missing" "tests did not build"]
+assert equal ($failing.reports | where id == "clearance" | get msg) ["building tests (2)" "evaluated 2 checks"]
+
+# Killed while one check built and the next in name order was evaluating.
+let cut = (fold-progress ["a" "b" "c"] [
+    { type: "EVAL" attr: "a" success: true error: null drvPath: "/d/a" cacheStatus: "notBuilt" }
+])
+assert equal (checks-killed "likely out of memory, signal 9" $cut.progress) {
+    outcome: { status: "killed" error: "likely out of memory, signal 9, while building a and evaluating b" }
+    reports: [
+        { state: "error" id: "clearance/a" msg: "a was killed while building" }
+        { state: "error" id: "clearance/b" msg: "b was killed while evaluating" }
+    ]
+}
+assert equal (checks-killed "likely out of memory, exit status 1" $landing.progress).outcome.error "likely out of memory, exit status 1 (den-host-evaluation exceeded 6 GiB)"
+assert equal (check-status-id "nixos/a very long check name that keeps going") "clearance/nixos-a-very-long-check-name-tha"
+print "ok local clearance progress"
+
+def gen-check-results [key: string] {
+    let names = (0..<(pick $"($key)/count" 6) | each {|i| $"check-($i)" })
+    let evals = ($names | enumerate | each {|name|
+        let kind = (pick-from $"($key)/eval/($name.index)" ["cached" "build" "alias" "eval-error" "memory"])
+        match $kind {
+            "cached" => { type: "EVAL" attr: $name.item success: true error: null drvPath: $"/d/($name.index)" cacheStatus: "cached" }
+            "build" => { type: "EVAL" attr: $name.item success: true error: null drvPath: $"/d/($name.index)" cacheStatus: "notBuilt" }
+            "alias" => { type: "EVAL" attr: $name.item success: true error: null drvPath: "/d/0" cacheStatus: "notBuilt" }
+            "eval-error" => { type: "EVAL" attr: $name.item success: false error: "error: boom" }
+            _ => { type: "EVAL" attr: $name.item success: false error: $MEMORY_BUDGET_ERROR }
+        }
+    })
+    # nix-fast-build builds each derivation once, after its check evaluates.
+    mut stream = []
+    mut queued = []
+    for eval in $evals {
+        $stream = ($stream ++ [$eval])
+        if $eval.success and $eval.cacheStatus == "notBuilt" and $eval.drvPath not-in $queued {
+            $queued = ($queued ++ [$eval.drvPath])
+            if (flag $"($key)/finish/($eval.attr)") {
+                $stream = ($stream ++ [{ type: "BUILD" attr: $eval.attr success: (flag $"($key)/ok/($eval.attr)") error: null duration: 1.0 }])
+            }
+        }
+    }
+    { names: $names results: $stream }
+}
+
+for-all "every check reported started ends done or error, once the run ends" {|key|
+    let run = (gen-check-results $key)
+    let folded = (fold-progress $run.names $run.results)
+    let reports = ($folded.reports ++ (if ($folded.progress.building | is-empty) { [] } else {
+        (checks-killed "likely out of memory, signal 9" $folded.progress).reports
+    }))
+    let total = ($run.names | length)
+    for started in ($reports | where state == "working" and id != "clearance" | get id | uniq) {
+        let last = ($reports | where id == $started | last)
+        assert ($last.state in ["done" "error"]) $"($started) was left ($last.state)"
+    }
+    for summary in ($reports | where id == "clearance" | get msg) {
+        let counted = ($summary | parse --regex '(?<n>\d+)/(?<total>\d+)' | get --optional 0)
+        assert ($counted != null and ($counted.n | into int) <= $total and ($counted.total | into int) == $total) $"bad count in ($summary)"
+    }
+    assert ($reports | all {|report| $report.id =~ '^clearance(/[A-Za-z0-9_.+-]{1,32})?$' }) "an id is not an OSC 7501 path"
+}
+
 def gen-check-result [key: string] {
     let kind = (pick-from $"($key)/kind" ["passed" "build" "eval" "memory"])
     {
