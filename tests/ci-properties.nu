@@ -875,3 +875,38 @@ for-all "remote retries back off by doubling from two seconds" {|key|
     assert equal (remote-retry-delay ($attempt + 1) $RATE_LIMITED) ($first * 2)
     assert equal (remote-retry-delay 1 $RATE_LIMITED) 2sec
 }
+
+# The trunk remote is the configured one, else a preferred name, else the only
+# remote. A configured name that is not a remote, or several remotes with no
+# preferred one among them, is refused rather than guessed.
+for-all "the trunk remote is configured, preferred, or the only remote" {|key|
+    let names = (["tangled" "origin" "upstream" "knot"] | where {|name| flag $"($key)/has/($name)" })
+    let configured = (pick-from $"($key)/configured" [null "" "upstream" "knot"])
+    let preferred = ($TRUNK_REMOTES | where {|name| $name in $names } | get --optional 0)
+    let expected = if ($configured | is-not-empty) {
+        if $configured in $names { $configured } else { null }
+    } else if $preferred != null {
+        $preferred
+    } else if ($names | length) == 1 {
+        $names | first
+    } else { null }
+    assert equal (choose-trunk-remote $names $configured) $expected
+}
+
+const TANGLED_LOCATION_CASES = [
+    [url expected];
+    ["git@tangled.org:schlich.tngl.sh/xr-ui" { owner: "schlich.tngl.sh" name: "xr-ui" }]
+    ["git@tangled.org:@schlich.tngl.sh/ci.git" { owner: "schlich.tngl.sh" name: "ci" }]
+    ["https://tangled.org/did:plc:abc/ci/" { owner: "did:plc:abc" name: "ci" }]
+    ["ssh://git@knot.example/schlich.tngl.sh/ci" { owner: "schlich.tngl.sh" name: "ci" }]
+    ["git@tangled.org:did:plc:cbfi43hmtk77onjajvmonkjl" { did: "did:plc:cbfi43hmtk77onjajvmonkjl" }]
+    ["https://tangled.org/did:plc:abc" { did: "did:plc:abc" }]
+    ["git@tangled.org:a/b/c" null]
+    ["git@tangled.org:xr-ui" null]
+    ["/srv/git/ci" null]
+]
+
+for case in $TANGLED_LOCATION_CASES {
+    assert equal (tangled-location $case.url) $case.expected $"tangled-location ($case.url)"
+}
+print $"ok tangled remote locations \(($TANGLED_LOCATION_CASES | length) cases)"

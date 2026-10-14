@@ -156,14 +156,20 @@ an owned workspace. Use `ci rebase` during an active topic; it fetches trunk
 and rebases the whole series in place.
 
 Tangled is the trunk remote: `main@tangled` is the base of every topic.
-GitHub (`origin`) is a mirror of `main` that `ci land` fast-forwards after
-each landing, and an optional landing clearance; `ci dispatch` never pushes there.
+Another repository's trunk remote is the one JJ's `ci.trunk-remote` setting
+names (`jj config set --repo ci.trunk-remote NAME`), else `tangled`, else
+`origin`, else its only remote; until main is first pushed there, topics
+start from the root. GitHub (`origin`) is a mirror of `main` that `ci land`
+fast-forwards after each landing when it is not the trunk itself, and an
+optional landing clearance; `ci dispatch` never pushes there.
 `ci dispatch` rebases,
-validates, and pushes the stable `jj-<slug>-<change-id>` bookmark to Tangled.
-It does not create a follow-up change, so further edits to the series update
-the same branch. Open a Tangled pull request from that branch when the topic
-needs review; `ci` finds it by branch through Tangled's public index and
-needs no credentials beyond the SSH key used to push.
+validates, and pushes the stable `jj-<slug>-<change-id>` bookmark to the trunk
+remote. It does not create a follow-up change, so further edits to the series
+update the same branch. Open a Tangled pull request from that branch when the
+topic needs review; `ci` finds it by branch through Tangled's public index and
+needs no credentials beyond the SSH key used to push. A remote URL may name
+the repository by owner and name or by its repository DID; a trunk remote
+that is not on Tangled skips the pull request link.
 
 `ci land` is the only way a change reaches `main`. It dispatches the topic,
 which rebases it onto `main@tangled`; for a declared refactor, it proves that
