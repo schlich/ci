@@ -51,11 +51,32 @@ if(self.contained_in("::@"),
     ++ ",\"conflict\":" ++ json(conflict)
     ++ ",\"described\":" ++ json(description != "")
     ++ ",\"title\":" ++ json(description.first_line())
-    ++ ",\"impact\":" ++ json(trailers.filter(|t| t.key() == "Impact").map(|t| t.value()))
     ++ ",\"files\":[" ++ self.diff().files().map(|f| "[" ++ json(f.status()) ++ "," ++ json(f.path().display()) ++ "]").join(",") ++ "]"
     ++ "}\n",
   "{\"above\":false}\n")
 '
+
+# Each change's declared impact class, from the latest `ci.impact.set` record
+# in the ci log, as { CHANGE_ID: class }. Only lines naming the event are
+# decoded, since this runs at every prompt. Keep in step with read-ci-log and
+# impact-declarations in ci.nu.
+def impact-declarations [] {
+    let path = if ($env.CI_LOG? | is-not-empty) { $env.CI_LOG } else {
+        $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "ci" "log.otlp.jsonl"
+    }
+    if not ($path | path exists) { return {} }
+    open --raw $path
+    | lines
+    | where {|line| $line | str contains '"eventName":"ci.impact.set"' }
+    | each {|line| try { $line | from json } catch { null } }
+    | each {|request| $request.resourceLogs | get scopeLogs | flatten | get logRecords | flatten }
+    | flatten
+    | reduce --fold {} {|record, declarations|
+        let attributes = ($record.attributes? | default [] | reduce --fold {} {|attribute, all| $all | upsert $attribute.key ($attribute.value | values | first) })
+        let change = ($attributes."ci.change_id"? | default "")
+        if ($change | is-empty) { $declarations } else { $declarations | upsert $change ($attributes."ci.impact"? | default "") }
+    }
+}
 
 # The state a Codex ownership record declares: none, active, delivered,
 # discarded, or released. A record from before `state` has only `finished`,
@@ -340,8 +361,14 @@ def stranded-topic [root: path, stack_ids: list, wc: record] {
 # Every local fact, plus the cached pipeline state for the published head.
 def collect [root: path] {
     let revset = ('@ | (' + $TRUNK + '..@) | (@..' + $TRUNK + ')')
+    let declarations = (impact-declarations)
     let revisions = (jj-lines $root [log --no-graph -r $revset -T $REVISION_TEMPLATE] | each {|line| $line | from json }
-        | each {|rev| if $rev.above and ($rev.title | is-empty) { $rev | update title "(no description)" } else { $rev } })
+        | each {|rev| if $rev.above and ($rev.title | is-empty) { $rev | update title "(no description)" } else { $rev } }
+        | each {|rev|
+            if not $rev.above { return $rev }
+            let impact = ($declarations | get --optional $rev.change_id)
+            $rev | insert impact (if ($impact | is-empty) { [] } else { [$impact] })
+        })
     let above = ($revisions | where above)
     let wc = ($above | where wc | first)
     # An empty, undescribed working copy is scratch space; the topic is below.
@@ -487,7 +514,7 @@ def lint-summary [facts: record] {
 def topic-title [facts: record] {
     let title = if $facts.head.described { $"\"($facts.head.title)\"" } else { "(no description)" }
     let impact = ($facts.stack | each {|rev| $rev.impact } | flatten | uniq)
-    let impact_label = if ($impact | is-empty) { "no Impact trailer" } else { $impact | str join "+" }
+    let impact_label = if ($impact | is-empty) { "no impact declared" } else { $impact | str join "+" }
     $"($facts.head.short) ($title) · ($impact_label)"
 }
 

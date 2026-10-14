@@ -352,9 +352,9 @@ async def interdiff(
 async def impact_check(
     base: str, head: str, workspace: Workspace = None, wait_seconds: Wait = None
 ) -> dict:
-    """`ci impact check BASE HEAD`: check a commit range's Impact trailers;
-    for a refactor, prove every host closure matches the merge base. Builds
-    closures, so it can take minutes."""
+    """`ci impact check BASE HEAD`: check the impact declared for each
+    revision in a range; for a refactor, prove every host closure matches the
+    merge base. Builds closures, so it can take minutes."""
     return await run(
         ["impact", "check", base, head],
         workspace,
@@ -362,6 +362,21 @@ async def impact_check(
         mutating=False,
         default_wait=20,
     )
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def impact_show(
+    revset: Annotated[
+        str | None,
+        Field(description="Revisions to show (default: the current topic)."),
+    ] = None,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci impact show`: each revision's declared impact class and manual
+    steps, from the ci log."""
+    args = ["impact", "show"] + ([] if revset is None else [revset])
+    return await run(args, workspace, wait_seconds, mutating=False)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -403,6 +418,29 @@ async def new(
     """`ci new`: start a topic as a new change on main@tangled in this
     workspace; the current topic stays as a sibling."""
     args = ["new"] + ([] if message is None else ["--message", message])
+    return await run(args, workspace, wait_seconds)
+
+
+@mcp.tool(annotations=LOCAL)
+async def impact_set(
+    impact: Literal["refactor", "behavior", "breaking"],
+    steps: Annotated[
+        list[str] | None,
+        Field(
+            description="The manual steps activating a breaking change needs, "
+            "in order. Required for breaking; omit otherwise."
+        ),
+    ] = None,
+    revision: Annotated[
+        str, Field(description="Revision or revset to declare (default: @).")
+    ] = "@",
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci impact set IMPACT [STEP...] -r REVISION`: declare a revision's
+    impact in the ci log. Dispatch and landing require one per revision; the
+    latest declaration for a change wins."""
+    args = ["impact", "set", impact, *(steps or []), "--revision", revision]
     return await run(args, workspace, wait_seconds)
 
 

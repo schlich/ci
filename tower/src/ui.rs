@@ -950,7 +950,7 @@ fn draw_topic_detail(frame: &mut Frame, area: Rect, app: &App) {
             .impact
             .last()
             .cloned()
-            .unwrap_or_else(|| "no Impact".into());
+            .unwrap_or_else(|| "no impact".into());
         let right_w = width(&impact) + if revision.conflict { 11 } else { 0 } + 1;
         let title = if revision.title.is_empty() {
             "(no description)"

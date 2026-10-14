@@ -269,12 +269,12 @@ polls every 30 seconds (default timeout `--timeout 2hr`) and stops at the
 first failed, timed-out, or cancelled workflow without landing anything.
 
 `ci land --clearance github` takes clearance from GitHub Actions. It pushes the topic branch to `origin`, where
-`nix-ci.yml` runs on every `jj-*` push, waits for the `impact classification`
-and `nix flake checks` runs on the exact head, and then fast-forwards `main`
+`nix-ci.yml` runs on every `jj-*` push, waits for the `nix flake checks` run
+on the exact head, and then fast-forwards `main`
 on Tangled and GitHub exactly as a spindle-cleared landing does. Never merge a
 GitHub pull request instead: GitHub's squash and rebase merges rewrite
-commits, so `main` would hold a commit no check ran on, change IDs and
-per-revision trailers would be lost, and `park` and `prune` could no longer
+commits, so `main` would hold a commit no check ran on, change IDs and the
+impact declarations keyed by them would be lost, and `park` and `prune` could no longer
 tell that the topic landed. The GitHub repository therefore allows only
 merge commits, which its linear-history rule rejects, so its merge button
 cannot land anything; its `main` rule accepts only fast-forward pushes.
@@ -435,6 +435,9 @@ which the OpenTelemetry Collector's `otlpjsonfile` receiver reads as is. The
 records carry the event name (`ci.status` for a status report), the state,
 phase id, and message, the process id that groups one run, and the working
 directory. One log serves every repository and workspace on the machine.
+It is also where `ci impact set` records impact declarations
+(`ci.impact.set`) and `ci land` records releases (`ci.release`), so it is
+state as well as telemetry: keep it when cleaning up `$XDG_STATE_HOME`.
 
 When `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is
 set, `ci` also posts each record to that OTLP/HTTP endpoint (`/v1/logs` under
@@ -516,7 +519,7 @@ contacts a forge itself. `ci tower --json` prints what it collected, and
 
 `ci sim` answers what the machine would look like once the dispatched
 user-facing topics land. It merges `main@tangled` with the head of every
-dispatched topic whose revisions are `Impact: behavior` or `Impact: breaking`
+dispatched topic whose revisions are declared `behavior` or `breaking`
 (or the topic branches given; `--all` adds refactors) in a temporary
 workspace, then builds that merge's Home
 Manager generation to `$XDG_STATE_HOME/ci/preview-home`. The merge is
@@ -547,38 +550,52 @@ unattended rebase; a supervisor does not rebase on its own.
 
 ## Impact classes and releases
 
-Every JJ change ends its description with an `Impact:` trailer that states
-what it does to the built machines:
+Every JJ change declares what it does to the built machines with
+`ci impact set`, which records a typed `ci.impact.set` event in
+[the ci log](#the-ci-log) rather than text in the description:
 
 - `refactor`: every NixOS closure is unchanged, as for refactors, docs, CI,
   and repository tooling. `ci land` proves that each host's toplevel
   derivation matches the base. No release.
 - `behavior`: a user-facing change to a host. Landing it cuts a CalVer release.
 - `breaking`: a user-facing change that needs manual steps when activating.
-  The description body must list the steps, and the release commit carries
-  them.
+  Each step is its own argument, and at least one is required.
 
-```text
-Launch terminals through their configured Home Manager packages
-
-Impact: refactor
+```nushell
+ci impact set refactor
+ci impact set breaking "Run `ssh-keygen -R homelab` once" -r lqwrwwuy
+ci impact show
 ```
 
-`ci dispatch` refuses a topic with a missing trailer, or one that mixes a
-refactor with a user-facing change: the topic lands as a unit, so it would
-ship the refactor inside a release and lose its closure-neutral guarantee.
-Split the refactor into its own topic, or make it the parent layer of a stack
-when the change depends on it. Breaking and behavior revisions may share a
-topic; the topic takes the stronger class.
+The event is keyed by the full change ID, which survives every rebase and
+restack, so a declaration follows its change to `main`; declaring again
+replaces it. `-r` takes a revset and declares each revision in it. The
+description stays prose: nothing parses it. A change that predates this
+carried an `Impact:` trailer instead, and `ci impact import` declares the
+undeclared revisions of a topic from theirs.
 
-Landing keeps every revision, so each commit on `main` carries its own
-trailer. After fast-forwarding `main`, `ci land` tags every behavior or
-breaking revision it landed as `YYYY.MM.DD.N` (UTC commit date, numbered
-within the day) with `jj tag set` and pushes the tag to Tangled. The tagged
-commit's description is the release note. `ci release` catches up on
-anything since the newest release if a tag push failed. Refactors never cut a
-version, so the list of releases is the list of changes that alter a machine.
-`ci version` prints the newest release in the current revision.
+The declarations live only on the machine that made them, which is the one
+that dispatches and lands the topic. GitHub cannot read them, so it no longer
+runs an impact check; a GitHub-cleared landing still classifies the topic and
+proves a refactor closure-neutral locally first.
+
+`ci dispatch` refuses a topic with an undeclared revision, a breaking
+revision without steps, or one that mixes a refactor with a user-facing
+change: the topic lands as a unit, so it would ship the refactor inside a
+release and lose its closure-neutral guarantee. Split the refactor into its
+own topic, or make it the parent layer of a stack when the change depends on
+it. Breaking and behavior revisions may share a topic; the topic takes the
+stronger class.
+
+After fast-forwarding `main`, `ci land` tags every behavior or breaking
+revision it landed as `YYYY.MM.DD.N` (UTC commit date, numbered within the
+day) with `jj tag set` and pushes the tag to Tangled. The tagged commit's
+description and its declared manual steps are the release note: `ci land`
+prints them and records a `ci.release` event in the ci log. `ci release`
+catches up on anything since the newest release if a tag push failed.
+Refactors never cut a version, so the list of releases is the list of changes
+that alter a machine. `ci version` prints the newest release in the current
+revision.
 
 A NixOS generation cannot carry the tag: the tag is created after merge, and
 local `path:` builds have no Git revision. Compare a generation with a release
@@ -618,7 +635,8 @@ Tangled, which holds code.
 The permanent default is one branch per ordinary JJ topic. The dispatch
 bookmark is a stable `jj-<slug>-<change-id>` branch, and `ci land`
 fast-forwards `main` to it after the landing clearance passes it. `main` stays linear
-without squashing, and every revision keeps its change ID and trailer. Branches
+without squashing, and every revision keeps its change ID and so its impact
+declaration. Branches
 from older sessions may retain their descriptive names, but new topics must use
 the `jj-` prefix: the spindle accepts manual runs only on `jj-*` branches and
 `main`, and `ci` treats only `jj-*` bookmarks as dispatched topics.

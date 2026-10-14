@@ -14,7 +14,7 @@ use std::time::Instant;
 use jj_ci_lifecycle::stage::{Observation, Stage, Stranded};
 use serde::{Deserialize, Serialize};
 
-use crate::time;
+use crate::{log, time};
 
 /// The trunk revset `context-status` uses.
 pub const TRUNK: &str = r#"coalesce(remote_bookmarks(exact:"main", exact:"tangled"), trunk())"#;
@@ -53,14 +53,15 @@ struct RawRevision {
     e: bool,
     x: bool,
     dv: bool,
-    i: Vec<String>,
     rb: Vec<(String, String)>,
     on: bool,
     ts: i64,
 }
 
-impl From<RawRevision> for Revision {
-    fn from(raw: RawRevision) -> Self {
+impl Revision {
+    /// `raw` with the impact `declarations` (from the ci log) give its change.
+    fn read(raw: RawRevision, declarations: &HashMap<String, String>) -> Self {
+        let impact = declarations.get(&raw.ch).cloned().into_iter().collect();
         Revision {
             commit_id: raw.c,
             change_id: raw.ch,
@@ -71,7 +72,7 @@ impl From<RawRevision> for Revision {
             empty: raw.e,
             conflict: raw.x,
             divergent: raw.dv,
-            impact: raw.i,
+            impact,
             remote_bookmarks: raw.rb,
             on_trunk: raw.on,
             time_ms: raw.ts * 1_000,
@@ -93,7 +94,10 @@ pub struct TrunkCommit {
 #[derive(Deserialize)]
 struct RawTrunk {
     c: String,
+    ch: String,
     s: String,
+    /// `Impact:` trailers, which commits landed before impact moved to the ci
+    /// log still carry; shown only when the log has no declaration.
     t: String,
     i: Vec<String>,
     tags: Vec<String>,
@@ -160,7 +164,7 @@ pub struct StrandedTopic {
 }
 
 impl Topic {
-    /// The topic's combined Impact class, as `ci dispatch` would judge it.
+    /// The topic's combined impact class, as `ci dispatch` would judge it.
     pub fn impact(&self) -> Option<String> {
         if self.stack.is_empty() {
             return None;
@@ -293,7 +297,6 @@ fn revision_template() -> String {
         r#" ++ ",\"p\":[" ++ parents.map(|p| "\"" ++ p.commit_id() ++ "\"").join(",") ++ "]""#,
         r#" ++ ",\"t\":" ++ json(description.first_line()) ++ ",\"d\":" ++ json(description != "")"#,
         r#" ++ ",\"e\":" ++ json(empty) ++ ",\"x\":" ++ json(conflict) ++ ",\"dv\":" ++ json(divergent)"#,
-        r#" ++ ",\"i\":" ++ json(trailers.filter(|t| t.key() == "Impact").map(|t| t.value()))"#,
         r#" ++ ",\"rb\":[" ++ remote_bookmarks.map(|b| "[" ++ json(b.name()) ++ "," ++ json(b.remote()) ++ "]").join(",") ++ "]""#,
         &format!(r#" ++ ",\"on\":" ++ json(self.contained_in("::{trunk}"))"#),
         r#" ++ ",\"ts\":" ++ committer.timestamp().format("%s") ++ "}\n""#,
@@ -301,7 +304,7 @@ fn revision_template() -> String {
     .concat()
 }
 
-const TRUNK_TEMPLATE: &str = r#""{\"c\":\"" ++ commit_id ++ "\",\"s\":" ++ json(change_id.short(8)) ++ ",\"t\":" ++ json(description.first_line()) ++ ",\"i\":" ++ json(trailers.filter(|t| t.key() == "Impact").map(|t| t.value())) ++ ",\"tags\":[" ++ tags.map(|t| json(t.name())).join(",") ++ "],\"a\":" ++ json(author.name()) ++ ",\"ts\":" ++ committer.timestamp().format("%s") ++ "}\n""#;
+const TRUNK_TEMPLATE: &str = r#""{\"c\":\"" ++ commit_id ++ "\",\"ch\":\"" ++ change_id ++ "\",\"s\":" ++ json(change_id.short(8)) ++ ",\"t\":" ++ json(description.first_line()) ++ ",\"i\":" ++ json(trailers.filter(|t| t.key() == "Impact").map(|t| t.value())) ++ ",\"tags\":[" ++ tags.map(|t| json(t.name())).join(",") ++ "],\"a\":" ++ json(author.name()) ++ ",\"ts\":" ++ committer.timestamp().format("%s") ++ "}\n""#;
 
 const WORKSPACE_TEMPLATE: &str = r#""{\"name\":" ++ json(self.name()) ++ ",\"root\":" ++ json(self.root()) ++ ",\"c\":\"" ++ self.target().commit_id() ++ "\"}\n""#;
 
@@ -418,12 +421,13 @@ fn graph(repo: &Path, recorded: &[String]) -> Result<(Graph, Vec<TrunkCommit>), 
     }
     let revset = format!("({TRUNK})..({heads}) | ({heads})");
     let template = revision_template();
+    let declarations = log::impact_declarations();
     let revisions: Vec<Revision> = parse_lines::<RawRevision>(&jj(
         repo,
         &["log", "--no-graph", "-r", &revset, "-T", &template],
     )?)?
     .into_iter()
-    .map(Revision::from)
+    .map(|raw| Revision::read(raw, &declarations))
     .collect();
     let trunk_revset = format!("ancestors({TRUNK}, {TRUNK_DEPTH})");
     let trunk: Vec<TrunkCommit> = parse_lines::<RawTrunk>(&jj(
@@ -439,10 +443,13 @@ fn graph(repo: &Path, recorded: &[String]) -> Result<(Graph, Vec<TrunkCommit>), 
     )?)?
     .into_iter()
     .map(|raw| TrunkCommit {
+        impact: match declarations.get(&raw.ch) {
+            Some(impact) => vec![impact.clone()],
+            None => raw.i,
+        },
         commit_id: raw.c,
         short: raw.s,
         title: raw.t,
-        impact: raw.i,
         tags: raw.tags,
         author: raw.a,
         time_ms: raw.ts * 1_000,

@@ -11,6 +11,7 @@ mod app;
 mod feed;
 mod host;
 mod jobs;
+mod log;
 mod repo;
 mod theme;
 mod time;

@@ -242,7 +242,8 @@ NoDropWhilePending ==
 (* Not rocket science: main only ever holds a topic commit a gate passed.  *)
 MainOnlyHoldsPassedHeads == mainHead \in Heads => mainHead = passedHead
 (* Delivery is the published commit itself, not a forge-made copy of it,  *)
-(* so change IDs, trailers, and ancestry checks survive landing.           *)
+(* so change IDs, the impact declared for them, and ancestry checks        *)
+(* survive landing.                                                        *)
 DeliveryIsPublishedHead == delivered => mainHead = publishedHead
 (* An edit or rebase after landing keeps the topic undelivered. *)
 DeliveredHeadIsLocal == delivered => mainHead = head

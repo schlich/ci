@@ -250,9 +250,10 @@ for-all "log-event appends records that read-ci-log returns in order" {|key|
     rm $log
 }
 
-# Impact classes: trailers, PR classification, release numbering, and plan order.
+# Impact classes: declarations, former trailers (for `ci impact import`), PR
+# classification, release numbering, and plan order.
 
-# "" stands for a missing trailer; `each` would drop a null.
+# "" stands for a missing declaration; `each` would drop a null.
 const IMPACT_VALUES = ["refactor" "behavior" "breaking" "Refactor" "BEHAVIOR" "chore" ""]
 
 def gen-impacts [key: string] {
@@ -276,6 +277,50 @@ for-all "description-body drops the subject and the trailer" {|key|
     let body = (description-body $description)
     assert equal (parse-impact $body) ""
     assert equal $body ($description | lines | skip 1 | drop 1 | str join "\n" | str trim)
+}
+
+for-all "impact-problem accepts exactly the typed declarations" {|key|
+    let impact = (pick-from $"($key)/impact" ($IMPACT_VALUES | str lowercase))
+    let steps = (0..<(pick $"($key)/steps" 3) | each {|i| pick-from $"($key)/step/($i)" ["Run `x`" "Reboot" " " ""] })
+    let valid = ($impact in $IMPACTS
+        and ($steps | all {|step| $step | str trim | is-not-empty })
+        and (($impact == "breaking") == ($steps | is-not-empty)))
+    assert equal ((impact-problem $impact $steps) == null) $valid
+}
+
+for-all "declarations follow the latest ci.impact.set per change" {|key|
+    let log = (mktemp --tmpdir ci-impact-log-XXXXXX)
+    let changes = (0..<(1 + (pick $"($key)/changes" 3)) | each {|i| gen-change-id $"($key)/change/($i)" } | uniq)
+    let revisions = ($changes | each {|change|
+        { change_id: $change short: ($change | str substring 0..7) commit_id: "0000" description: (gen-title $"($key)/title/($change)") }
+    })
+    let declarations = (0..<(pick $"($key)/count" 6) | each {|i|
+        let impact = (pick-from $"($key)/impact/($i)" $IMPACTS)
+        {
+            revision: (pick-from $"($key)/revision/($i)" $revisions)
+            impact: $impact
+            steps: (if $impact == "breaking" { [$"Step (gen-title $'($key)/step/($i)')"] } else { [] })
+        }
+    })
+    with-env { CI_LOG: $log OTEL_EXPORTER_OTLP_ENDPOINT: "" OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "" } {
+        for declaration in $declarations {
+            declare-impact [$declaration.revision] $declaration.impact $declaration.steps | ignore
+        }
+        log-event "ci.status" "noise" { "ci.change_id": ($changes | first) "ci.impact": "breaking" }
+        let declared = (with-impacts $revisions)
+        for revision in $declared {
+            let mine = ($declarations | where revision.change_id == $revision.change_id)
+            let latest = if ($mine | is-empty) { null } else { $mine | last }
+            if $latest == null {
+                assert equal $revision.impact ""
+                assert equal $revision.steps []
+            } else {
+                assert equal $revision.impact $latest.impact
+                assert equal $revision.steps $latest.steps
+            }
+        }
+    }
+    rm $log
 }
 
 for-all "combine-impacts never mixes refactors with user-facing changes" {|key|

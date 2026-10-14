@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{self, Event};
 
 use crate::host::{self, HostInfo, LockReader, Locks};
 use crate::jobs::{Run, Scanner};
+use crate::log;
 use crate::repo::{self, Snapshot};
 
 pub enum Msg {
@@ -159,10 +160,12 @@ pub fn start(dir: PathBuf, tx: Sender<Msg>) -> Feed {
         let result = repo::snapshot(&dir);
         if let (Ok(snapshot), Ok(mut watched)) = (&result, shared.lock()) {
             watched.op_heads = snapshot.op_heads.clone();
+            // An impact declaration changes the board without a JJ operation.
             watched.records = snapshot
                 .workspace_roots
                 .iter()
                 .flat_map(|root| repo::record_files(root))
+                .chain([log::path()])
                 .collect();
         }
         if snapshots.send(Msg::Snapshot(result.map(Box::new))).is_err() {

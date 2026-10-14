@@ -26,6 +26,14 @@ def "nu-complete ci clearances" [] {
     ]
 }
 
+def "nu-complete ci impacts" [] {
+    [
+        { value: "refactor", description: "Every NixOS closure is unchanged" }
+        { value: "behavior", description: "A user-facing change; landing it cuts a release" }
+        { value: "breaking", description: "A user-facing change that needs the manual steps it lists" }
+    ]
+}
+
 def "nu-complete ci revisions" [] {
     let bookmarks = (^jj bookmark list --all-remotes --template 'name ++ if(remote, "@" ++ remote) ++ "\n"' | complete)
     if $bookmarks.exit_code != 0 { return [] }
@@ -115,10 +123,27 @@ export extern "ci land" [
     --attempts: int # How many times to start over when main moves (default 5)
 ]
 
-# Check Impact trailers on the commits between two revisions
+# Check the declared impact of the revisions between two revisions
 export extern "ci impact check" [
     base: string@"nu-complete ci revisions" # Base revision
     head: string@"nu-complete ci revisions" # Head revision
+]
+
+# Declare a revision's impact in the ci log
+export extern "ci impact set" [
+    impact: string@"nu-complete ci impacts" # refactor, behavior, or breaking
+    ...steps: string # The manual steps a breaking change needs, in order
+    --revision(-r): string@"nu-complete ci revisions" # The revisions to declare (default @)
+]
+
+# Show each revision's declared impact
+export extern "ci impact show" [
+    revset?: string@"nu-complete ci revisions" # Revisions to show (default the current topic)
+]
+
+# Declare undeclared revisions from their former Impact: trailers
+export extern "ci impact import" [
+    revset?: string@"nu-complete ci revisions" # Revisions to import (default the current topic)
 ]
 
 # Tag a release for behavior or breaking changes since the last release

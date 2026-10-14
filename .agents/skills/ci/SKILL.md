@@ -29,12 +29,14 @@ path to `main`.
   independently. `jj split` creates parent/child changes by default, while
   `jj split --parallel` creates siblings. Checkpoint before splitting, assign
   explicit descriptions, and verify the resulting graph with `jj log`.
-- End every description with an `Impact:` trailer: `refactor` when no NixOS
-  closure changes (refactors, docs, CI, tooling), `behavior` for a user-facing
-  change, or `breaking` for a user-facing change whose description body lists
-  the manual activation steps. Never combine a refactor with a user-facing
-  change in one topic; split the refactor into its own topic, or its own parent
-  layer when the change depends on it.
+- Declare every revision's impact with `ci impact set`, not in its
+  description: `refactor` when no NixOS closure changes (refactors, docs, CI,
+  tooling), `behavior` for a user-facing change, or `breaking STEP...` for a
+  user-facing change, listing each manual activation step as an argument.
+  Declare each revision of a stack (`-r REV`), and declare again to change
+  one. Never combine a refactor with a user-facing change in one topic; split
+  the refactor into its own topic, or its own parent layer when the change
+  depends on it.
 
 ## JJ MCP integration
 
@@ -88,7 +90,8 @@ Use the narrowest workflow that matches the request:
 | Capture a review version | `ci review snapshot <label>` | Records the exact base and series tip for a later interdiff. |
 | Compare review versions | `ci interdiff <old> <new>` | Runs a commit-by-commit `git range-diff` between named snapshots. |
 | Review a series as stacked Tangled pull requests | `ci dispatch --stack` | Pushes each revision as `stack/<series>/<change-id>`; then choose `Submit as stacked PRs` in Tangled. Review only; `ci land` still delivers. |
-| Check a commit range's impact | `ci impact check <base> <head>` | Git and Nix only; for a refactor it proves every host closure matches the merge base. `ci land` runs the same proof. |
+| Declare a revision's impact | `ci impact set <class> [<step>...] [-r <rev>]` | Records a `ci.impact.set` event in the machine's ci log, keyed by change ID, so it survives rebases. `breaking` requires at least one step; the others take none. `ci impact show [<revset>]` lists declarations; `ci impact import` reads former `Impact:` trailers of undeclared revisions. |
+| Check a commit range's impact | `ci impact check <base> <head>` | Reads the declarations from this machine's ci log; for a refactor it proves every host closure matches the merge base. `ci land` runs the same proof. |
 | Show the release in the current revision | `ci version` | Read-only. Releases are CalVer tags (`YYYY.MM.DD.N`) that `ci land` cuts for behavior and breaking revisions; `ci release` only catches up after a failed tag push. |
 
 ## Safety rules

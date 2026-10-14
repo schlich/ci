@@ -92,14 +92,16 @@ def otlp-log-request [event: string, body: string, attributes: record, severity:
 }
 
 # Append the log record `event` to the ci log and export it. A record that
-# cannot be written never fails the run.
-def log-event [event: string, body: string, attributes: record, --severity: string = "INFO"] {
+# cannot be written fails the run only when it is `--required`, as a record
+# other commands read back is.
+def log-event [event: string, body: string, attributes: record, --severity: string = "INFO", --required] {
     let request = (otlp-log-request $event $body $attributes $severity (date now | into int))
     try {
         let path = (ci-log-path)
         mkdir ($path | path dirname)
         $"($request | to json --raw)\n" | save --append $path
     } catch {|err|
+        if $required { error make { msg: $"could not write the ci log: ($err.msg)" } }
         print --stderr $"ci: could not write the ci log: ($err.msg)"
     }
     let base = ($env.OTEL_EXPORTER_OTLP_ENDPOINT? | default "" | str trim --right --char "/")
@@ -114,12 +116,16 @@ def log-event [event: string, body: string, attributes: record, --severity: stri
 }
 
 # The ci log's records, oldest first, as { time, event, severity, body,
-# attributes }. A line another writer is still appending is skipped.
-def read-ci-log [] {
+# attributes }. A line another writer is still appending is skipped. With
+# `--event`, only lines naming that event are decoded at all, which keeps a
+# reader of one kind of record fast however long the log grows.
+def read-ci-log [--event: string] {
     let path = (ci-log-path)
     if not ($path | path exists) { return [] }
+    let needle = if $event == null { "" } else { $"\"eventName\":\"($event)\"" }
     open --raw $path
     | lines
+    | where {|line| $line | str contains $needle }
     | each {|line| try { $line | from json } catch { null } }
     | each {|request| $request.resourceLogs? | default [] | each {|resource| $resource.scopeLogs? | default [] | each {|scope| $scope.logRecords? | default [] } } }
     | flatten | flatten | flatten
@@ -282,7 +288,9 @@ const TRUNK_KEY = 'revset-aliases."trunk()"'
 # GitHub mirrors main, and its Actions can gate a landing in the spindle's
 # place with `ci land --clearance github`. Its rules accept only fast-forwards.
 const GITHUB_REMOTE = "origin"
-const GITHUB_REQUIRED_CHECKS = ["impact classification" "nix flake checks"]
+# Impact declarations live in this machine's ci log, which GitHub cannot read,
+# so `ci land` classifies the topic itself and GitHub only builds it.
+const GITHUB_REQUIRED_CHECKS = ["nix flake checks"]
 const TANGLED_INDEX = "https://api.tangled.org"
 const TANGLED_WEB = "https://tangled.org"
 const IDENTITY_RESOLVER = "https://slingshot.microcosm.blue"
@@ -1339,17 +1347,73 @@ def revset-change-ids [revset: string] {
     $result.stdout | lines | where {|line| $line | str trim | is-not-empty }
 }
 
-# Every change declares its effect on the built machines with an `Impact:`
-# trailer in its JJ description, ordered from least to most disruptive:
+# Every change declares its effect on the built machines with `ci impact set`,
+# which records a `ci.impact.set` event in the ci log keyed by the full change
+# ID. Change IDs survive rebases, so a declaration follows its change to
+# trunk, and the latest one for a change wins. The description stays prose.
+# Classes, from least to most disruptive:
 #   refactor  every NixOS closure is unchanged (refactors, docs, CI, tooling)
 #   behavior  user-facing change; landing it cuts a CalVer release
-#   breaking  user-facing change whose description body lists manual steps
+#   breaking  user-facing change that lists the manual steps it needs
 const IMPACTS = ["refactor" "behavior" "breaking"]
+const IMPACT_EVENT = "ci.impact.set"
+
+# Why `impact` with manual `steps` is not a valid declaration, or null.
+def impact-problem [impact: string, steps: list] {
+    if $impact not-in $IMPACTS {
+        return $"Declare the impact as one of ($IMPACTS | str join ', ') with `ci impact set`."
+    }
+    if ($steps | any {|step| ($step | describe) != "string" or ($step | str trim | is-empty) }) {
+        return "Every manual step must be non-empty text."
+    }
+    if $impact == "breaking" and ($steps | is-empty) {
+        return "A breaking change must list the manual steps it needs: `ci impact set breaking STEP...`."
+    }
+    if $impact != "breaking" and ($steps | is-not-empty) {
+        return $"Only a breaking change lists manual steps; declare it breaking or drop the steps."
+    }
+    null
+}
+
+# The latest declaration for each change in `records` (from read-ci-log), as
+# { CHANGE_ID: { impact, steps, time } }.
+def impact-declarations [records: list] {
+    $records
+    | where event == $IMPACT_EVENT
+    | reduce --fold {} {|record, declarations|
+        let change = ($record.attributes."ci.change_id"? | default "")
+        if ($change | is-empty) { return $declarations }
+        $declarations | upsert $change {
+            impact: ($record.attributes."ci.impact"? | default "")
+            steps: ($record.attributes."ci.impact.steps"? | default [])
+            time: $record.time
+        }
+    }
+}
+
+# `revisions` with each one's declared `impact` ("" when undeclared; not null,
+# which `each` would drop) and `steps`.
+def with-impacts [revisions: list] {
+    let declarations = (impact-declarations (read-ci-log --event $IMPACT_EVENT))
+    $revisions | each {|revision|
+        let declaration = ($declarations | get --optional $revision.change_id)
+        $revision
+        | insert impact ($declaration.impact? | default "")
+        | insert steps ($declaration.steps? | default [])
+    }
+}
+
+# The combined impact of the revisions in `revset`, or null when it has none.
+def revset-impact [revset: string] {
+    combine-impacts (with-impacts (revisions-in $revset) | each {|revision| $revision.impact }) | get impact
+}
+
+# Impact used to be an `Impact:` trailer in the description. `ci impact
+# import` reads one into a declaration; nothing else looks at descriptions.
 const IMPACT_TRAILER = '^(?i)impact:\s*(?P<value>\S+)\s*$'
 
 # The last `Impact:` trailer value in a description, lowercased, or "" when
-# there is none. Not null: `each` drops null results, which would hide an
-# unclassified revision from `combine-impacts`.
+# there is none.
 def parse-impact [description: string] {
     let values = ($description | lines | parse --regex $IMPACT_TRAILER | get value | str lowercase)
     if ($values | is-empty) { "" } else { $values | last }
@@ -1375,7 +1439,7 @@ def combine-impacts [impacts: list] {
     }
     let invalid = ($impacts | where {|impact| $impact not-in $IMPACTS })
     if ($invalid | is-not-empty) {
-        return { impact: null problem: $"Every revision needs an `Impact: ($IMPACTS | str join '|')` trailer." }
+        return { impact: null problem: $"Every revision needs a declared impact: `ci impact set ($IMPACTS | str join '|') -r REV`." }
     }
     let user_facing = ($impacts | where {|impact| $impact != "refactor" })
     if ($user_facing | is-empty) {
@@ -1407,8 +1471,11 @@ def layer-revisions [base: string] {
     revisions-in $"($base)..@"
 }
 
+# Revisions in `revset`, oldest first, as { change_id, short, commit_id,
+# description }.
 def revisions-in [revset: string] {
-    let result = (^jj log -r $revset --no-graph -T 'change_id.short() ++ "\t" ++ description.escape_json() ++ "\n"' | complete)
+    let template = 'change_id ++ "\t" ++ change_id.short() ++ "\t" ++ commit_id ++ "\t" ++ description.escape_json() ++ "\n"'
+    let result = (local-complete { ^jj log -r $revset --no-graph -T $template })
     if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
     $result.stdout
     | lines
@@ -1416,24 +1483,48 @@ def revisions-in [revset: string] {
     | reverse
     | each {|line|
         let fields = ($line | split row "\t")
-        { change_id: ($fields | first) description: ($fields | skip 1 | str join "\t" | from json) }
+        {
+            change_id: ($fields | first)
+            short: ($fields | get 1)
+            commit_id: ($fields | get 2)
+            description: ($fields | skip 3 | str join "\t" | from json)
+        }
     }
 }
 
+# The combined impact of `revisions`, failing when any lacks a valid
+# declaration or the topic mixes refactors with user-facing changes.
 def require-impact [revisions: list] {
-    let missing = ($revisions | where {|revision| (parse-impact $revision.description) not-in $IMPACTS })
-    for revision in $missing {
-        print --stderr $"($revision.change_id): missing or invalid Impact trailer; add one with `jj describe -r ($revision.change_id)`."
+    let revisions = (with-impacts $revisions)
+    for revision in ($revisions | where impact not-in $IMPACTS) {
+        print --stderr $"($revision.short): no impact declared; run `ci impact set ($IMPACTS | str join '|') -r ($revision.short)`."
     }
-    let result = (combine-impacts ($revisions | each {|revision| parse-impact $revision.description }))
+    let result = (combine-impacts ($revisions | each {|revision| $revision.impact }))
     if $result.problem != null { error make { msg: $result.problem } }
-    let unexplained = ($revisions | where {|revision|
-        (parse-impact $revision.description) == "breaking" and (description-body $revision.description | is-empty)
-    })
-    if ($unexplained | is-not-empty) {
-        error make { msg: $"Describe the manual steps in the body of every breaking revision: ($unexplained | get change_id | str join ', ')." }
-    }
+    let problems = ($revisions | each {|revision|
+        let problem = (impact-problem $revision.impact $revision.steps)
+        if $problem == null { null } else { $"($revision.short): ($problem)" }
+    } | compact)
+    if ($problems | is-not-empty) { error make { msg: ($problems | str join "\n") } }
     $result.impact
+}
+
+# Record `impact` and `steps` for each revision in `revisions`. The log write
+# must succeed: a declaration that was not recorded would silently vanish.
+def declare-impact [revisions: list, impact: string, steps: list] {
+    let problem = (impact-problem $impact $steps)
+    if $problem != null { error make { msg: $problem } }
+    for revision in $revisions {
+        log-event $IMPACT_EVENT $"($revision.short) is ($impact)" {
+            "ci.change_id": $revision.change_id
+            "ci.impact": $impact
+            "ci.impact.steps": $steps
+            "vcs.ref.head.revision": $revision.commit_id
+        } --required
+        let title = ($revision.description | lines | get --optional 0 | default "(no description)")
+        print $"($revision.short) ($title): ($impact)"
+        for step in $steps { print $"  - ($step)" }
+    }
 }
 
 # Host name to toplevel derivation for every NixOS configuration in a flake.
@@ -1719,7 +1810,7 @@ def plan-topics [published: list] {
                 | lines | into int | math min)
             files: (git-command "listing topic files" { ^jj diff --name-only --from $fork --to $commit } | lines)
             current: (contains-main $commit)
-            impact: (combine-impacts (revisions-in $"($fork)..($commit)" | each {|revision| parse-impact $revision.description }) | get impact)
+            impact: (revset-impact $"($fork)..($commit)")
         }
     }
 }
@@ -1998,7 +2089,7 @@ def probe-state [probe: closure] {
 # inflight is everything on a running machine. Tools keep plain VCS words.
 def main [] {
     print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
-    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact check`, `ci release`, `ci version`."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`."
 }
 
 # The control tower: a live terminal view of every workspace's topic, each
@@ -2212,7 +2303,7 @@ def preview-topics [names: list<string>, all: bool] {
         $topic
         | insert revset $revset
         | insert title (revision-field $revset 'description.first_line()')
-        | insert impact (combine-impacts (revisions-in $"($base)..($revset)" | each {|revision| parse-impact $revision.description }) | get impact)
+        | insert impact (revset-impact $"($base)..($revset)")
     })
     if ($names | is-not-empty) {
         let missing = ($names | where {|name| $name not-in ($topics | get name) })
@@ -2647,44 +2738,89 @@ def require-closure-neutral [base: string, head: string] {
     print "Every NixOS closure matches the base."
 }
 
-# Classify `base..head` from its commit trailers and, for a refactor, prove
-# that every NixOS closure matches the merge base. Uses Git and Nix only, so it
-# runs without a JJ workspace; `ci land` runs the same proof itself.
+# Classify the revisions in `base..head` from their declarations and, for a
+# refactor, prove that every NixOS closure matches the merge base. The
+# declarations are in this machine's ci log, so it runs where the topic was
+# declared; `ci land` runs the same proof itself.
 def "main impact check" [base: string, head: string] {
-    let log = (git-command "reading the topic commits" {
-        ^git log --no-merges --format=%h%x1f%B%x1e $"($base)..($head)"
-    })
-    let revisions = ($log | split row "\u{1e}" | str trim | where {|entry| $entry | is-not-empty } | each {|entry|
-        let fields = ($entry | split row "\u{1f}")
-        { change_id: ($fields | first) description: ($fields | skip 1 | str join "\u{1f}") }
-    })
-    let impact = (require-impact $revisions)
+    let impact = (require-impact (revisions-in $"($base)..($head)"))
     print $"Impact: ($impact)"
     if $impact != "refactor" { return }
-    require-closure-neutral (git-command "finding the merge base" { ^git merge-base $base $head }) $head
+    let merge_base = (revision-id $"heads\(::\(($base)) & ::\(($head)))")
+    require-closure-neutral $merge_base (revision-id $head)
+}
+
+# Declare the impact of `--revision` (default the working-copy change; a
+# revset declares every revision in it): `refactor`, `behavior`, or
+# `breaking` followed by each manual step activating it needs. Declaring
+# again replaces the earlier declaration.
+def "main impact set" [
+    impact: string # refactor, behavior, or breaking
+    ...steps: string # The manual steps a breaking change needs, in order
+    --revision (-r): string = "@" # The revisions to declare
+] {
+    let revisions = (revisions-in $revision)
+    if ($revisions | is-empty) { error make { msg: $"($revision) names no revisions." } }
+    declare-impact $revisions $impact $steps
+}
+
+# The declared impact of each revision in `revset` (default the current topic).
+def "main impact show" [revset?: string] {
+    let revset = ($revset | default $"(trunk-revset)..@")
+    with-impacts (revisions-in $revset) | each {|revision|
+        {
+            change: $revision.short
+            title: ($revision.description | lines | get --optional 0 | default "")
+            impact: (if ($revision.impact | is-empty) { null } else { $revision.impact })
+            steps: $revision.steps
+        }
+    }
+}
+
+# Declare each undeclared revision in `revset` (default the current topic)
+# from the `Impact:` trailer its description carried before impact moved to
+# the ci log. A breaking revision's description body becomes its one manual
+# step. Revisions without a valid trailer are listed, not guessed.
+def "main impact import" [revset?: string] {
+    let revset = ($revset | default $"(trunk-revset)..@")
+    for revision in (with-impacts (revisions-in $revset) | where impact not-in $IMPACTS) {
+        let impact = (parse-impact $revision.description)
+        let body = (description-body $revision.description)
+        let steps = if $impact == "breaking" and ($body | is-not-empty) { [$body] } else { [] }
+        if (impact-problem $impact $steps) != null {
+            print --stderr $"($revision.short): no usable Impact trailer; run `ci impact set` for it."
+            continue
+        }
+        declare-impact [$revision] $impact $steps
+    }
 }
 
 const RELEASE_TAG_GLOB = "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].*"
 
 # Tag a CalVer release on every user-facing revision in `range`, oldest first,
 # and push each tag to the trunk remote. The tag names the release; the
-# revision description, with its Impact trailer, is its notes.
+# revision description and its declared manual steps are its notes, printed
+# and recorded in the ci log as `ci.release`.
 def cut-releases [range: string, dry_run: bool] {
     let tags = (git-command "listing release tags" {
         ^jj tag list -T 'name ++ "\n"' $"glob:'($RELEASE_TAG_GLOB)'"
     } | lines | uniq)
     let revisions = (git-command "listing unreleased revisions" {
-        ^jj log -r $range --reversed --no-graph -T 'commit_id ++ "\t" ++ committer.timestamp().utc().format("%Y.%m.%d") ++ "\t" ++ description.escape_json() ++ "\n"'
+        ^jj log -r $range --reversed --no-graph -T 'commit_id ++ "\t" ++ change_id ++ "\t" ++ committer.timestamp().utc().format("%Y.%m.%d") ++ "\t" ++ description.escape_json() ++ "\n"'
     } | lines | where {|line| $line | is-not-empty } | each {|line|
         let fields = ($line | split row "\t")
-        { commit: ($fields | first) date: ($fields | get 1) description: ($fields | skip 2 | str join "\t" | from json) }
-    })
+        {
+            commit: ($fields | first)
+            change_id: ($fields | get 1)
+            date: ($fields | get 2)
+            description: ($fields | skip 3 | str join "\t" | from json)
+        }
+    } | with-impacts $in)
     mut known = $tags
     for revision in $revisions {
-        let impact = (parse-impact $revision.description)
-        if $impact not-in ["behavior" "breaking"] { continue }
+        if $revision.impact not-in ["behavior" "breaking"] { continue }
         let version = (next-version $revision.date $known)
-        let title = $"($version): ($revision.description | lines | first)"
+        let title = $"($version): ($revision.description | lines | get --optional 0 | default '')"
         if $dry_run {
             print $"would release ($title) at ($revision.commit | str substring 0..11)"
         } else {
@@ -2692,6 +2828,14 @@ def cut-releases [range: string, dry_run: bool] {
             let remote = (trunk-remote)
             run-remote $"pushing ($version) to ($remote)" { ^jj git push --remote $remote --tag $version } | ignore
             print $"released ($title)"
+            for step in $revision.steps { print $"  manual step: ($step)" }
+            log-event "ci.release" $title {
+                "ci.release.version": $version
+                "ci.change_id": $revision.change_id
+                "ci.impact": $revision.impact
+                "ci.impact.steps": $revision.steps
+                "vcs.ref.head.revision": $revision.commit
+            }
             report-status done $"Released ($title)" --id $"release/($version)"
         }
         $known = ($known | append $version)

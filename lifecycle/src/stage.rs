@@ -163,7 +163,8 @@ impl Observation {
             Stage::Landed => "run `ci park` to confirm delivery and free the workspace".into(),
             Stage::Idle => "edit files to start the topic, or `ci park` if it was delivered".into(),
             Stage::Editing if !self.described => {
-                "describe the change with an `Impact:` trailer, then `ci preflight`".into()
+                "describe the change, declare its impact with `ci impact set CLASS`, then `ci preflight`"
+                    .into()
             }
             Stage::Editing => "run `ci preflight`, then `ci dispatch`".into(),
             Stage::Validated => "run `ci dispatch`".into(),
