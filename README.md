@@ -179,7 +179,10 @@ that is not on Tangled skips the pull request link.
 
 `ci land` is the only way a change reaches `main`. It dispatches the topic,
 which rebases it onto `main@tangled`; for a declared refactor, it proves that
-every NixOS closure matches that base. It then passes that exact commit
+every NixOS closure matches that base. The proof compares the head with the
+commit it forks from, found once the proof holds the local checks lock, so a
+topic that lands while it waits is never counted as this one's change. It then
+passes that exact commit
 through the landing clearance, fast-forwards `main` to it, and tags any release.
 `main` therefore holds only commits that were tested as they are, and history
 stays linear without squashing. Other workspaces land into the same trunk, so

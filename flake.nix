@@ -107,8 +107,12 @@
           in
           pkgs.runCommand "ci-properties-check"
             {
-              # util-linux provides the flock(1) that the local checks lock uses.
+              # util-linux provides the flock(1) that the local checks lock uses;
+              # the closure proof's test runs in a JJ repository it exports
+              # with git.
               nativeBuildInputs = [
+                pkgs.git
+                pkgs.jujutsu
                 pkgs.nushell
                 pkgs.util-linux
               ];

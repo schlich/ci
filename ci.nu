@@ -2607,9 +2607,11 @@ def land-published [published: record, timeout: duration, gate: string] {
     let trunk = (trunk)
     let remote = $trunk.remote
     let main = $trunk.bookmark
-    let base = (revision-id "trunk()")
+    # Other workspaces share this repository, so trunk() may already have
+    # moved past the commit the head was rebased onto.
+    let base = (fork-point "trunk()" $published.head)
     if $published.impact == "refactor" {
-        phase closures "Proving every NixOS closure unchanged" { require-closure-neutral $base $published.head }
+        phase closures "Proving every NixOS closure unchanged" { require-closure-neutral "trunk()" $published.head }
     }
     if $gate == "github" { push-bookmark $GITHUB_REMOTE $published.branch }
     print $"Waiting for ($checker.name) to pass ($published.head | str substring 0..11)."
@@ -2784,13 +2786,24 @@ def with-commit-trees [revisions: record, body: closure] {
     $outcome.value
 }
 
-# Prove every NixOS closure at `head` matches `base`, or fail naming the hosts
-# that changed. Evaluating every host twice is heavy, so the proof holds the
-# local checks lock.
-def require-closure-neutral [base: string, head: string] {
+# The commit `head` forks from `onto`: the newest commit both contain. It
+# stays put when `onto` moves on, so trunk advancing after a rebase never
+# changes what a topic is compared against.
+def fork-point [onto: string, head: string] {
+    revision-id $"heads\(::\(($onto)) & ::\(($head)))"
+}
+
+# Prove every NixOS closure at `head` matches the commit it forks from `onto`,
+# or fail naming the hosts that changed. Evaluating every host twice is heavy,
+# so the proof holds the local checks lock, and finds that commit only once it
+# has the lock: while it waits another session may land, and work that landed
+# meanwhile is not the topic's (2026-10-16). `fingerprint` stands in for
+# closure-fingerprint in tests.
+def require-closure-neutral [onto: string, head: string, --fingerprint: closure] {
+    let fingerprint = ($fingerprint | default {|flake| closure-fingerprint $flake })
     let differences = (with-local-checks-lock $head {
-        with-commit-trees { base: $base head: $head } {|trees|
-            closure-differences (closure-fingerprint $"path:($trees.base)") (closure-fingerprint $"path:($trees.head)")
+        with-commit-trees { base: (fork-point $onto $head) head: $head } {|trees|
+            closure-differences (do $fingerprint $"path:($trees.base)") (do $fingerprint $"path:($trees.head)")
         }
     })
     if ($differences | is-not-empty) {
@@ -2807,8 +2820,7 @@ def "main impact check" [base: string, head: string] {
     let impact = (require-impact (revisions-in $"($base)..($head)"))
     print $"Impact: ($impact)"
     if $impact != "refactor" { return }
-    let merge_base = (revision-id $"heads\(::\(($base)) & ::\(($head)))")
-    require-closure-neutral $merge_base (revision-id $head)
+    require-closure-neutral $base (revision-id $head)
 }
 
 # Declare the impact of `--revision` (default the working-copy change; a

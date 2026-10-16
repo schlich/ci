@@ -894,6 +894,56 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
 }
 print "ok local checks lock"
 
+# Trunk advancing while a refactor's closure proof waits for the local checks
+# lock (2026-10-16): another session landed a closure change meanwhile, and the
+# proof blamed it on the topic. The proof compares the head with the commit it
+# forks from, so only the topic's own change can fail it. A fake fingerprint
+# reads each tree's hosts.json in place of evaluating NixOS closures.
+
+let proof_repo = (mktemp --directory --tmpdir ci-proof-XXXXXX)
+let proof_config = (mktemp --tmpdir ci-proof-jj-XXXXXX.toml)
+'user.name = "ci"
+user.email = "ci@example.invalid"
+revset-aliases."trunk()" = "latest(present(main) | root())"
+' | save --force $proof_config
+def proof-commit [message: string] {
+    ^jj commit --quiet -m $message
+    revision-id "@-"
+}
+with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $proof_config } {
+    cd $proof_repo
+    ^jj git init --quiet
+    '{"asus": "a"}' | save --force hosts.json
+    let base = (proof-commit "base")
+    ^jj bookmark create --quiet main -r $base
+    '{"asus": "b"}' | save --force hosts.json
+    let landed = (proof-commit "another topic changes asus")
+    ^jj new --quiet $base
+    "readme" | save --force README
+    let refactor = (proof-commit "refactor")
+    ^jj new --quiet $base
+    '{"asus": "c"}' | save --force hosts.json
+    let behavior = (proof-commit "behavior")
+    let fingerprint = {|flake| open ($flake | str replace --regex '^path:' '' | path join "hosts.json") }
+
+    let lock = (local-checks-lock-path)
+    mkdir ($lock | path dirname)
+    { topic: "landing" pid: $nu.pid start: (process-start $nu.pid) unit: null } | to json --raw | save --force $lock
+    job spawn {
+        sleep 1sec
+        ^jj --repository $proof_repo bookmark set --quiet main -r $landed
+        rm $lock
+    } | ignore
+    require-closure-neutral "trunk()" $refactor --fingerprint $fingerprint
+    assert equal (revision-id "trunk()") $landed "trunk did not advance during the wait"
+    assert (not ($lock | path exists)) "the proof kept the lock"
+
+    let failed = (try { require-closure-neutral "trunk()" $behavior --fingerprint $fingerprint; null } catch {|err| $err.msg })
+    assert ($failed != null and ($failed | str contains "these host closures changed: asus")) $"a closure change passed as a refactor: ($failed)"
+}
+rm --recursive --force $proof_repo $proof_config
+print "ok closure proof while trunk advances"
+
 # The topic lock (2026-10-07): a second `ci` moving a topic that a live one is
 # already moving fails at once instead of waiting, and the lock goes with the
 # work however it ends.
