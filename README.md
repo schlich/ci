@@ -29,6 +29,48 @@ source for completions, the guard, and `jw`, and `lib.skills.ci` the skill.
 Every repository runs the `ci.nu` its lock file pins; `nix flake update ci`
 moves to a newer one.
 
+## Stately dispatch and landing
+
+Single-topic `ci dispatch`, `ci dispatch --land`, and `ci land` use the
+Stately agent in `agent/machine.mjs`. It names the work that used to live in
+the landing retry loop: publishing, checking landability, queueing,
+refreshing trunk, republishing, proving, clearing, and advancing. Progress
+reports expose the current state through the existing OSC 7501 and ci log
+channels. Dispatch ends in `dispatched`; only an explicitly requested landing
+enters the landing states. Stacked review and train landing keep their
+separate orchestration.
+
+The agent is deterministic and needs no model, provider SDK, or credentials.
+Nushell executes the existing policy operations under the same topic lock
+and landing queue. Clearance must name the published head before advancing;
+only a lost landing race retries, up to `--attempts`. Conflicts, failed
+checks, and other command errors stop. Rewritten heads are redispatched and
+cleared again. No activation is part of this flow.
+
+The npm lockfile pins the alpha agent and its exact XState peer. The Nix
+package fetches those tarballs by their lockfile integrity hashes, without
+an install script or network access at runtime. This published agent version
+predates the guide's step helpers, so the host uses XState's pure transition
+API with a `setupAgent` machine. JSON snapshots move between host steps
+inside one locked run. They are not durable checkpoints: after interruption,
+rerun the command to observe repository and remote state afresh rather than
+replay a remote effect whose outcome may be unknown.
+
+For development, install the pinned dependencies in `agent/`, then point both
+overrides at this checkout when exercising the workflow from another repo:
+
+```nu
+$env.CI_SCRIPT = '/path/to/ci/ci.nu'
+$env.CI_AGENT_SCRIPT = '/path/to/ci/agent/cli.mjs'
+```
+
+`checks.x86_64-linux.ci-agent` covers dispatch-only termination, queue and
+clearance ordering, stale-head rejection, rewriting and reproving, bounded
+races, and terminal failures. It uses no repository or remote mutations.
+The existing TLA+ and Rust lifecycle model continue to define protocol
+safety; this command machine refines their Publish, Queue, GatePasses, and
+Land operations.
+
 ## Protocol
 
 `JjCi.tla` is a bounded TLA+ state-machine model of topic rebase, conflict

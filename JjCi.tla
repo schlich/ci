@@ -26,6 +26,12 @@ EXTENDS Naturals, FiniteSets, TLC
 (* retries. A train (`ci land --train`) lands several topics in one        *)
 (* fast-forward from the front of the same queue; this model follows one   *)
 (* topic and leaves trains out.                                           *)
+(* agent/machine.mjs refines this protocol into the single-topic command  *)
+(* states. Its Nushell host executes Publish via publish-topic, Queue via *)
+(* with-landing-queue, GatePasses via wait-for-pipeline, and Land via       *)
+(* advance-main. Only a failed Land lease retries; each rewritten head    *)
+(* goes through Publish and GatePasses again. These guards remain in the  *)
+(* effect implementations as well as in the agent.                        *)
 (***************************************************************************)
 
 CONSTANTS Heads, MainHeads

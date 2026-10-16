@@ -22,6 +22,12 @@
 //! rebasing there. `tests/spec.rs` checks every transition of the bounded
 //! model against the TLA+ actions, every invariant against the reachable
 //! states, and every action property against the transitions.
+//!
+//! `agent/machine.mjs` refines this protocol into dispatch/landing command
+//! states. Its host maps publishing to Publish, queueing to Queue, clearing
+//! to GatePasses, and advancing to Land. Refreshing/republishing invalidates
+//! clearance on a rewritten head; bounded retries apply only to a lost
+//! landing lease. This lifecycle remains the shared protocol classifier.
 
 pub mod stage;
 

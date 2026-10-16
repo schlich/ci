@@ -39,6 +39,7 @@
       ci = import ./ci-package.nix { inherit pkgs osc7501-nu; };
       lifecycle = pkgs.callPackage ./lifecycle/package.nix { };
       tower = pkgs.callPackage ./tower/package.nix { };
+      agent = pkgs.callPackage ./agent/package.nix { inherit pkgs; };
       source =
         files:
         lib.fileset.toSource {
@@ -51,6 +52,7 @@
         default = ci;
         inherit ci;
         ci-tower = tower;
+        ci-agent = agent;
         jj-ci-lifecycle = lifecycle;
         context-status = import ./context-status.nix { inherit pkgs; };
         ci-mcp = pkgs.callPackage ./mcp-package.nix { inherit ci; };
@@ -79,6 +81,7 @@
         ci = pkgs.runCommand "ci-package-check" { } ''
           test -x ${ci}/bin/ci
           test -x ${ci}/bin/ci-tower
+          test -x ${ci}/bin/ci-agent
           touch "$out"
         '';
         # TLC explores every state of the bounded model and checks its
@@ -92,6 +95,13 @@
         # Its tests check the state machine against every action and
         # invariant of the same bounded model.
         ci-lifecycle = lifecycle;
+        ci-agent = pkgs.runCommand "ci-agent-check" { } ''
+          cp ${./agent/machine.test.mjs} machine.test.mjs
+          cp ${./agent/machine.mjs} machine.mjs
+          ln -s ${agent}/lib/ci-agent/node_modules node_modules
+          ${pkgs.nodejs}/bin/node --test machine.test.mjs
+          touch "$out"
+        '';
         # Its unit tests run as the package builds.
         ci-tower = tower;
         ci-properties =

@@ -8,6 +8,7 @@ pkgs.symlinkJoin {
   paths = [
     (pkgs.writeNuScriptBin "ci" (builtins.readFile ./ci-launch.nu))
     (pkgs.callPackage ./tower/package.nix { })
+    (pkgs.callPackage ./agent/package.nix { inherit pkgs; })
   ];
   nativeBuildInputs = [ pkgs.makeWrapper ];
   meta.mainProgram = "ci";

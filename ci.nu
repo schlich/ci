@@ -3228,22 +3228,6 @@ def advance-main [head: string, base: string, label: string] {
     true
 }
 
-# Land a published topic that holds the front of the landing queue: the gate
-# must pass the exact head, and main then fast-forwards to that commit, so
-# main only ever holds tested trees. Returns false when main moved anyway.
-def land-published [published: record, timeout: duration, gate: string] {
-    let checker = (landing-gate $gate)
-    # Other workspaces share this repository, so trunk() may already have
-    # moved past the commit the head was rebased onto.
-    let base = (fork-point "trunk()" $published.head)
-    if $gate == "github" { push-bookmark $GITHUB_REMOTE $published.branch }
-    print $"Waiting for ($checker.name) to pass ($published.head | str substring 0..11)."
-    wait-for-pipeline $checker $published.head $timeout
-    if not (advance-main $published.head $base $published.branch) { return false }
-    print $"Landed ($published.branch) on main. `ci park` frees the workspace."
-    true
-}
-
 # Fail now on what would otherwise fail only after clearance: a stacked topic
 # cannot land before its parent, and a declared refactor must leave every
 # closure unchanged. A refactor once proved at `proven` is not proved again
@@ -3266,29 +3250,101 @@ def require-landable [published: record, proven?: string] {
 # can, such as another machine or a push by hand, and `attempts` bounds how
 # many times that may send it back to rebase and take clearance again. A
 # rebase conflict or failed clearance still stops it.
-def land-queued [published: record, timeout: duration, gate: string, attempts: int] {
-    if $attempts < 1 { error make { msg: "--attempts must be at least 1." } }
-    require-landable $published
-    with-landing-queue (lock-topic $published.head) {
-        mut current = $published
-        for attempt in 1..$attempts {
-            fetch-trunk
-            if not (contains-main $current.head) {
-                let moved = "main moved while this landing waited; rebasing onto it."
+# Stately owns the next legal operation and the retry bound. Snapshots stay
+# inside this locked command: restarting an interrupted command re-observes
+# the repository rather than replaying a possibly completed remote effect.
+# CI_AGENT_SCRIPT selects the topic's machine when developing with CI_SCRIPT.
+def topic-agent-step [state?: record, event?: record, --land, --attempts: int = 5] {
+    let request = if $state == null {
+        { input: { land: $land attempts: $attempts } }
+    } else { { snapshot: $state.snapshot event: $event } }
+    let response = (do {
+        if ($env.CI_AGENT_SCRIPT? | is-not-empty) {
+            $request | to json --raw | ^node $env.CI_AGENT_SCRIPT
+        } else {
+            $request | to json --raw | ^ci-agent
+        }
+    } | complete)
+    if $response.exit_code != 0 {
+        error make { msg: $"CI agent refused the transition: ($response.stderr | str trim)" }
+    }
+    $response.stdout | from json
+}
+
+# Execute only the effect named by the machine. Existing operations retain
+# ownership checks, checkpoints, exact-head clearance, and lease-protected
+# fast-forwards. No failure is automatically retried or conflict resolved.
+def drive-topic-agent [state: record, published: record, timeout: duration, gate: string] {
+    mut step = $state
+    mut current = $published
+    mut base = ""
+    while not $step.done {
+        report-status working $"CI agent: ($step.state)" --id agent
+        let active = $step
+        if $active.state == "queueing" {
+            let queued = $current
+            with-landing-queue (lock-topic $queued.head) {
+                drive-topic-agent (topic-agent-step $active { type: QUEUED }) $queued $timeout $gate
+            }
+            return
+        }
+        let event = try { match $active.state {
+            "checking" => {
+                require-landable $current
+                { type: LANDABLE }
+            }
+            "refreshing" => {
+                fetch-trunk
+                { type: REFRESHED fresh: (contains-main $current.head) }
+            }
+            "republishing" => {
+                let moved = $"main moved; rebasing and redispatching \(attempt ($active.context.attempt) of ($active.context.limit))."
                 print $moved
                 report-status working $moved --id land
-                let proven = $current.head
                 $current = (publish-topic)
-                require-landable $current $proven
+                { type: PUBLISHED head: $current.head }
             }
-            if (land-published $current $timeout $gate) { return }
-            if $attempt == $attempts { break }
-            let retry = $"main moved outside the landing queue while clearance ran; rebasing onto the new main and trying again \(attempt ($attempt + 1) of ($attempts))."
-            print $retry
-            report-status working $retry --id land
+            "proving" => {
+                require-landable $current $active.context.proven
+                { type: LANDABLE }
+            }
+            "clearing" => {
+                let checker = (landing-gate $gate)
+                $base = (fork-point "trunk()" $current.head)
+                if $gate == "github" { push-bookmark $GITHUB_REMOTE $current.branch }
+                print $"Waiting for ($checker.name) to pass ($current.head | str substring 0..11)."
+                wait-for-pipeline $checker $current.head $timeout
+                { type: CLEARED head: $current.head }
+            }
+            "advancing" => {
+                { type: ADVANCED head: $current.head landed: (advance-main $current.head $base $current.branch) }
+            }
+            _ => { error make { msg: $"Unknown CI agent state: ($active.state)" } }
+        } } catch {|err|
+            let blocked = (topic-agent-step $active { type: FAILED message: $err.msg })
+            report-status blocked $"CI agent: ($blocked.context.error)" --id agent
+            error make { msg: $err.msg }
         }
-        error make { msg: $"main moved outside the landing queue during each of ($attempts) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+        $step = (topic-agent-step $step $event)
     }
+    if $step.state == "exhausted" {
+        error make { msg: $"main moved outside the landing queue during each of ($step.context.limit) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+    }
+    if $step.state != "landed" { error make { msg: $"CI agent stopped in ($step.state)." } }
+    report-status done "CI agent: landed" --id agent
+    print $"Landed ($current.branch) on main. `ci park` frees the workspace."
+}
+
+def publish-with-agent [land: bool, attempts: int] {
+    # Reject invalid run input before publishing anything.
+    let initial = (topic-agent-step --land=$land --attempts $attempts)
+    report-status working "CI agent: publishing" --id agent
+    let published = try { publish-topic } catch {|err|
+        let blocked = (topic-agent-step $initial { type: FAILED message: $err.msg })
+        report-status blocked $"CI agent: ($blocked.context.error)" --id agent
+        error make { msg: $err.msg }
+    }
+    { published: $published state: (topic-agent-step $initial { type: PUBLISHED head: $published.head }) }
 }
 
 # Why a topic in `ci sequence` cannot join a train, or null when it can.
@@ -3556,7 +3612,8 @@ def "main dispatch" [
     }
     report-run (if $land { "Landed the topic" } else { "Dispatched the topic" }) {
         with-topic-lock (current-topic-id) {
-            let published = (publish-topic)
+            let run = (publish-with-agent $land $attempts)
+            let published = $run.published
             # The push is the dispatch; reading Tangled only adds review links,
             # so a trunk remote elsewhere, or an unreachable index, skips them.
             let repo = (try { tangled-repo } catch { null })
@@ -3576,8 +3633,9 @@ def "main dispatch" [
             }
             print $"Impact: ($published.impact)"
             if $land {
-                land-queued $published $timeout $clearance $attempts
+                drive-topic-agent $run.state $published $timeout $clearance
             } else {
+                report-status done "CI agent: dispatched" --id agent
                 print "Dispatched this topic in place. Further edits update the same JJ series and branch; `ci land` delivers it."
             }
         }
@@ -3614,8 +3672,8 @@ def "main land" [
     }
     report-run "Landed the topic" {
         with-topic-lock (current-topic-id) {
-            let published = (publish-topic)
-            land-queued $published $timeout $cleared_by $attempts
+            let run = (publish-with-agent true $attempts)
+            drive-topic-agent $run.state $run.published $timeout $cleared_by
         }
     }
 }

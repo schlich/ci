@@ -1,0 +1,12 @@
+{
+  "name": "ci-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test machine.test.mjs" },
+  "dependencies": {
+    "@statelyai/agent": "2.0.0-alpha.28",
+    "xstate": "6.0.0-alpha.64",
+    "zod": "4.6.7"
+  }
+}
