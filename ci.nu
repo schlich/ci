@@ -1212,9 +1212,13 @@ def unit-exit-code [recorded: string, systemd_run: int] {
     if $code > 128 { -1 * ($code - 128) } else { $code }
 }
 
-# The memory one evaluation worker may take, in MiB, before nix-eval-jobs
-# restarts it and retries the check alone.
-const EVAL_MEMORY_MIB = 6144
+# nix-eval-jobs' memory budget per worker, in MiB. The budget is workers times
+# this; past it, nix-eval-jobs kills the largest worker mid-check and retries
+# that check alone, failing it if it exceeds the budget even then. Measured
+# on the dotfiles checks (2026-10-16), 4 GiB evaluates them in 224 s against
+# 178 s at 6 GiB, and keeps 2 GiB more of a 16 GiB machine free; their
+# largest check needs about 3.1 GiB alone, and 2 GiB fails three of them.
+const EVAL_MEMORY_MIB = 4096
 
 # The status record for one check: a child of `clearance`, its name cut to
 # the characters and length an OSC 7501 id segment allows.
@@ -1340,10 +1344,10 @@ def checks-killed [error: string, progress: record] {
 # spindle workflow runs, streaming the build log. Outputs already in the local
 # store or a binary cache are skipped, so a topic that leaves the system
 # closures alone builds only the cheap checks. Evaluation uses one worker:
-# den-host-evaluation alone needs about 6 GiB once a flake input brings its
-# own nixpkgs, the per-worker size is only a soft limit checked between
-# attributes, and two workers beside open agent sessions exhausted this
-# 16 GiB machine and froze it (2026-10-07).
+# two workers beside open agent sessions exhausted this 16 GiB machine and
+# froze it (2026-10-07), and two workers sharing the same budget were slower
+# than one (2026-10-16), since one worker reuses the evaluation the checks
+# share, such as nixpkgs and each host's configuration.
 #
 # The checks run in their own transient user service with a memory cap, so
 # when memory runs out the kernel or systemd-oomd stops that unit rather than

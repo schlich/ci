@@ -820,7 +820,7 @@ for-all "unclaim leaves no claim without an active owner" {|key|
 # a failed check on record, was killed. An evaluation over the memory budget
 # counts as killed too. Only a check that failed by itself reads as failed.
 
-const MEMORY_BUDGET_ERROR = "evaluation exceeded the memory budget of 6144 MiB (workers * max-memory-size) even when run alone"
+const MEMORY_BUDGET_ERROR = "evaluation exceeded the memory budget of 4096 MiB (workers * max-memory-size) even when run alone"
 const CHECK_OUTCOME_CASES = [
     { exit: 0 results: null expected: { status: "success" } }
     # The 2026-10-07 landing: the checks unit's main process died from a
@@ -902,7 +902,7 @@ let landing = (fold-progress ["cached" "desktop-primary" "den-host-evaluation" "
 assert equal $landing.reports [
     { state: "working" id: "clearance/desktop-primary" msg: "building desktop-primary" }
     { state: "working" id: "clearance" msg: "building desktop-primary (2/4)" }
-    { state: "error" id: "clearance/den-host-evaluation" msg: "den-host-evaluation exceeded 6 GiB" }
+    { state: "error" id: "clearance/den-host-evaluation" msg: "den-host-evaluation exceeded 4 GiB" }
     { state: "done" id: "clearance/desktop-primary" msg: "desktop-primary built in 1min 2sec" }
     { state: "working" id: "clearance" msg: "evaluated 3/4 checks" }
 ]
@@ -929,7 +929,7 @@ assert equal (checks-killed "likely out of memory, signal 9" $cut.progress) {
         { state: "error" id: "clearance/b" msg: "b was killed while evaluating" }
     ]
 }
-assert equal (checks-killed "likely out of memory, exit status 1" $landing.progress).outcome.error "likely out of memory, exit status 1 (den-host-evaluation exceeded 6 GiB)"
+assert equal (checks-killed "likely out of memory, exit status 1" $landing.progress).outcome.error "likely out of memory, exit status 1 (den-host-evaluation exceeded 4 GiB)"
 assert equal (check-status-id "nixos/a very long check name that keeps going") "clearance/nixos-a-very-long-check-name-tha"
 print "ok local clearance progress"
 
