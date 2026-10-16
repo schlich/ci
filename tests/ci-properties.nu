@@ -900,6 +900,9 @@ print "ok local checks lock"
 # forks from, so only the topic's own change can fail it. A fake fingerprint
 # reads each tree's hosts.json in place of evaluating NixOS closures.
 
+let default_fingerprint = (select-fingerprint null {|flake| $"fingerprinted:($flake)" })
+assert equal (do $default_fingerprint "path:example") "fingerprinted:path:example" "the missing fingerprint default was evaluated before receiving its flake"
+
 let proof_repo = (mktemp --directory --tmpdir ci-proof-XXXXXX)
 let proof_config = (mktemp --tmpdir ci-proof-jj-XXXXXX.toml)
 'user.name = "ci"

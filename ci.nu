@@ -2911,8 +2911,12 @@ def fork-point [onto: string, head: string] {
 # has the lock: while it waits another session may land, and work that landed
 # meanwhile is not the topic's (2026-10-16). `fingerprint` stands in for
 # closure-fingerprint in tests.
+def select-fingerprint [fingerprint: any, fallback: closure] {
+    if $fingerprint == null { $fallback } else { $fingerprint }
+}
+
 def require-closure-neutral [onto: string, head: string, --fingerprint: closure] {
-    let fingerprint = ($fingerprint | default {|flake| closure-fingerprint $flake })
+    let fingerprint = (select-fingerprint $fingerprint {|flake| closure-fingerprint $flake })
     let differences = (with-local-checks-lock $head {
         with-commit-trees { base: (fork-point $onto $head) head: $head } {|trees|
             closure-differences (do $fingerprint $"path:($trees.base)") (do $fingerprint $"path:($trees.head)")
