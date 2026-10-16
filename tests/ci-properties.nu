@@ -645,21 +645,24 @@ for-all "a Prek failure names every failed hook" {|key|
 }
 
 # Preflight skips Prek only where Prek would find no configuration: none in
-# the work tree or any directory above it.
-for-all "prek-config finds the nearest configuration at or above the work tree" {|key|
+# the directory or above it within the work tree. A configuration in a
+# directory enclosing the work tree, such as the repository holding a Claude
+# Code worktree, does not count (2026-10-16).
+for-all "prek-config finds the nearest configuration within the work tree" {|key|
     let base = (mktemp --directory --tmpdir "ci-prek-config.XXXXXX" | path expand)
-    let dirs = [$base ($base | path join "repo") ($base | path join "repo" "sub")]
+    let root = ($base | path join "repo")
+    let dirs = [$base $root ($root | path join "sub")]
     for dir in $dirs { mkdir $dir }
     let placed = ($dirs | enumerate | each {|dir|
         let name = (pick-from $"($key)/name/($dir.index)" ([null] ++ $PREK_CONFIGS))
         if $name != null { "" | save ($dir.item | path join $name) }
-        if $name == null { null } else { $dir.item | path join $name }
+        { depth: $dir.index path: (if $name == null { null } else { $dir.item | path join $name }) }
     })
-    let expected = ($placed | reverse | compact | get --optional 0)
-    let found = (prek-config ($base | path join "repo" "sub"))
+    # The first directory encloses the work tree, so its configuration never counts.
+    let expected = ($placed | where depth > 0 and path != null | sort-by depth --reverse | get --optional 0.path)
+    let found = (prek-config ($root | path join "sub") $root)
     rm --recursive $base
-    # A configuration above the temporary directory would also count.
-    if $expected != null { assert equal $found $expected }
+    assert equal $found $expected
 }
 
 for-all "unclaim leaves no claim without an active owner" {|key|

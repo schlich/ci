@@ -2043,18 +2043,23 @@ def prek-verdict [runs: list] {
 }
 
 # The files Prek reads its hooks from, in the directory it runs in or the
-# nearest parent that has one.
+# nearest parent that has one, up to the work tree's root.
 const PREK_CONFIGS = ["prek.toml" ".pre-commit-config.yaml" ".pre-commit-config.yml"]
 
-# The Prek configuration that applies in `dir`, or null when there is none.
-def prek-config [dir: path] {
+# The Prek configuration that applies in `dir` of the work tree `root`, or null
+# when there is none. Prek never looks above the work tree, so neither does
+# this: a workspace nested in another repository, as in a Claude Code worktree,
+# would otherwise find that repository's configuration and run a Prek that
+# finds none (2026-10-16).
+def prek-config [dir: path, root: path] {
+    let top = ($root | path expand)
     mut current = ($dir | path expand)
     loop {
         let dir = $current
         let found = ($PREK_CONFIGS | each {|name| $dir | path join $name } | where {|path| $path | path exists })
         if ($found | is-not-empty) { return ($found | first) }
         let parent = ($current | path dirname)
-        if $parent == $current { return null }
+        if $current == $top or $parent == $current { return null }
         $current = $parent
     }
 }
@@ -2076,7 +2081,7 @@ def validate-change [] {
     let context = (git-context)
     # A repository without hooks has nothing for Prek to run, and Prek
     # fails there instead of passing; its flake checks still gate landing.
-    if (prek-config $context.GIT_WORK_TREE) == null {
+    if (prek-config $context.GIT_WORK_TREE $context.GIT_WORK_TREE) == null {
         print $"No Prek configuration in ($context.GIT_WORK_TREE); no hooks to run."
         record-validation
         return
