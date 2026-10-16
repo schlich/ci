@@ -1,10 +1,13 @@
 # The ci MCP server: the same `ci` launcher as the shell, as agent tools. It
 # announces jobs on cross.stream through `xs` when one is given or on PATH;
-# without it, watchers fall back to polling. The ruff check lints the source;
+# without it, watchers fall back to polling. Jobs run in transient systemd
+# user units, which resolve their command on the host, so the job shell is a
+# store path rather than a sandbox's `sh`. The ruff check lints the source;
 # writers.writePython3 would run flake8 instead.
 {
   lib,
   runCommand,
+  runtimeShell,
   makeWrapper,
   python3,
   git,
@@ -29,5 +32,6 @@ runCommand "ci-mcp"
           ++ lib.optional (xs != null) xs
         )
       } \
-      --set CI_MCP_CI ${lib.getExe ci}
+      --set CI_MCP_CI ${lib.getExe ci} \
+      --set CI_MCP_SH ${runtimeShell}
   ''

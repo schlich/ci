@@ -918,6 +918,14 @@ changes, and built systems from half-finished topics (2026-10-07).
   creates `.jj-workspaces/NAME` beside the default checkout as before. The
   ci MCP server runs each job in the directory its `workspace` names, not at
   that directory's JJ root, so its `start` nests the same way.
+- The app stops a session's whole cgroup scope when the session restarts,
+  which twice killed one `ci land` waiting for the local checks lock
+  (2026-10-16). The ci MCP server therefore starts each job in its own
+  transient systemd user unit, `ci-mcp-JOB`, passing its environment
+  explicitly, so a job keeps running and `job` reports its real outcome after
+  a restart. `meta.json` names the unit; `cancel` stops the unit's processes.
+  Without a user manager, or with `CI_MCP_DETACH=0`, a job runs as a
+  detached process as before.
 - Every other topic command (`new`, `sync`, `rebase`, `preflight`,
   `dispatch`, `land`, `park`, `cancel`) refuses to run from such a worktree,
   since it would act on the shared default checkout's working copy.

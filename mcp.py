@@ -5,6 +5,11 @@ Every tool starts `ci` as a background job in a JJ workspace, waits up to
 keeps running; poll it with `job`. Jobs record their log and exit code
 under $XDG_STATE_HOME/ci-mcp/jobs, so a result survives the server.
 
+Each job runs in its own transient systemd user unit, so it also survives
+the client: the Claude desktop app stops its whole cgroup scope when a
+session restarts, which killed `ci land` jobs mid-clearance (2026-10-16).
+Without a user manager the job falls back to a detached process.
+
 The server starts the `ci` launcher (ci-launch.nu), which runs the ci.nu the
 package bundles, or, inside the ci repository, a topic's own ci.nu when the
 topic edits it and main@tangled's otherwise.
@@ -18,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import threading
@@ -30,6 +36,13 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 CI = os.environ.get("CI_MCP_CI", "ci")
+# The shell that wraps each job; CI_MCP_SH names a store path, since a unit's
+# command resolves on the host, where a sandbox's /usr/bin does not exist.
+SH = os.environ.get("CI_MCP_SH", "sh")
+# CI_MCP_DETACH=0 keeps jobs in the server's own cgroup, as before units.
+DETACH = os.environ.get("CI_MCP_DETACH", "1") != "0"
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ENV_VALUE = re.compile(r"[^\x00-\x08\x0b-\x1f\x7f]*")
 STATE = (
     Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     / "ci-mcp"
@@ -130,7 +143,10 @@ def job_state(path: Path, meta: dict) -> tuple[str, int | None]:
     if exit_file.exists():
         code = int(exit_file.read_text().strip() or "1")
         return ("succeeded" if code == 0 else "failed"), code
-    if alive(meta["pid"]):
+    # A unit's process is visible here too: the desktop sandbox shares the
+    # host's PID namespace. A unit that ended before its PID was read wrote
+    # its exit file first, so a missing PID means only an unknown one.
+    if meta.get("pid") and alive(meta["pid"]):
         return "running", None
     return "lost", None
 
@@ -171,6 +187,65 @@ def running_mutation(root: Path) -> str | None:
     return None
 
 
+def host_program(program: str) -> str:
+    # systemd resolves a unit's command on the host, outside any sandbox the
+    # server runs in, so name the program by the store path it resolves to.
+    found = shutil.which(program)
+    return os.path.realpath(found) if found else program
+
+
+def start_unit(unit: str, command: list[str], cwd: Path, env: dict) -> int | None:
+    """Start `command` in a transient user unit and return its PID (0 when
+    it ended before the PID was read), or None when no unit could start."""
+    systemd_run = shutil.which("systemd-run")
+    if not DETACH or systemd_run is None:
+        return None
+    # The user manager's environment is not the server's: pass it whole,
+    # PATH, HOME, SSH_AUTH_SOCK, and XDG_* included, minus what systemd
+    # refuses as an assignment.
+    setenv = [
+        f"--setenv={name}={value}"
+        for name, value in env.items()
+        if ENV_NAME.fullmatch(name) and ENV_VALUE.fullmatch(value)
+    ]
+    try:
+        started = subprocess.run(
+            [
+                systemd_run,
+                "--user",
+                "--quiet",
+                "--collect",
+                f"--unit={unit}",
+                f"--description=ci MCP job {unit.removeprefix('ci-mcp-')}",
+                "--property=Type=exec",
+                f"--working-directory={cwd}",
+                *setenv,
+                *command,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if started.returncode != 0:
+        return None
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", "--property=MainPID", "--value", unit],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return int(shown.stdout.strip() or "0")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0
+
+
 def start_job(args: list[str], workspace: str | None, mutating: bool) -> str:
     root = workspace_root(workspace)
     # Run where the caller asked, not at the JJ root: from a Claude Code
@@ -197,46 +272,53 @@ def start_job(args: list[str], workspace: str | None, mutating: bool) -> str:
     # ci reports its phases there as OSC 7501 records, which
     # `watch-job <log_path>` follows beside the log.
     env["PST_FILE"] = str(path / "log.status.jsonl")
-    # The shell records the exit code even if this server exits first; the
-    # job runs in its own session so a client disconnect does not kill it.
-    proc = subprocess.Popen(
-        [
-            "sh",
-            "-c",
-            # It then announces the exit code on cross.stream, so watch-job
-            # wakes the moment the job ends.
-            (
-                '"$@" >"$CI_MCP_LOG" 2>&1; code=$?; echo $code >"$CI_MCP_EXIT"; '
-                'xs append "$CI_MCP_XS" "$CI_MCP_DONE" '
-                '--meta "{\\"outcome\\": {\\"exit_code\\": $code}}" >/dev/null 2>&1'
-            ),
-            "ci-mcp-job",
-            CI,
-            *args,
-        ],
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    _procs[job_id] = proc
-    threading.Thread(target=proc.wait, daemon=True).start()
+    # The shell records the exit code even if this server exits first, then
+    # announces it on cross.stream, so watch-job wakes the moment the job ends.
+    command = [
+        host_program(SH),
+        "-c",
+        (
+            '"$@" >"$CI_MCP_LOG" 2>&1; code=$?; echo $code >"$CI_MCP_EXIT"; '
+            'xs append "$CI_MCP_XS" "$CI_MCP_DONE" '
+            '--meta "{\\"outcome\\": {\\"exit_code\\": $code}}" >/dev/null 2>&1'
+        ),
+        "ci-mcp-job",
+        host_program(CI),
+        *args,
+    ]
+    (path / "log").touch()
+    unit = f"ci-mcp-{job_id}"
+    pid = start_unit(unit, command, cwd, env)
+    if pid is None:
+        unit = None
+        # Its own session spares the job a client disconnect, but not a
+        # client that stops its whole cgroup.
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _procs[job_id] = proc
+        threading.Thread(target=proc.wait, daemon=True).start()
+        pid = proc.pid
     (path / "meta.json").write_text(
         json.dumps(
             {
                 "args": args,
                 "workspace": str(root),
                 "mutating": mutating,
-                "pid": proc.pid,
+                "pid": pid,
+                "unit": unit,
                 "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "topic": topic,
             }
         )
     )
-    (path / "log").touch()
     job_event(
         f"{topic}.start",
-        {"log": str(path / "log"), "cwd": str(cwd), "pid": proc.pid},
+        {"log": str(path / "log"), "cwd": str(cwd), "pid": pid, "unit": unit},
     )
     return job_id
 
@@ -693,12 +775,24 @@ def jobs(
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
 def cancel(job_id: str) -> dict:
-    """Stop a running job by sending SIGTERM to its process group. `ci`
-    checkpoints before history surgery; inspect the workspace afterwards."""
+    """Stop a running job by sending SIGTERM to every process in its unit
+    (its process group, for a job without one). `ci` checkpoints before
+    history surgery; inspect the workspace afterwards."""
     path = job_dir(job_id)
     meta = read_meta(path)
     if job_state(path, meta)[0] == "running":
-        os.killpg(meta["pid"], signal.SIGTERM)
+        stopped = meta.get("unit") and (
+            subprocess.run(
+                ["systemctl", "--user", "kill", "--signal=SIGTERM", meta["unit"]],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if not stopped:
+            os.killpg(meta["pid"], signal.SIGTERM)
         time.sleep(1)
     return render(job_id)
 
