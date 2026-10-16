@@ -160,6 +160,13 @@ export extern "ci release" [
 # Describe the current revision against release tags
 export extern "ci version" []
 
+# Send recorded dispatches and landings as OpenTelemetry traces
+export extern "ci trace export" [
+    --endpoint: string # OTLP/HTTP traces URL (default from OTEL_EXPORTER_OTLP_*)
+    --since: datetime # Only runs that started at or after this time
+    --dry-run # List the runs and their spans without sending anything
+]
+
 # Record that this host runs a release and how you tested it, and send it to homelab
 export extern "ci verify" [
     release?: string # CalVer release (default: the newest one this host runs)

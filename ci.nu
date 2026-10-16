@@ -13,7 +13,9 @@ def report-status [state: string, msg?: string, --id: string, --kind: string] {
     } catch {|err|
         print --stderr $"ci: could not report status: ($err.msg)"
     }
-    if $state != "clear" {
+    # A run's final clear only drops its records; a clear under an id ends a
+    # wait, which its trace times.
+    if $state != "clear" or $id != null {
         let severity = match $state { "error" => "ERROR" "blocked" => "WARN" _ => "INFO" }
         log-event "ci.status" ($text | default $state) { "ci.status.state": $state "ci.status.id": $id "ci.status.kind": $kind } --severity $severity
     }
@@ -118,14 +120,18 @@ def log-event [event: string, body: string, attributes: record, --severity: stri
 # The ci log's records, oldest first, as { time, event, severity, body,
 # attributes }. A line another writer is still appending is skipped. With
 # `--event`, only lines naming that event are decoded at all, which keeps a
-# reader of one kind of record fast however long the log grows.
-def read-ci-log [--event: string] {
+# reader of one kind of record fast however long the log grows. `--pid` keeps
+# only the records that process wrote, the same way.
+def read-ci-log [--event: string, --pid: int] {
     let path = (ci-log-path)
     if not ($path | path exists) { return [] }
-    let needle = if $event == null { "" } else { $"\"eventName\":\"($event)\"" }
+    let needles = ([
+        (if $event == null { null } else { $"\"eventName\":\"($event)\"" })
+        (if $pid == null { null } else { $"\"key\":\"process.pid\",\"value\":{\"intValue\":\"($pid)\"}" })
+    ] | compact)
     open --raw $path
     | lines
-    | where {|line| $line | str contains $needle }
+    | where {|line| $needles | all {|needle| $line | str contains $needle } }
     | each {|line| try { $line | from json } catch { null } }
     | each {|request| $request.resourceLogs? | default [] | each {|resource| $resource.scopeLogs? | default [] | each {|scope| $scope.logRecords? | default [] } } }
     | flatten | flatten | flatten
@@ -137,6 +143,367 @@ def read-ci-log [--event: string] {
             body: (from-otlp-value ($record.body? | default { stringValue: "" }))
             attributes: (from-otlp-attributes ($record.attributes? | default []))
         }
+    }
+}
+
+# Every dispatch and landing is also an OpenTelemetry trace, derived from the
+# status records it wrote to the ci log: a span for the run, one for each
+# landing attempt, one for each phase and check inside it, and one for each
+# wait on another topic's local checks. A phase that reports done without
+# having reported working, such as a release, becomes an event on its attempt.
+# When OTEL_EXPORTER_OTLP_TRACES_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT is
+# set, a run exports its trace as it ends, and `ci trace export` sends the
+# runs recorded before, from the ci log and the ci MCP job store. Ids derive
+# from the run's process and first record, so both give a run the same ids.
+# The trace ledger beside the ci log keeps either from sending a trace twice:
+# a store keyed by span id, as otel-desktop-viewer's is, drops a duplicate
+# together with whatever it was appending beside it.
+
+# A process's records further apart than this come from a later process that
+# reused its pid; no phase stays silent this long.
+const TRACE_RUN_GAP = 3hr
+
+def trace-ledger-path [] {
+    ci-log-path | path dirname | path join "traces.exported"
+}
+
+def otlp-traces-endpoint [] {
+    let base = ($env.OTEL_EXPORTER_OTLP_ENDPOINT? | default "" | str trim --right --char "/")
+    $env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT? | default (if ($base | is-empty) { "" } else { $"($base)/v1/traces" })
+}
+
+# This run's command line as `ci SUBCOMMAND ARGS...`, from the arguments the
+# launcher passed the ci.nu it runs, or null when they cannot be read.
+def this-command [] {
+    let argv = (try { ps --long | where pid == $nu.pid | get 0.command | split row " " } catch { [] })
+    let script = ($argv | enumerate | where {|arg| $arg.item | str ends-with "ci.nu" } | get --optional 0.index)
+    if $script == null { return null }
+    ["ci"] ++ ($argv | skip ($script + 1)) | str join " "
+}
+
+# The ci MCP job running this process, which its PST_FILE names.
+def this-mcp-job [] {
+    let file = ($env.PST_FILE? | default "")
+    let dir = ($file | path dirname)
+    if ($file | path basename) == "log.status.jsonl" and ($dir | path dirname | path basename) == "jobs" {
+        $dir | path basename
+    } else { null }
+}
+
+# The root span's name: `ci` and its subcommand, guessed from the phases when
+# a run recorded no command line.
+def run-name [run: record] {
+    if ($run.command? | is-not-empty) {
+        return ($run.command | split row " " | where {|word| $word | is-not-empty } | first 2 | str join " ")
+    }
+    let ids = ($run.records | get id)
+    if ("clearance" in $ids) or ("land" in $ids) { "ci land" } else if "push" in $ids { "ci dispatch" } else if "preflight" in $ids { "ci preflight" } else { "ci" }
+}
+
+# Close every phase still open in `open`, and `wait` if it is open, at `time`.
+def close-open-spans [open: record, wait: any, time: int, status: string, message: string] {
+    let phases = ($open | values | each {|span| $span | insert end $time | insert status $status | insert message $message })
+    let waits = if $wait == null { [] } else { [($wait | insert end $time | insert status $status | insert message $message)] }
+    $phases ++ $waits | each {|span| finish-span $span }
+}
+
+# A span in the shape `status-spans` returns, from an open one.
+def finish-span [span: record] {
+    {
+        path: $span.path
+        parent: $span.parent
+        name: $span.name
+        start: $span.start
+        end: $span.end
+        status: $span.status
+        message: $span.message
+        attributes: ($span.attributes? | default {} | merge (if ($span.waited? | is-empty) { {} } else { { "ci.wait.for": ($span.waited | uniq) } }))
+        events: ($span.events? | default [])
+    }
+}
+
+# The spans of one run from its status records, { time state id msg } with
+# time in Unix nanoseconds, as { path parent name start end status message
+# attributes events }. `path` names a span uniquely within the run, `parent`
+# is its parent's path (null for the run itself), and `status` is ok, error,
+# or unset.
+def status-spans [records: list, --name: string = "ci", --attributes: record = {}] {
+    let records = ($records
+        | each {|r| { time: $r.time state: ($r.state? | default "") id: ($r.id? | default "") msg: ($r.msg? | default "") } }
+        | sort-by time)
+    if ($records | is-empty) { return [] }
+    let start = ($records | first | get time)
+    let end = ($records | last | get time)
+    mut spans = []
+    mut open = {}
+    mut opened = 0
+    mut waits = 0
+    mut wait: any = null
+    mut attempt = { number: 1 start: $start events: [] }
+    mut outcome: any = null
+    for r in $records {
+        let attempt_path = $"attempt-($attempt.number)"
+        if $r.id == "land" and $r.state == "working" and ($r.msg | str contains "trying again") {
+            # Landing starts over: close this attempt and everything open in it.
+            $spans = ($spans ++ (close-open-spans $open $wait $r.time "unset" "still open when the landing started over"))
+            $spans = ($spans | append (finish-span {
+                path: $attempt_path parent: "run" name: $"attempt ($attempt.number)" start: $attempt.start end: $r.time
+                status: "unset" message: $r.msg events: $attempt.events
+                attributes: { "ci.attempt": $attempt.number "ci.attempt.retried": true }
+            }))
+            $open = {}
+            $wait = null
+            $attempt = { number: ($attempt.number + 1) start: $r.time events: [] }
+        } else if $r.id == "local-checks" {
+            if $r.state == "blocked" {
+                if $wait == null {
+                    # The wait belongs to the phase that opened last.
+                    let within = ($open | values | sort-by start | get --optional path | default [] | last 1 | get --optional 0 | default $attempt_path)
+                    $waits += 1
+                    $wait = { path: $"($attempt_path)/wait#($waits)" parent: $within name: "wait for local checks" start: $r.time waited: [$r.msg] attributes: { "ci.attempt": $attempt.number } }
+                } else {
+                    $wait = ($wait | update waited { append $r.msg })
+                }
+            } else if $r.state == "clear" and $wait != null {
+                $spans = ($spans | append (finish-span ($wait | insert end $r.time | insert status "ok" | insert message "")))
+                $wait = null
+            }
+        } else if $r.id == "" {
+            if $r.state in ["done" "error"] { $outcome = $r }
+        } else if $r.state == "working" {
+            if $r.id in $open {
+                $open = ($open | update $r.id { update attributes { upsert "ci.status.last_msg" $r.msg } })
+            } else {
+                let prefix = ($r.id | split row "/" | first)
+                let parent = if $prefix != $r.id and $prefix in $open { $open | get $prefix | get path } else { $attempt_path }
+                $opened += 1
+                $open = ($open | insert $r.id {
+                    path: $"($attempt_path)/($r.id)#($opened)" parent: $parent name: $r.id start: $r.time
+                    attributes: { "ci.status.id": $r.id "ci.status.msg": $r.msg "ci.attempt": $attempt.number }
+                })
+            }
+        } else if $r.state in ["done" "error" "failed"] and $r.id in $open {
+            let failed = $r.state != "done"
+            $spans = ($spans | append (finish-span ($open | get $r.id | insert end $r.time | insert status (if $failed { "error" } else { "ok" }) | insert message (if $failed { $r.msg } else { "" }))))
+            $open = ($open | reject $r.id)
+        } else if $r.state != "clear" {
+            $attempt = ($attempt | update events { append { time: $r.time name: $r.id attributes: { "ci.status.state": $r.state "ci.status.msg": $r.msg } } })
+        }
+    }
+    let status = if $outcome == null { "unset" } else if $outcome.state == "error" { "error" } else { "ok" }
+    let message = if $outcome == null { "the run recorded no outcome" } else if $status == "error" { $outcome.msg } else { "" }
+    $spans = ($spans ++ (close-open-spans $open $wait $end "error" "never reported done"))
+    $spans = ($spans | append (finish-span {
+        path: $"attempt-($attempt.number)" parent: "run" name: $"attempt ($attempt.number)" start: $attempt.start end: $end
+        status: $status message: $message events: $attempt.events attributes: { "ci.attempt": $attempt.number }
+    }))
+    [(finish-span {
+        path: "run" parent: null name: $name start: $start end: $end status: $status message: $message
+        attributes: ($attributes | merge { "ci.attempts": $attempt.number })
+    })] ++ $spans
+}
+
+# The OTLP/JSON ExportTraceServiceRequest for the spans of the run `key`
+# names. Ids are hex digests of the key and each span's path.
+def trace-request [key: string, spans: list] {
+    let trace = ($key | hash md5)
+    let span_id = {|path| $"($key)#($path)" | hash md5 | str substring 0..<16 }
+    {
+        resourceSpans: [{
+            resource: { attributes: (otlp-attributes { "service.name": "ci" "host.name": (sys host | get hostname) }) }
+            scopeSpans: [{
+                scope: { name: "ci" }
+                spans: ($spans | each {|span|
+                    let parent = if $span.parent == null { {} } else { { parentSpanId: (do $span_id $span.parent) } }
+                    {
+                        traceId: $trace
+                        spanId: (do $span_id $span.path)
+                        name: $span.name
+                        kind: 1
+                        startTimeUnixNano: ($span.start | into string)
+                        endTimeUnixNano: ($span.end | into string)
+                        attributes: (otlp-attributes $span.attributes)
+                        events: ($span.events | each {|event|
+                            { timeUnixNano: ($event.time | into string) name: $event.name attributes: (otlp-attributes $event.attributes) }
+                        })
+                        status: { code: (match $span.status { "ok" => 1 "error" => 2 _ => 0 }) message: $span.message }
+                    } | merge $parent
+                })
+            }]
+        }]
+    }
+}
+
+# The trace of a recorded run, { key name command workspace job records }.
+def run-trace [run: record] {
+    let attributes = {
+        "ci.command": ($run.command? | default null)
+        "ci.workspace": ($run.workspace? | default null)
+        "ci.job.id": ($run.job? | default null)
+        "process.pid": ($run.pid? | default null)
+        "ci.command.inferred": (if ($run.command? | is-empty) { true } else { null })
+    }
+    trace-request $run.key (status-spans $run.records --name (run-name $run) --attributes $attributes)
+}
+
+# The runs the ci log records, oldest first: each process's status records,
+# from the `ci.run` record that starts a dispatch or landing, and split where
+# the process falls silent for TRACE_RUN_GAP. With `--pid`, only that
+# process's runs.
+def logged-runs [--pid: int] {
+    let host = (sys host | get hostname)
+    (read-ci-log --event ci.status --pid $pid) ++ (read-ci-log --event ci.run --pid $pid)
+    | sort-by time
+    | group-by {|record| $record.attributes."process.pid"? | default 0 | into string }
+    | values
+    | each {|records|
+        mut runs = []
+        mut current = []
+        for record in $records {
+            let gap = if ($current | is-empty) { false } else { ($record.time - ($current | last | get time)) > ($TRACE_RUN_GAP | into int) }
+            if ($current | is-not-empty) and ($gap or $record.event == "ci.run") {
+                $runs = ($runs | append [$current])
+                $current = []
+            }
+            $current = ($current | append $record)
+        }
+        $runs | append [$current]
+    }
+    | flatten
+    | where {|records| $records | is-not-empty }
+    | each {|records|
+        let first = ($records | first)
+        let started = ($records | where event == "ci.run" | get --optional 0)
+        {
+            key: $"($host)/($first.attributes.'process.pid'?)/($first.time)"
+            pid: $first.attributes."process.pid"?
+            command: ($started.attributes?."ci.command"? | default null)
+            job: ($started.attributes?."ci.job.id"? | default null)
+            workspace: $first.attributes."process.working_directory"?
+            records: ($records | each {|record|
+                if $record.event == "ci.run" {
+                    { time: $record.time state: "start" id: "" msg: $record.body }
+                } else {
+                    { time: $record.time state: $record.attributes."ci.status.state"? id: ($record.attributes."ci.status.id"? | default "") msg: $record.body }
+                }
+            })
+        }
+    }
+    | sort-by {|run| $run.records | first | get time }
+}
+
+# The runs the ci MCP job store records: each job's OSC 7501 status file and
+# the command its meta.json names.
+def job-runs [] {
+    let state_dir = ($env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state"))
+    let jobs = ($state_dir | path join "ci-mcp" "jobs")
+    if not ($jobs | path exists) { return [] }
+    ls $jobs | where type == dir | get name | each {|dir|
+        let status_file = ($dir | path join "log.status.jsonl")
+        let meta_file = ($dir | path join "meta.json")
+        if not ($status_file | path exists) or not ($meta_file | path exists) { return null }
+        let meta = (try { open --raw $meta_file | from json } catch { null })
+        if $meta == null { return null }
+        let records = (open --raw $status_file
+            | lines
+            | each {|line| try { $line | from json } catch { null } }
+            | compact
+            | where {|r| ($r.time? | is-not-empty) }
+            | each {|r| { time: ($r.time | into datetime | into int) state: ($r.state? | default "") id: ($r.id? | default "") msg: ($r.msg? | default "") } }
+            | sort-by time)
+        if ($records | is-empty) { return null }
+        let args = ($meta.args? | default ($meta.command? | default "" | split row " " | skip 1))
+        {
+            key: $"ci-mcp/($dir | path basename)"
+            command: (["ci"] ++ $args | str join " ")
+            job: ($dir | path basename)
+            workspace: ($meta.workspace? | default null)
+            records: $records
+        }
+    } | compact
+}
+
+# Every recorded run once, oldest first. The ci log's runs take the command,
+# job id, and status records of the MCP job that ran them, matched by the time
+# of their first status report, which both stores record in the same call;
+# the job's records also hold the clears that ended each wait, which the ci
+# log kept only from 2026-10-16. MCP jobs the ci log does not cover keep
+# their own.
+def recorded-runs [] {
+    let second = {|time| $time // 1_000_000_000 }
+    let first_status = {|run| $run.records | where id != "" | get --optional 0.time }
+    let jobs = (job-runs | where {|job| (do $first_status $job) != null })
+    let by_second = ($jobs | reduce --fold {} {|job, index|
+        let bucket = (do $second (do $first_status $job) | into string)
+        $index | upsert $bucket ($index | get --optional $bucket | default [] | append $job)
+    })
+    let match = {|run|
+        let time = (do $first_status $run)
+        if $time == null { return null }
+        let bucket = (do $second $time)
+        [($bucket - 1) $bucket ($bucket + 1)]
+        | each {|b| $by_second | get --optional ($b | into string) | default [] }
+        | flatten
+        | where {|job| ((do $first_status $job) - $time | math abs) < 2_000_000_000 }
+        | get --optional 0
+    }
+    let logged = (logged-runs | each {|run|
+        let job = (do $match $run)
+        if $job == null { $run } else {
+            # The ci.run record, when there is one, still starts the run.
+            let start = ($run.records | where state == "start")
+            $run
+            | upsert command ($run.command | default $job.command)
+            | upsert job ($run.job | default $job.job)
+            | upsert records ($start ++ $job.records | sort-by time)
+            | insert matched $job.key
+        }
+    })
+    let matched = ($logged | get --optional matched | compact)
+    $logged | reject --optional matched | append ($jobs | where {|job| $job.key not-in $matched })
+    | sort-by {|run| $run.records | first | get time }
+}
+
+# Send each run's trace to `endpoint`, one request per trace, skipping the
+# traces the ledger lists and adding the ones sent. Returns a row per run.
+def export-traces [runs: list, endpoint: string] {
+    let ledger = (trace-ledger-path)
+    let sent = if ($ledger | path exists) { open --raw $ledger | lines | reduce --fold {} {|id, set| $set | upsert $id true } } else { {} }
+    mkdir ($ledger | path dirname)
+    $runs | each {|run|
+        let request = (run-trace $run)
+        let spans = $request.resourceSpans.0.scopeSpans.0.spans
+        let trace = $spans.0.traceId
+        let row = {
+            started: ($spans.0.startTimeUnixNano | into int | into datetime)
+            name: $spans.0.name
+            took: ((($spans.0.endTimeUnixNano | into int) - ($spans.0.startTimeUnixNano | into int)) | into duration | format duration sec)
+            spans: ($spans | length)
+            trace: $trace
+        }
+        if $trace in $sent { return ($row | insert sent "already") }
+        try {
+            http post --content-type application/json --max-time 5sec $endpoint $request | ignore
+        } catch {|err|
+            error make { msg: $"could not export trace ($trace) to ($endpoint): ($err.msg)" }
+        }
+        $"($trace)\n" | save --append $ledger
+        $row | insert sent "now"
+    }
+}
+
+# Export this process's run as a trace when an OTLP traces endpoint is set. A
+# trace that cannot be sent never fails the run; `ci trace export` sends it
+# later.
+def export-this-run [] {
+    let endpoint = (otlp-traces-endpoint)
+    if ($endpoint | is-empty) { return }
+    try {
+        let since = (ps --long | where pid == $nu.pid | get 0.start_time | into int)
+        let runs = (logged-runs --pid $nu.pid | where {|run| ($run.records | first | get time) >= $since })
+        export-traces ($runs | last 1) $endpoint | ignore
+    } catch {|err|
+        print --stderr $"ci: could not export this run's trace: ($err.msg)"
     }
 }
 
@@ -152,16 +519,21 @@ def phase [id: string, msg: string, body: closure] {
     $result
 }
 
-# Run a whole dispatch or landing: report done or error for the run, then
-# clear its records so terminals and watchers drop them.
+# Run a whole dispatch or landing: record its command line, report done or
+# error for the run, clear its records so terminals and watchers drop them,
+# and export its trace.
 def report-run [msg: string, body: closure] {
+    let command = (this-command)
+    log-event "ci.run" ($command | default $msg) { "ci.command": $command "ci.job.id": (this-mcp-job) }
     try { do $body } catch {|err|
         report-status error ($err.msg | lines | get --optional 0 | default $"($msg) failed")
         report-status clear
+        export-this-run
         $err.raw
     }
     report-status done $msg
     report-status clear
+    export-this-run
 }
 
 # JJ lists its operation heads as files that another JJ process may be
@@ -2377,7 +2749,7 @@ def probe-state [probe: closure] {
 # inflight is everything on a running machine. Tools keep plain VCS words.
 def main [] {
     print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
-    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`, `ci trace export`."
 }
 
 # The control tower: a live terminal view of every workspace's topic, each
@@ -3427,6 +3799,48 @@ def "main release" [--dry-run] {
 }
 
 # The newest CalVer release contained in the current revision.
+# Export, as OpenTelemetry traces, every run the ci log or the ci MCP job
+# store records that the trace ledger does not list yet: one trace per
+# dispatch or landing, with a span for each attempt, phase, check, and wait
+# on another topic's local checks. Runs export themselves as they end once an
+# endpoint is set; this sends the ones recorded before, or while the
+# collector was down.
+def "main trace export" [
+    --endpoint: string # OTLP/HTTP traces URL; default: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, or OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces
+    --since: datetime # Only runs that started at or after this time
+    --dry-run # List the runs and their spans without sending anything
+] {
+    # A run with no outcome that reported lately may still be going; sending
+    # it now would list it in the ledger before it finished.
+    let quiet_since = ((date now) - $TRACE_RUN_GAP | into int)
+    let runs = (recorded-runs
+        | where {|run| $run.records | any {|record| $record.state == "working" } }
+        | where {|run| $since == null or ($run.records | first | get time) >= ($since | into int) }
+        | where {|run| (
+            ($run.records | any {|record| $record.id == "" and $record.state in ["done" "error"] })
+            or ($run.records | last | get time) < $quiet_since
+        ) })
+    if $dry_run {
+        return ($runs | each {|run|
+            let spans = (status-spans $run.records --name (run-name $run))
+            {
+                started: ($spans.0.start | into datetime)
+                name: $spans.0.name
+                took: (($spans.0.end - $spans.0.start) | into duration | format duration sec)
+                attempts: ($spans | where name =~ '^attempt ' | length)
+                spans: ($spans | length)
+                status: $spans.0.status
+                job: ($run.job? | default null)
+            }
+        })
+    }
+    let target = ($endpoint | default (otlp-traces-endpoint))
+    if ($target | is-empty) {
+        error make { msg: "No traces endpoint: pass --endpoint, or set OTEL_EXPORTER_OTLP_ENDPOINT (e.g. http://127.0.0.1:4318)." }
+    }
+    export-traces $runs $target
+}
+
 def "main version" [] {
     let commit = (current-change "commit_id")
     run-command "describing the current revision" {

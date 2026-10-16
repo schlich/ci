@@ -250,6 +250,146 @@ for-all "log-event appends records that read-ci-log returns in order" {|key|
     rm $log
 }
 
+# Traces: a run's status records become a tree of spans.
+
+# A run's status records as ci writes them, shuffled: attempts that main
+# moving starts over, each a sequence of phases, some holding checks or a wait
+# on another topic's local checks, then an outcome or none for a lost run.
+# Returns the records and the spans they must give.
+def gen-status-run [key: string] {
+    mut time = 1_000_000_000_000
+    mut records = []
+    mut phases = []
+    mut waits = []
+    let attempts = (1 + (pick $"($key)/attempts" 3))
+    for a in 0..<$attempts {
+        if $a > 0 {
+            $time += 1 + (pick $"($key)/($a)/gap" 1000)
+            $records = ($records | append { time: $time state: "working" id: "land" msg: $"main moved while the gate ran; rebasing onto the new main and trying again \(attempt ($a + 1) of 5)." })
+        }
+        for p in 0..<(1 + (pick $"($key)/($a)/count" 4)) {
+            let k = $"($key)/($a)/($p)"
+            let id = (pick-from $"($k)/id" ["rebase" "preflight" "push" "closures" "clearance"])
+            $time += 1 + (pick $"($k)/before" 1000)
+            let start = $time
+            $records = ($records | append { time: $time state: "working" id: $id msg: $"Running ($id)" })
+            if (flag $"($k)/wait") {
+                $time += 1 + (pick $"($k)/wait/before" 100)
+                let blocked = $time
+                $records = ($records | append { time: $time state: "blocked" id: "local-checks" msg: "Waiting for local checks of a" })
+                if (flag $"($k)/wait/again") {
+                    $time += 1 + (pick $"($k)/wait/again/at" 100)
+                    $records = ($records | append { time: $time state: "blocked" id: "local-checks" msg: "Waiting for local checks of b" })
+                }
+                $time += 1 + (pick $"($k)/wait/for" 1000)
+                $records = ($records | append { time: $time state: "clear" id: "local-checks" msg: "" })
+                $waits = ($waits | append { start: $blocked end: $time phase: $id attempt: ($a + 1) })
+            }
+            if $id == "clearance" {
+                for c in 0..<(pick $"($k)/checks" 3) {
+                    $time += 1 + (pick $"($k)/check/($c)/before" 100)
+                    let check_start = $time
+                    $records = ($records | append { time: $time state: "working" id: $"clearance/check-($c)" msg: "building" })
+                    $time += 1 + (pick $"($k)/check/($c)/took" 100)
+                    $records = ($records | append { time: $time state: "done" id: $"clearance/check-($c)" msg: "built" })
+                    $phases = ($phases | append { id: $"clearance/check-($c)" start: $check_start end: $time status: "ok" attempt: ($a + 1) })
+                }
+            }
+            $time += 1 + (pick $"($k)/took" 1000)
+            let state = (pick-from $"($k)/state" ["done" "done" "error"])
+            $records = ($records | append { time: $time state: $state id: $id msg: $"($id) ($state)" })
+            $phases = ($phases | append { id: $id start: $start end: $time status: (if $state == "done" { "ok" } else { "error" }) attempt: ($a + 1) })
+        }
+    }
+    let outcome = (pick-from $"($key)/outcome" ["done" "error" "none"])
+    if $outcome != "none" {
+        $time += 1
+        $records = ($records | append { time: $time state: $outcome id: "" msg: "Landed the topic" })
+    }
+    {
+        records: (shuffle $"($key)/order" $records)
+        attempts: $attempts
+        phases: $phases
+        waits: $waits
+        status: (match $outcome { "done" => "ok" "error" => "error" _ => "unset" })
+    }
+}
+
+for-all "status-spans gives one run whose spans nest within their parents" {|key|
+    let run = (gen-status-run $key)
+    let spans = (status-spans $run.records --name "ci land")
+    let roots = ($spans | where parent == null)
+    assert equal ($roots | length) 1
+    assert equal $roots.0.name "ci land"
+    assert equal $roots.0.status $run.status
+    assert equal ($spans | get path | uniq | length) ($spans | length) "paths are unique"
+    let by_path = ($spans | reduce --fold {} {|span, index| $index | insert $span.path $span })
+    for span in ($spans | where parent != null) {
+        let parent = ($by_path | get --optional $span.parent)
+        assert ($parent != null) $"($span.path) has a parent"
+        assert ($span.start <= $span.end) $"($span.path) ends after it starts"
+        assert ($parent.start <= $span.start and $span.end <= $parent.end) $"($span.path) lies within ($span.parent)"
+    }
+}
+
+for-all "status-spans opens an attempt for each start over" {|key|
+    let run = (gen-status-run $key)
+    let attempts = (status-spans $run.records | where name =~ '^attempt ')
+    assert equal ($attempts | length) $run.attempts
+    assert equal ($attempts | where {|span| $span.attributes."ci.attempt.retried"? == true } | length) ($run.attempts - 1)
+}
+
+for-all "status-spans times each phase and wait by its own reports" {|key|
+    let run = (gen-status-run $key)
+    let spans = (status-spans $run.records)
+    for phase in $run.phases {
+        let found = ($spans | where name == $phase.id and start == $phase.start and end == $phase.end)
+        assert equal ($found | length) 1 $"($phase.id) at ($phase.start)"
+        assert equal $found.0.status $phase.status
+        assert equal $found.0.attributes."ci.attempt" $phase.attempt
+        if ($phase.id | str starts-with "clearance/") {
+            assert ($found.0.parent | str contains "/clearance#") "checks nest in their clearance"
+        }
+    }
+    for wait in $run.waits {
+        let found = ($spans | where name == "wait for local checks" and start == $wait.start and end == $wait.end)
+        assert equal ($found | length) 1 $"wait at ($wait.start)"
+        assert ($found.0.parent | str contains $"/($wait.phase)#") "a wait nests in the phase it held up"
+    }
+}
+
+for-all "trace-request gives stable hex ids whose parents resolve" {|key|
+    let run = (gen-status-run $key)
+    let spans = (status-spans $run.records)
+    let request = (trace-request $key $spans)
+    assert equal $request (trace-request $key $spans) "the same run gives the same request"
+    let sent = $request.resourceSpans.0.scopeSpans.0.spans
+    assert equal ($sent | length) ($spans | length)
+    assert ($sent | all {|span| $span.traceId =~ '^[0-9a-f]{32}$' and $span.spanId =~ '^[0-9a-f]{16}$' }) "ids are hex"
+    assert equal ($sent | get spanId | uniq | length) ($sent | length) "span ids are unique"
+    let ids = ($sent | get spanId)
+    assert ($sent | all {|span| ($span.parentSpanId? == null) or ($span.parentSpanId in $ids) }) "parents resolve"
+    assert ($sent | all {|span| $span.startTimeUnixNano =~ '^\d+$' and $span.endTimeUnixNano =~ '^\d+$' }) "times are integer strings"
+}
+
+for-all "report-run records a run that logged-runs reads back" {|key|
+    let log = (mktemp --tmpdir ci-log-XXXXXX)
+    # The run's OSC 7501 reports go to a file of its own, not a watcher's.
+    let pst = (mktemp --tmpdir ci-pst-XXXXXX)
+    let ids = (0..<(1 + (pick $"($key)/count" 3)) | each {|i| pick-from $"($key)/id/($i)" ["rebase" "preflight" "push"] })
+    with-env { CI_LOG: $log PST_FILE: $pst OTEL_EXPORTER_OTLP_ENDPOINT: "" OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "" OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "" } {
+        report-run "Landed the topic" {
+            for id in $ids { phase $id $"Running ($id)" {} | ignore }
+        }
+        let runs = (logged-runs --pid $nu.pid)
+        assert equal ($runs | length) 1
+        let spans = (status-spans $runs.0.records)
+        assert equal ($spans.0.status) "ok"
+        assert equal ($spans | where {|span| $span.name in $ids } | length) ($ids | length)
+    }
+    rm $log
+}
+
 # Impact classes: declarations, former trailers (for `ci impact import`), PR
 # classification, release numbering, and plan order.
 

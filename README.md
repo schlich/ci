@@ -526,6 +526,41 @@ set, `ci` also posts each record to that OTLP/HTTP endpoint (`/v1/logs` under
 the general one). A record that cannot be written or exported never fails the
 run.
 
+### Traces
+
+Every `ci dispatch` and `ci land` is also an OpenTelemetry trace, built from
+the status records it wrote to the ci log, so you can see where a landing's
+time went:
+
+```text
+ci land                          the run: command, workspace, MCP job, outcome
+├── attempt 1                    one per start over when main moved
+│   ├── rebase / preflight / push
+│   ├── closures                 the refactor closure proof
+│   │   └── wait for local checks    another topic held the checks lock
+│   └── clearance
+│       └── clearance/<check>    one per check that had to build
+└── attempt 2 …                  releases and mirroring are events on it
+```
+
+When `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set, a run exports its trace as it ends (`/v1/traces` under the general one).
+`ci trace export` sends the runs recorded before, or while the collector was
+down: every run in the ci log, and every job in the ci MCP server's job
+store, which reaches further back. `--dry-run` lists them instead, and
+`--since` limits them.
+
+```nu
+ci trace export --endpoint http://127.0.0.1:4318/v1/traces
+```
+
+Trace and span ids are digests of the run's process and first record, so a
+run exported live and again by `ci trace export` keeps them. `ci` lists each
+trace it sends in `traces.exported` beside the ci log and never sends one
+twice, because a store keyed by span id, as otel-desktop-viewer's is, drops a
+duplicate together with whatever arrived with it. A trace that cannot be sent
+never fails the run.
+
 ### Context status
 
 `context-status` summarizes the current workspace's topic: its stage in the
