@@ -563,7 +563,8 @@ Every JJ change declares what it does to the built machines with
 
 - `refactor`: every NixOS closure is unchanged, as for refactors, docs, CI,
   and repository tooling. `ci land` proves that each host's toplevel
-  derivation matches the base. No release.
+  derivation matches the base; a flake without `nixosConfigurations` has no
+  hosts, so the proof holds trivially. No release.
 - `behavior`: a user-facing change to a host. Landing it cuts a CalVer release.
 - `breaking`: a user-facing change that needs manual steps when activating.
   Each step is its own argument, and at least one is required.

@@ -1575,10 +1575,18 @@ def declare-impact [revisions: list, impact: string, steps: list] {
     }
 }
 
-# Host name to toplevel derivation for every NixOS configuration in a flake.
+# Host name to toplevel derivation for every NixOS configuration in a flake;
+# a flake without `nixosConfigurations` has no hosts. The flake is loaded
+# through its locked reference, since pure evaluation refuses an unlocked
+# `builtins.getFlake`, so a missing output stays distinct from a host that
+# fails to evaluate. The locked URL is percent-encoded and so holds no `${`,
+# which makes its JSON form a valid Nix string.
 def closure-fingerprint [flake: string] {
+    let locked = (git-command $"locking ($flake)" {
+        ^nix flake metadata --json --no-update-lock-file $flake
+    } | from json | get url)
     git-command $"evaluating the NixOS closures of ($flake)" {
-        ^nix eval --json --no-update-lock-file $"($flake)#nixosConfigurations" --apply 'configs: builtins.mapAttrs (_: c: builtins.unsafeDiscardStringContext c.config.system.build.toplevel.drvPath) configs'
+        ^nix eval --json --no-update-lock-file --apply 'flake: builtins.mapAttrs (_: c: builtins.unsafeDiscardStringContext c.config.system.build.toplevel.drvPath) (flake.nixosConfigurations or {})' --expr $"builtins.getFlake ($locked | to json)"
     } | from json
 }
 
