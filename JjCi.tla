@@ -23,7 +23,9 @@ EXTENDS Naturals, FiniteSets, TLC
 (* while a topic holds the front. A topic that rebases there keeps the    *)
 (* clearance it then takes. The model leaves out what moves trunk from     *)
 (* outside the queue, such as another machine, which `ci land --attempts`  *)
-(* retries.                                                               *)
+(* retries. A train (`ci land --train`) lands several topics in one        *)
+(* fast-forward from the front of the same queue; this model follows one   *)
+(* topic and leaves trains out.                                           *)
 (***************************************************************************)
 
 CONSTANTS Heads, MainHeads

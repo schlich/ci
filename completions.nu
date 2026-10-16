@@ -126,6 +126,7 @@ export extern "ci land" [
     --clearance: string@"nu-complete ci clearances" # What must pass the head (default local)
     --timeout: duration # How long to wait for the pipeline (default 2hr)
     --attempts: int # How many times to start over when something outside the landing queue moves main (default 5)
+    --train # Land every dispatched, conflict-free topic in one fast-forward, clearing the chain once
 ]
 
 # Check the declared impact of the revisions between two revisions

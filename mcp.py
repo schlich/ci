@@ -552,6 +552,14 @@ async def land(
         str, Field(description="Nushell duration to wait, e.g. 2hr.")
     ] = "2hr",
     attempts: Annotated[int, Field(ge=1, le=20)] = 5,
+    train: Annotated[
+        bool,
+        Field(
+            description="Land every dispatched, conflict-free topic in one "
+            "fast-forward (`--train`), clearing the chain once and bisecting "
+            "on failure. Only when the user asks to land them all."
+        ),
+    ] = False,
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
@@ -561,7 +569,10 @@ async def land(
     restarting one another. Only on an explicit user request to deliver the
     topic. Takes minutes to hours; poll the job."""
     args = ["land", "--clearance", clearance, "--timeout", timeout]
-    args += ["--attempts", str(attempts)]
+    if train:
+        args += ["--train"]
+    else:
+        args += ["--attempts", str(attempts)]
     return await run(args, workspace, wait_seconds, default_wait=20)
 
 

@@ -213,6 +213,32 @@ moved, it leaves `main` alone, rebases and redispatches the topic, and takes
 clearance again on the new head, up to `--attempts` times (default 5). A
 rebase conflict or failed clearance still stops it.
 
+`ci land --train` lands every dispatched topic it can in one fast-forward,
+for one clearance instead of one per topic. It runs from any workspace and
+waits in the same landing queue. From the front, it takes the topics `ci
+sequence` lists, in that order, and rebases each onto the one before it,
+forming one linear chain on `main`. A topic joins only as it was dispatched:
+its local bookmark is the one on the trunk remote, with no edits above it,
+it is not stacked on another topic, does not conflict with `main`, and has
+one declared impact. A topic whose rebase onto the chain would conflict, or
+that another `ci` is moving (its topic lock is held), is left untouched.
+Each declared refactor proves its closures unchanged against the chain
+below it, on a trial merge, before it joins, and stays out if they changed.
+Clearance then runs once on the chain's tip. When it passes, the topic
+branches are pushed, `main` fast-forwards to the tip, and a release is
+tagged for each behavior or breaking revision, exactly as separate landings
+would. When it fails, `ci land --train` bisects: it takes clearance on
+prefixes of the chain to find the first topic that fails, about log2(N) more
+runs, lands the prefix before that topic, and reports the culprit with its
+failure. The culprit stays on the new `main`, the topics after it move back
+onto `main` without it, and each is pushed unless it conflicts there; their
+owners land them again. The run ends with a table of what happened to each
+topic, and fails when a culprit was found. Workspaces with a train topic
+checked out are snapshotted before planning and updated afterwards, and the
+whole rewrite has one `ci recover` checkpoint. A train does not retry: if
+something outside the queue moves `main` while it clears, nothing lands and
+every topic returns to `main`.
+
 The installed `ci`, the dev shell's, and the ci MCP server's are one launcher
 (`ci-launch.nu`) that picks the `ci.nu` to run each time it starts. Other
 repositories run the copy bundled with the package, the version their lock

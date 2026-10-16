@@ -2020,16 +2020,24 @@ def contains-main [revision: string] {
 # the merge, as when another session held .git/index.lock, left its probe
 # behind for every later plan to count as a topic (2026-10-07).
 def trial-merge [revisions: list<string>] {
-    let marker = $"jj-ci-plan-probe-(random uuid)"
-    let probes = $"description\(substring:'($marker)')"
-    let outcome = try {
-        git-command "creating a trial merge" { ^jj new --no-edit -m $marker ...$revisions } | ignore
-        let probe = (revision-field $probes 'commit_id')
+    with-trial-merge $revisions {|probe|
         let conflict = (revision-field $probe 'conflict') == "true"
         let changes = (git-command "diffing the trial merge" {
             ^jj diff --name-only --from (trunk-revset) --to $probe
         } | is-not-empty)
-        { value: { conflict: $conflict changes: $changes } error: null }
+        { conflict: $conflict changes: $changes }
+    }
+}
+
+# Run `body` with the commit ID of a headless merge of `revisions`, then
+# abandon the merge. Its tree is what rebasing the last revision onto the
+# others would give, so a check can run on that tree before anything moves.
+def with-trial-merge [revisions: list<string>, body: closure] {
+    let marker = $"jj-ci-plan-probe-(random uuid)"
+    let probes = $"description\(substring:'($marker)')"
+    let outcome = try {
+        git-command "creating a trial merge" { ^jj new --no-edit -m $marker ...$revisions } | ignore
+        { value: (do $body (revision-field $probes 'commit_id')) error: null }
     } catch {|err| { value: null error: $err.msg } }
     let abandoned = (do { ^jj abandon $probes } | complete)
     if $outcome.error != null { error make { msg: $outcome.error } }
@@ -2194,6 +2202,8 @@ def build-plan [published: list] {
         {
             topic: $topic.label
             tip: $topic.tip
+            commit: $topic.commit
+            bookmark: $topic.bookmark
             change: ($topic.tip | str substring 0..7)
             description: $topic.description
             impact: $topic.impact
@@ -2909,6 +2919,233 @@ def land-queued [published: record, timeout: duration, gate: string, attempts: i
     }
 }
 
+# Why a topic in `ci sequence` cannot join a train, or null when it can.
+# `facts` holds the plan entry's `main` status and `impact`, whether its
+# local bookmark is the one `pushed` to the trunk remote, and whether its
+# plan tip is that bookmark (`dispatched`), with no edits above it.
+def train-exclusion [facts: record] {
+    if $facts.main != "clean" { return $facts.main }
+    if not $facts.pushed { return "local bookmark differs from the dispatched one" }
+    if not $facts.dispatched { return "has edits since its dispatch" }
+    if $facts.impact not-in $IMPACTS { return "has no single declared impact" }
+    null
+}
+
+# Find where clearance first fails in a train of `count` topics that failed
+# as a whole with `failure`: `clear` takes a prefix length and runs clearance
+# on the chain up to it, returning { passed, error }. Main itself, the empty
+# prefix, counts as passing. Bisection needs about log2(count) more
+# clearances. Returns { passing, culprit, failure }: the longest prefix found
+# to pass, the index of the topic after it, which failed clearance on top of
+# that prefix, and that clearance's error.
+def bisect-train [count: int, failure: any, clear: closure] {
+    mut passing = 0
+    mut failing = $count
+    mut error = $failure
+    while $failing - $passing > 1 {
+        let middle = ($passing + $failing) // 2
+        let verdict = (do $clear $middle)
+        if $verdict.passed {
+            $passing = $middle
+        } else {
+            $failing = $middle
+            $error = $verdict.error
+        }
+    }
+    { passing: $passing culprit: ($failing - 1) failure: $error }
+}
+
+# Run clearance on the train's `entry`, the tip of a prefix, and report
+# whether it passed. Remote clearance needs the head pushed: GitHub's to the
+# mirror, the spindle's to the trunk remote, where it is started by hand.
+def train-clearance [checker: record, gate: string, entry: record, timeout: duration] {
+    if $gate == "github" { push-bookmark $GITHUB_REMOTE $entry.name }
+    if $gate == "spindle" { push-topic-bookmark $entry.name }
+    print $"Waiting for ($checker.name) to pass ($entry.name) at ($entry.head | str substring 0..11)."
+    try {
+        wait-for-pipeline $checker $entry.head $timeout
+        { passed: true error: null }
+    } catch {|err| { passed: false error: $err.msg } }
+}
+
+# Release the topic locks a train took, as { lock, claim } records.
+def release-topic-locks [claims: list] {
+    for claim in $claims { swap-local-checks-lock $claim.lock ($claim.claim | hash sha256) "" | ignore }
+}
+
+# Land every dispatched topic that can go in one fast-forward: one
+# clearance for the lot instead of one per topic. From the front of the
+# landing queue, the topics in `ci sequence` order are rebased into one
+# linear chain on main. A topic is left out, untouched, when it is not
+# dispatched as it stands, would conflict with the chain, has no single
+# declared impact, or is moved by another `ci` (its topic lock is held). A
+# declared refactor must prove its closures unchanged against the chain
+# below it, on a trial merge, before it joins. Clearance then runs once on
+# the chain's tip, and main fast-forwards to it, with a release tagged for
+# each user-facing revision. If clearance fails, bisection finds the first
+# topic that fails it: the passing prefix lands, and that topic and every
+# one after it return to main for their owners to land again. `checker`
+# and `fingerprint` stand in for the landing gate and closure-fingerprint in
+# tests.
+def land-train [timeout: duration, gate: string, --checker: record, --fingerprint: closure] {
+    let checker = if $checker == null { landing-gate $gate } else { $checker }
+    let fingerprint = (select-fingerprint $fingerprint {|flake| closure-fingerprint $flake })
+    with-landing-queue 'train "ci land --train"' {
+        fetch-trunk
+        checkpoint "train"
+        let base = (revision-id "trunk()")
+        let published = (topic-bookmarks | where parent == null)
+        # Snapshot every workspace with work above main first, so edits made
+        # there since the last JJ command show as undispatched.
+        let busy = (workspaces-in $"(trunk-revset)..working_copies\()")
+        for name in $busy {
+            let root = (try { workspace-root $name } catch { "" })
+            if ($root | path exists) and $root != "" {
+                local-complete { ^jj --repository $root status } | ignore
+            }
+        }
+        let plan = (build-plan $published | where bookmark != null)
+        let moved = if ($published | is-empty) { [] } else {
+            other-workspaces-in $"\(($published | each {|topic| bookmark-revset $topic.name } | str join ' | '))::"
+        }
+        mut claims = []
+        mut chain = []
+        mut skipped = []
+        let outcome = try {
+            mut tip = $base
+            for entry in $plan {
+                let bookmark = (bookmark-revset $entry.bookmark)
+                let head = (revision-id $bookmark)
+                let reason = (train-exclusion {
+                    main: $entry.main
+                    impact: $entry.impact
+                    pushed: ($head == (try { revision-id (remote-bookmark-revset $entry.bookmark) } catch { "" }))
+                    dispatched: ($entry.commit == $head)
+                })
+                if $reason != null {
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($reason)" })
+                    continue
+                }
+                let change = (revision-field $head 'change_id')
+                let lock = (topic-lock-path $change)
+                mkdir ($lock | path dirname)
+                let claim = ({ topic: (lock-topic $head) pid: $nu.pid start: (process-start $nu.pid) workspace: $env.PWD } | to json --raw)
+                let holder = (claim-local-checks-lock $lock $claim)
+                if $holder != null {
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: pid ($holder.pid? | default '?') is moving it" })
+                    continue
+                }
+                $claims = ($claims | append { lock: $lock claim: $claim })
+                let on_tip = (contains-main $head) and $tip == $base
+                let candidate = $tip
+                let trial = if $on_tip { { conflict: false } } else { trial-merge [$candidate $head] }
+                if $trial.conflict {
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: "skipped: conflicts with the train" })
+                    continue
+                }
+                if $entry.impact == "refactor" {
+                    let proof = (try {
+                        phase closures $"Proving ($entry.bookmark) closure-neutral on the train" {
+                            if $on_tip {
+                                require-closure-neutral $candidate $head --fingerprint $fingerprint
+                            } else {
+                                with-trial-merge [$candidate $head] {|probe|
+                                    require-closure-neutral $candidate $probe --fingerprint $fingerprint
+                                }
+                            }
+                        }
+                        null
+                    } catch {|err| $err.msg })
+                    if $proof != null {
+                        $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($proof | lines | first)" })
+                        continue
+                    }
+                }
+                if not $on_tip {
+                    restack $bookmark $candidate | ignore
+                    if (conflicted-revisions $"($candidate)..($bookmark)" | is-not-empty) {
+                        error make { msg: $"Rebasing ($entry.bookmark) onto the train conflicted although its trial merge did not.(recovery-hint)" }
+                    }
+                }
+                let rebased = (revision-id $bookmark)
+                print $"($entry.bookmark) joins the train at ($rebased | str substring 0..11)."
+                $chain = ($chain | append { name: $entry.bookmark head: $rebased below: $candidate impact: $entry.impact })
+                $tip = $rebased
+            }
+            if ($chain | is-empty) {
+                print "No dispatched topic can join a train."
+                { value: { landed: 0 chain: [] failure: null } error: null }
+            } else {
+                report-status working $"Clearing a train of ($chain | length) topics" --id train
+                let whole = (train-clearance $checker $gate ($chain | last) $timeout)
+                let found = if $whole.passed {
+                    { passing: ($chain | length) culprit: null failure: null }
+                } else {
+                    let train = $chain
+                    let split = (bisect-train ($train | length) $whole.error {|length|
+                        train-clearance $checker $gate ($train | get ($length - 1)) $timeout
+                    })
+                    { passing: $split.passing culprit: ($train | get $split.culprit | get name) failure: $split.failure }
+                }
+                mut landed = $found.passing
+                if $landed > 0 {
+                    let last = ($chain | get ($landed - 1))
+                    for entry in ($chain | first $landed) { push-topic-bookmark $entry.name }
+                    if not (advance-main $last.head $base $"a train of ($landed) topics") {
+                        print --stderr "main moved outside the landing queue while the train cleared; nothing landed."
+                        $landed = 0
+                    }
+                }
+                { value: { landed: $landed chain: $chain failure: $found } error: null }
+            }
+        } catch {|err| { value: null error: $err.msg } }
+        if $outcome.error != null {
+            release-topic-locks $claims
+            update-moved-workspaces $moved
+            error make { msg: $outcome.error }
+        }
+        let result = $outcome.value
+        # Return every topic that did not land to main: the first stays where
+        # it is, on the landed prefix or on main; the rest are moved onto
+        # main newest first, so the commits above the topic below each one
+        # are still its own.
+        let returned = ($result.chain | skip $result.landed)
+        let returns = ($returned | enumerate | reverse | each {|entry|
+            if $entry.index > 0 {
+                let own = $"roots\(($entry.item.below)..(bookmark-revset $entry.item.name))"
+                run-command $"returning ($entry.item.name) to main" {
+                    ^jj ...(checkpoint-tag) rebase -s $own -o (trunk-revset) --skip-emptied
+                } | ignore
+            }
+            let conflicted = (conflicted-revisions $"(trunk-revset)..(bookmark-revset $entry.item.name)" | is-not-empty)
+            if not $conflicted { push-topic-bookmark $entry.item.name }
+            { topic: $entry.item.name conflicted: $conflicted }
+        } | reverse)
+        update-moved-workspaces $moved
+        release-topic-locks $claims
+        let culprit = $result.failure.culprit?
+        let rows = (($result.chain | first $result.landed | each {|entry| { topic: $entry.name outcome: "landed" } })
+            ++ ($returns | each {|entry|
+                let state = if $entry.conflicted { "returned to main with conflicts; resolve before landing" } else { "returned to main" }
+                { topic: $entry.topic outcome: (if $entry.topic == $culprit { $"failed clearance, ($state)" } else { $state }) }
+            })
+            ++ $skipped)
+        if ($rows | is-not-empty) { print ($rows | table) }
+        if $culprit != null {
+            let message = $"($culprit) failed clearance on top of the ($result.landed) topic\(s) that landed: ($result.failure.failure? | default 'no reason given')"
+            report-status error $message --id train
+            error make { msg: $message }
+        }
+        if $result.landed > 0 {
+            report-status done $"Landed a train of ($result.landed) topics" --id train
+            print $"Landed a train of ($result.landed) topics. Each topic's owner runs `ci park`."
+        }
+        if ($result.chain | is-not-empty) and $result.landed == 0 {
+            error make { msg: "main moved outside the landing queue while the train cleared. Nothing landed; every topic is back on main. Run `ci land --train` again once main is quiet." }
+        }
+    }
+}
+
 # Fast-forward GitHub's main to the trunk's. The trunk is authoritative, so a
 # rejected mirror push leaves the landing in place and reports how to retry,
 # as an error under `mirror` that does not fail the run. A repository without
@@ -2990,10 +3227,18 @@ def "main land" [
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
     --attempts: int = 5 # How many times to start over when something outside the landing queue moves main
+    --train # Land every dispatched, conflict-free topic in one fast-forward, clearing the chain once
 ] {
     let cleared_by = if $gate == null { $clearance } else {
         print --stderr "`ci land --gate` is now `ci land --clearance`."
         $gate
+    }
+    if $train {
+        report-run "Landed the train" {
+            require-jj-workspace-here
+            land-train $timeout $cleared_by
+        }
+        return
     }
     report-run "Landed the topic" {
         with-topic-lock (current-topic-id) {

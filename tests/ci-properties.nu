@@ -1086,6 +1086,86 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
 }
 print "ok landing queue"
 
+# A train (`ci land --train`): dispatched topics rebase into one chain and
+# take clearance once. A refactor that changes a closure stays out, a failing
+# chain is bisected, the passing prefix lands, and the topics after the
+# culprit return to main without it. A fake gate fails any tree holding the
+# file `b`, and a fake fingerprint reads each tree's hosts.json.
+
+let train_repo = (mktemp --directory --tmpdir ci-train-XXXXXX)
+let train_remote = (mktemp --directory --tmpdir ci-train-remote-XXXXXX)
+let train_config = (mktemp --tmpdir ci-train-jj-XXXXXX.toml)
+'user.name = "ci"
+user.email = "ci@example.invalid"
+revset-aliases."trunk()" = "latest(present(main@tangled) | root())"
+' | save --force $train_config
+^git init --quiet --bare $train_remote
+with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
+    cd $train_repo
+    ^jj git init --quiet
+    ^jj git remote add tangled $train_remote
+    '{"asus": "a"}' | save --force hosts.json
+    ^jj commit --quiet -m base
+    ^jj bookmark create --quiet main -r @-
+    ^jj bookmark track --quiet main@tangled
+    ^jj git push --quiet --remote tangled --bookmark main
+    let base = (revision-id "main")
+    # Topics in creation order, each dispatched as `ci dispatch` leaves it.
+    let topics = [
+        { name: "r" file: "hosts.json" content: '{"asus": "r"}' impact: "refactor" }
+        { name: "a" file: "a" content: "a" impact: "behavior" }
+        { name: "b" file: "b" content: "b" impact: "behavior" }
+        { name: "c" file: "c" content: "c" impact: "behavior" }
+    ]
+    for topic in ($topics | enumerate) {
+        with-env { JJ_TIMESTAMP: $"2026-10-16T12:00:0($topic.index)+00:00" } {
+            ^jj new --quiet $base -m $"topic ($topic.item.name)"
+            $topic.item.content | save --force $topic.item.file
+            ^jj bookmark create --quiet $"jj-($topic.item.name)" -r @
+        }
+        ^jj bookmark track --quiet $"jj-($topic.item.name)@tangled"
+        ^jj git push --quiet --remote tangled --bookmark $"jj-($topic.item.name)"
+        declare-impact (revisions-in "@") $topic.item.impact [] | ignore
+    }
+    ^jj new --quiet $base
+    let refactor = (revision-id "jj-r")
+    let fingerprint = {|flake| open ($flake | str replace --regex '^path:' '' | path join "hosts.json") }
+    let without_b = {
+        name: "fake gate"
+        probe: {|commit|
+            if "b" in (^jj file list -r $commit | lines) {
+                { state: "failed" workflows: [{ name: "fake" status: "failed" error: "b breaks" }] }
+            } else {
+                { state: "success" workflows: [] }
+            }
+        }
+        hint: ""
+        started_by_hand: false
+    }
+
+    let failed = (try { land-train 1min local --checker $without_b --fingerprint $fingerprint; null } catch {|err| $err.msg })
+    assert ($failed != null and ($failed | str contains "jj-b failed clearance") and ($failed | str contains "b breaks")) $"the culprit was not named: ($failed)"
+    assert equal (revision-id "main@tangled") (revision-id "jj-a") "the passing prefix did not land"
+    assert equal (revision-id "jj-b-") (revision-id "jj-a") "the culprit left the landed prefix"
+    assert equal (revision-id "jj-c-") (revision-id "main@tangled") "a topic after the culprit did not return to main"
+    assert (revset-change-ids "jj-b & ::jj-c" | is-empty) "a returned topic still carries the culprit"
+    assert equal (revision-id "jj-c") (revision-id "jj-c@tangled") "a returned topic was not pushed"
+    assert equal (revision-id "jj-r") $refactor "a refactor that changes a closure was moved"
+    assert ((^jj tag list | lines | length) == 1) "the landed behavior change was not released"
+    assert equal (landing-queue (landing-queue-path)) [] "the train kept its ticket"
+    let kept = (glob ($outcome_dir | path join "jj-ci" "topics" "*.lock") | where {|lock| (open --raw $lock) =~ 'topic [rabc]' })
+    assert ($kept | is-empty) $"the train kept topic locks: ($kept)"
+
+    # Once the culprit is fixed, the rest land in one clearance.
+    let fixed = ($without_b | update probe {|_| {|commit| { state: "success" workflows: [] } } })
+    land-train 1min local --checker $fixed --fingerprint $fingerprint
+    assert equal (revision-id "main@tangled") (revision-id "jj-c") "the train did not land its tip"
+    assert (revset-change-ids "jj-b & ::main@tangled" | is-not-empty) "the train left a topic behind"
+    assert equal (revision-id "jj-r") $refactor
+}
+rm --recursive --force $train_repo $train_remote $train_config
+print "ok land train"
+
 rm --recursive $outcome_dir
 
 # Plan tips: every tip has its own name, and only a divergent change's copies
@@ -1214,3 +1294,28 @@ for case in $TANGLED_LOCATION_CASES {
     assert equal (tangled-location $case.url) $case.expected $"tangled-location ($case.url)"
 }
 print $"ok tangled remote locations \(($TANGLED_LOCATION_CASES | length) cases)"
+
+# A train's bisection: clearance passes every prefix up to the culprit and
+# fails every one past it. Bisection must name that culprit, the prefix
+# before it, and the culprit's own failure, which is the whole train's when
+# the culprit is the last topic.
+
+for-all "bisect-train names the first topic that fails clearance" {|key|
+    let count = 1 + (pick $"($key)/count" 9)
+    let culprit = (pick $"($key)/culprit" $count)
+    let found = (bisect-train $count $"prefix ($count)" {|length|
+        { passed: ($length <= $culprit) error: $"prefix ($length)" }
+    })
+    assert equal $found { passing: $culprit culprit: $culprit failure: $"prefix ($culprit + 1)" }
+}
+
+for-all "a topic joins a train only when dispatched as it stands, clean, and classified" {|key|
+    let facts = {
+        main: (pick-from $"($key)/main" ["clean" "landed" "conflicts with main"])
+        pushed: (flag $"($key)/pushed")
+        dispatched: (flag $"($key)/dispatched")
+        impact: (pick-from $"($key)/impact" ["refactor" "behavior" "breaking" null])
+    }
+    let joins = $facts.main == "clean" and $facts.pushed and $facts.dispatched and $facts.impact != null
+    assert equal ((train-exclusion $facts) == null) $joins $"($facts)"
+}
