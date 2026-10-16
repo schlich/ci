@@ -664,7 +664,10 @@ def with-topic-lock [change: string, body: closure] {
 # than a check failing: on this machine, almost always memory. An evaluation
 # that outgrew the memory budget counts as killed too; nix-eval-jobs reports
 # it as failed once a retry on its own runs out as well.
-def checks-outcome [exit_code: int, results: string] {
+#
+# `explained` maps a check that did not build to why, as
+# explain-build-failure returns it, and its error then says so.
+def checks-outcome [exit_code: int, results: string, explained: record = {}] {
     if $exit_code == 0 { return { status: "success" } }
     let failed = ((try { open $results | get results } catch { [] }) | where {|result|
         not $result.success and ($result.error? | default "") !~ "exceeded the memory budget"
@@ -677,12 +680,48 @@ def checks-outcome [exit_code: int, results: string] {
     }
     let checks = ($failed | each {|result|
         match $result.type {
-            "BUILD" => $"($result.attr) did not build"
+            "BUILD" => $"($result.attr) did not build(build-failure-detail ($explained | get --optional $result.attr))"
             "EVAL" => $"($result.attr) did not evaluate"
             _ => $"($result.attr) failed to ($result.type | str lowercase)"
         }
     })
     { status: "failed" error: ($checks | str join ", ") }
+}
+
+# The line of a failed build's log that says why: the last one naming an
+# error, assertion, failure, panic, or exception, else the last line printed.
+# A test runner's traceback ends in its assertion, and a compiler's output in
+# its error, so this is usually the line a reviewer looks for first.
+def build-failure-reason [log: string] {
+    let printed = ($log | ansi strip | lines | each {|line| $line | str trim } | where {|line| $line | is-not-empty })
+    let named = ($printed | where {|line| $line =~ '(?i)\b(error|assert\w*|fail(ed|ure)?|panic\w*|exception)\b' })
+    $named | last | default ($printed | last) | default "" | str substring 0..<300
+}
+
+# What follows "<check> did not build" for a failure explain-build-failure
+# explained, or nothing for one it could not.
+def build-failure-detail [failure: any] {
+    if $failure == null { return "" }
+    let reason = if ($failure.reason | is-empty) { "" } else { $": ($failure.reason)" }
+    let log = if $failure.log == null { "" } else { $" \(log: ($failure.log))" }
+    $"($reason)($log)"
+}
+
+# Why the check `attr` did not build at `commit`, from the log Nix kept for
+# its derivation `drv`. The whole log is saved, without colour codes, as
+# $XDG_STATE_HOME/ci/check-failures/<commit>/<check>.log, which outlives the
+# exported tree, so a person or an agent can read it after the landing fails.
+# Returns { reason log }, or null when Nix has no log for `drv`, as for a
+# check built on a remote builder that kept it.
+def explain-build-failure [commit: string, attr: string, drv: string] {
+    if not ($drv | str starts-with "/nix/store/") { return null }
+    let fetched = (try { ^nix log $drv | complete } catch { { exit_code: 1 } })
+    if $fetched.exit_code != 0 or ($fetched.stdout | is-empty) { return null }
+    let log = ($fetched.stdout | ansi strip)
+    let dir = ($env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "ci" "check-failures" ($commit | str substring 0..<12))
+    let path = ($dir | path join $"($attr | str replace --all --regex '[^A-Za-z0-9_.+-]+' '-').log")
+    let saved = (try { mkdir $dir; $log | save --force $path; $path } catch { null })
+    { reason: (build-failure-reason $log) log: $saved }
 }
 
 # The exit code of checks that ran in a transient unit, in Nu's convention (a
@@ -709,7 +748,7 @@ def check-status-id [attr: string] {
 # Local clearance progress, before nix-fast-build reports anything. `names`
 # lists the checks, or is null when listing them failed.
 def checks-progress-start [names: any] {
-    { names: $names seen: [] building: [] built: [] failed: [] }
+    { names: $names seen: [] building: [] built: [] failed: [] explained: {} }
 }
 
 # The `clearance` record for `progress`: the newest build and its place
@@ -781,11 +820,13 @@ def checks-progress-step [progress: record, result: record] {
                     ]
                 }
             } else {
+                # The report carries the derivation, so the caller can say why
+                # from its build log.
                 let msg = $"($attr) did not build"
                 {
                     progress: ($progress | update failed ($progress.failed ++ [$msg]))
                     reports: [
-                        { state: "error" id: $id msg: $msg }
+                        { state: "error" id: $id msg: $msg drv: $drv }
                         (checks-progress-summary $progress)
                     ]
                 }
@@ -866,8 +907,15 @@ def local-checks-state [commit: string] {
                             $progress
                         } else {
                             let step = (checks-progress-step $progress $result)
-                            for report in $step.reports { report-status $report.state $report.msg --id $report.id }
-                            $step.progress
+                            let failed_drv = ($step.reports | get --optional drv | compact | get --optional 0)
+                            let failure = if $failed_drv == null { null } else { explain-build-failure $commit $result.attr $failed_drv }
+                            for report in $step.reports {
+                                let msg = if ($report.drv? | is-empty) { $report.msg } else { $"($report.msg)(build-failure-detail $failure)" }
+                                report-status $report.state $msg --id $report.id
+                            }
+                            if $failure == null { $step.progress } else {
+                                $step.progress | update explained {|progress| $progress.explained | upsert $result.attr $failure }
+                            }
                         }
                     })
                 { progress: $progress }
@@ -882,7 +930,7 @@ def local-checks-state [commit: string] {
             let outcome = if $exit_code == null {
                 { status: "killed" error: "stopped before it finished" }
             } else {
-                checks-outcome $exit_code $results
+                checks-outcome $exit_code $results $progress.explained
             }
             if $outcome.status != "killed" { return $outcome }
             let killed = (checks-killed $outcome.error $progress)

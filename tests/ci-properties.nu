@@ -701,6 +701,25 @@ for case in $CHECK_OUTCOME_CASES {
 }
 print $"ok local check outcomes \(($CHECK_OUTCOME_CASES | length) cases)"
 
+# A failed build explained from its log (2026-10-15): the dotfiles workbench
+# check's round-trip test failed with a Python traceback in colour, and the
+# landing said only that it did not build.
+const WORKBENCH_LOG = "-marimo-version: 0.24.2\n+marimo-version: 0.25.1\nTraceback (most recent call last):\n  File \e[35m\"/build/workspace/tests/roundtrip.py\"\e[0m, line \e[35m145\e[0m, in \e[35mmain\e[0m\n    assert \e[1;31mnot unexpected\e[0m, f\"unexpected changes: {unexpected}\"\n\e[1;35mAssertionError\e[0m: \e[35munexpected changes: {'marimo-version: 0.24.2'}\e[0m\n\n"
+assert equal (build-failure-reason $WORKBENCH_LOG) "AssertionError: unexpected changes: {'marimo-version: 0.24.2'}"
+assert equal (build-failure-reason "checking...\nexpected 3, got 4\n") "expected 3, got 4"
+assert equal (build-failure-reason "") ""
+assert equal (build-failure-reason $"error: ('' | fill --width 400 --character x)" | str length) 300
+rm --force $outcome_file
+{ results: [{ type: "BUILD" attr: "workbench" success: false error: "build exited with 1" } { type: "BUILD" attr: "other" success: false error: "build exited with 1" }] } | to json | save $outcome_file
+assert equal (checks-outcome 1 $outcome_file { workbench: { reason: "AssertionError: boom" log: "/s/workbench.log" } }) {
+    status: "failed"
+    error: "workbench did not build: AssertionError: boom (log: /s/workbench.log), other did not build"
+}
+assert equal (build-failure-detail { reason: "" log: "/s/a.log" }) " (log: /s/a.log)"
+assert equal (build-failure-detail { reason: "error: x" log: null }) ": error: x"
+assert equal (explain-build-failure "abc" "tests" "/d/2") null
+print "ok build failure explanations"
+
 # What a transient checks unit leaves behind, as observed on 2026-10-07: the
 # shell's recorded status and systemd-run's exit status for each way a run ends.
 const UNIT_EXIT_CASES = [
@@ -753,6 +772,8 @@ let failing = (fold-progress null [
 ])
 assert equal ($failing.reports | where state == "error" | get msg) ["broken did not evaluate: error: attribute 'x' missing" "tests did not build"]
 assert equal ($failing.reports | where id == "clearance" | get msg) ["building tests (2)" "evaluated 2 checks"]
+# A failed build's report names its derivation, so its log can explain it.
+assert equal ($failing.reports | where id == "clearance/tests" and state == "error" | get drv) ["/d/2"]
 
 # Killed while one check built and the next in name order was evaluating.
 let cut = (fold-progress ["a" "b" "c"] [

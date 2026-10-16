@@ -230,7 +230,14 @@ Local clearance reports each check as it goes, as OSC 7501 records that
 build and its place among the checks, such as `building desktop-primary
 (3/14)`. Each check that needs building gets its own `clearance/<check>`
 record: working when it starts, then done with its build time, or error when
-it does not build or evaluate. An evaluation that outgrows its worker's
+it does not build or evaluate. A check that does not build is explained from
+the log Nix kept for its derivation: the record, and the clearance failure,
+quote the log's last line naming an error, assertion, or failure, and the
+whole log is saved as `$XDG_STATE_HOME/ci/check-failures/<commit>/<check>.log`,
+such as `workbench did not build: AssertionError: unexpected changes: …
+(log: ~/.local/state/ci/check-failures/a94c0c7a1b2c/workbench.log)`. A
+`watch-job` monitor therefore delivers the cause, and an agent or person
+reads the rest from that file. An evaluation that outgrows its worker's
 memory budget reports as an error under its own name, such as
 `den-host-evaluation exceeded 6 GiB`. A run killed outright reports the
 builds and the evaluation it cut short as errors, and names them in the
