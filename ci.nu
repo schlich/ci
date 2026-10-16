@@ -519,6 +519,15 @@ def phase [id: string, msg: string, body: closure] {
     $result
 }
 
+# One line naming what failed. A bare "External command failed" names no
+# command (2026-10-16); its first label does, such as "Command `ci-agent` not
+# found".
+def error-summary [err: record] {
+    let first = ($err.msg | lines | get --optional 0 | default "")
+    let label = ($err.details?.labels? | default [] | get --optional 0.text | default "")
+    if ($label | is-empty) or ($first | str contains $label) { $first } else { $"($first): ($label)" }
+}
+
 # Run a whole dispatch or landing: record its command line, report done or
 # error for the run, clear its records so terminals and watchers drop them,
 # and export its trace.
@@ -526,7 +535,7 @@ def report-run [msg: string, body: closure] {
     let command = (this-command)
     log-event "ci.run" ($command | default $msg) { "ci.command": $command "ci.job.id": (this-mcp-job) }
     try { do $body } catch {|err|
-        report-status error ($err.msg | lines | get --optional 0 | default $"($msg) failed")
+        report-status error (error-summary $err | default --empty $"($msg) failed")
         report-status clear
         export-this-run
         $err.raw
@@ -994,9 +1003,9 @@ def with-local-checks-lock [commit: string, body: closure, --unit: string] {
         sleep 5sec
     }
     if $announced != {} { report-status clear --id local-checks }
-    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err.msg } }
+    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err } }
     swap-local-checks-lock $lock ($claim | hash sha256) "" | ignore
-    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $outcome.error != null { error make $outcome.error.raw }
     $outcome.value
 }
 
@@ -1010,7 +1019,9 @@ def topic-lock-path [change: string] {
 }
 
 # Run `body` holding the lock for topic `change`, or fail at once naming the
-# live process that holds it: waiting would only move the topic twice.
+# live process that holds it: waiting would only move the topic twice. An
+# error inside `body` is raised again whole, with the command and labels that
+# say what failed, not just its message.
 def with-topic-lock [change: string, body: closure] {
     let lock = (topic-lock-path $change)
     mkdir ($lock | path dirname)
@@ -1024,9 +1035,9 @@ def with-topic-lock [change: string, body: closure] {
     if $holder != null {
         error make { msg: $"Another `ci` \(pid ($holder.pid? | default '?') in ($holder.workspace? | default 'another workspace')) is already dispatching or landing ($holder.topic? | default 'this topic'). Let it finish, or stop it, rather than moving the topic twice." }
     }
-    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err.msg } }
+    let outcome = try { { value: (do $body) error: null } } catch {|err| { value: null error: $err } }
     swap-local-checks-lock $lock ($claim | hash sha256) "" | ignore
-    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $outcome.error != null { error make $outcome.error.raw }
     $outcome.value
 }
 
@@ -1129,9 +1140,9 @@ def with-landing-queue [topic: string, body: closure] {
         }
         if $announced != "" { report-status clear --id landing-queue }
         { value: (do $body) error: null }
-    } catch {|err| { value: null error: $err.msg } }
+    } catch {|err| { value: null error: $err } }
     rm --force $ticket
-    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $outcome.error != null { error make $outcome.error.raw }
     $outcome.value
 }
 
@@ -2414,9 +2425,9 @@ def with-trial-merge [revisions: list<string>, body: closure] {
     let outcome = try {
         git-command "creating a trial merge" { ^jj new --no-edit -m $marker ...$revisions } | ignore
         { value: (do $body (revision-field $probes 'commit_id')) error: null }
-    } catch {|err| { value: null error: $err.msg } }
+    } catch {|err| { value: null error: $err } }
     let abandoned = (do { ^jj abandon $probes } | complete)
-    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $outcome.error != null { error make $outcome.error.raw }
     if $abandoned.exit_code != 0 {
         error make { msg: $"abandoning the trial merge failed with exit code ($abandoned.exit_code): ($abandoned.stderr | str trim)" }
     }
@@ -3262,6 +3273,12 @@ def topic-agent-step [state?: record, event?: record, --land, --attempts: int = 
     let request = if $state == null {
         { input: { land: $land attempts: $attempts } }
     } else { { snapshot: $state.snapshot event: $event } }
+    if ($env.CI_AGENT_SCRIPT? | is-empty) and (which ci-agent | is-empty) {
+        # Only a ci.nu newer than the installed package meets this: the
+        # launcher builds the matching ci-agent when it can, and falls back to
+        # the package's, which predated the agent until 2026-10-16.
+        error make { msg: "ci-agent is not on PATH. It ships beside `ci` in the ci package; this ci.nu is newer than the installed package and the launcher could not build its agent. Update the ci package, or run `nix develop path:. --command ci` in the ci repository." }
+    }
     let response = (do {
         if ($env.CI_AGENT_SCRIPT? | is-not-empty) {
             $request | to json --raw | ^node $env.CI_AGENT_SCRIPT
@@ -3325,9 +3342,9 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
             }
             _ => { error make { msg: $"Unknown CI agent state: ($active.state)" } }
         } } catch {|err|
-            let blocked = (topic-agent-step $active { type: FAILED message: $err.msg })
+            let blocked = (topic-agent-step $active { type: FAILED message: (error-summary $err) })
             report-status blocked $"CI agent: ($blocked.context.error)" --id agent
-            error make { msg: $err.msg }
+            error make $err.raw
         }
         $step = (topic-agent-step $step $event)
     }
@@ -3344,9 +3361,9 @@ def publish-with-agent [land: bool, attempts: int] {
     let initial = (topic-agent-step --land=$land --attempts $attempts)
     report-status working "CI agent: publishing" --id agent
     let published = try { publish-topic } catch {|err|
-        let blocked = (topic-agent-step $initial { type: FAILED message: $err.msg })
+        let blocked = (topic-agent-step $initial { type: FAILED message: (error-summary $err) })
         report-status blocked $"CI agent: ($blocked.context.error)" --id agent
-        error make { msg: $err.msg }
+        error make $err.raw
     }
     { published: $published state: (topic-agent-step $initial { type: PUBLISHED head: $published.head }) }
 }
@@ -3530,11 +3547,11 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 }
                 { value: { landed: $landed chain: $chain failure: $found } error: null }
             }
-        } catch {|err| { value: null error: $err.msg } }
+        } catch {|err| { value: null error: $err } }
         if $outcome.error != null {
             release-topic-locks $claims
             update-moved-workspaces $moved
-            error make { msg: $outcome.error }
+            error make $outcome.error.raw
         }
         let result = $outcome.value
         # Return every topic that did not land to main: the first stays where
@@ -3707,10 +3724,10 @@ def with-commit-trees [revisions: record, body: closure] {
         }
         { value: (do $body $trees) error: null }
     } catch {|err|
-        { value: null error: $err.msg }
+        { value: null error: $err }
     }
     rm --recursive --force $root
-    if $outcome.error != null { error make { msg: $outcome.error } }
+    if $outcome.error != null { error make $outcome.error.raw }
     $outcome.value
 }
 

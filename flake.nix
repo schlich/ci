@@ -160,8 +160,22 @@
           tlaplus
           util-linux
         ];
+        # This jj honours the JJ_CONFIG the test suites set, which a user's
+        # jj wrapped with its own JJ_CONFIG would override. Hand it the user's
+        # configuration instead, read from their jj, so `ci land`'s preflight
+        # runs their fix.tools (2026-10-16).
         shellHook = ''
           export NU_LIB_DIRS=${osc7501-nu}
+          if [ -z "''${JJ_CONFIG-}" ]; then
+            for candidate in $(type -ap jj); do
+              if [ "$candidate" != ${pkgs.jujutsu}/bin/jj ]; then
+                if config="$("$candidate" config path --user 2>/dev/null)"; then
+                  export JJ_CONFIG="$config"
+                fi
+                break
+              fi
+            done
+          fi
         '';
       };
 

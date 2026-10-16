@@ -284,11 +284,14 @@ every topic returns to `main`.
 The installed `ci`, the dev shell's, and the ci MCP server's are one launcher
 (`ci-launch.nu`) that picks the `ci.nu` to run each time it starts. Other
 repositories run the copy bundled with the package, the version their lock
-file pins. Inside this repository, a topic that edits `ci.nu` runs its own
-copy, so a workflow change is tried before it lands, and any other workspace
-runs `main@tangled`'s, so an older workspace or a long-lived session never
-runs an older workflow. `CI_SCRIPT=/path/to/ci.nu` runs that copy from any
-repository while developing it.
+file pins. Inside this repository, a topic that edits `ci.nu` or `agent/`
+runs its own copy, so a workflow change is tried before it lands, and any
+other workspace runs `main@tangled`'s, so an older workspace or a long-lived
+session never runs an older workflow. Such a copy runs beside the
+`ci-agent` of the same revision: when its `agent/` sources differ from the
+installed package's, the launcher builds that agent with nix once and caches
+it under `~/.cache/ci`. `CI_SCRIPT=/path/to/ci.nu` runs that copy from any
+repository while developing it, with `CI_AGENT_SCRIPT` naming its agent.
 
 To dispatch a multi-change topic to Tangled as stacked PRs, run:
 

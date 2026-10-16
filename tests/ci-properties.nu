@@ -1183,8 +1183,27 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
     let other = (topic-lock-path "kyother")
     { topic: "live" pid: $nu.pid start: (process-start $nu.pid) workspace: "/w/other" } | to json --raw | save --force $other
     assert equal (with-topic-lock "kxtopic" { "ran" }) "ran" "another topic's lock blocked this one"
+    rm $other
+    # A command failing inside the lock (2026-10-16) was rethrown as a bare
+    # "External command failed", without saying which command.
+    let failed = (try { with-topic-lock "kxtopic" { ^ci-no-such-program-xyz }; null } catch {|err| $err })
+    assert ($failed != null) "a missing program inside the lock raised nothing"
+    assert (($failed.rendered | ansi strip) =~ 'ci-no-such-program-xyz') $"the rethrown error does not name the command: ($failed.rendered | ansi strip)"
+    assert equal (error-summary $failed) "External command failed: Command `ci-no-such-program-xyz` not found"
+    assert (not ($lock | path exists)) "a failed body kept the topic lock"
 }
 print "ok topic lock"
+
+for-all "error-summary keeps the message's first line and adds only a label it lacks" {|key|
+    let msg = (pick-from $"($key)/msg" ["boom" "External command failed" "first\nsecond"])
+    let labels = (pick-from $"($key)/labels" [[] [{ text: "Command `x` not found" }] [{ text: "boom" }]])
+    let summary = (error-summary { msg: $msg details: { labels: $labels } })
+    let first = ($msg | lines | first)
+    assert ($summary | str starts-with $first) $summary
+    let label = ($labels | get --optional 0.text | default "")
+    if ($label | is-not-empty) { assert ($summary | str contains $label) $summary }
+    assert (not ($summary | str contains "second")) $summary
+}
 
 # The landing queue (2026-10-16): landings that ran at once threw away one
 # another's clearance and restarted, up to five times each. Tickets are drawn

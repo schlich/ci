@@ -1,8 +1,22 @@
 # `ci`: the launcher in ci-launch.nu, which runs the ci.nu bundled here, or a
-# newer one inside the ci repository itself, plus `ci-tower` for `ci tower`.
+# newer one inside the ci repository itself, plus `ci-tower` for `ci tower`
+# and the `ci-agent` that ci.nu steps dispatches and landings with.
 # Shared by Home Manager, the dev shell, and the ci MCP server. Whichever
 # ci.nu the launcher runs inherits NU_LIB_DIRS, where it finds `pst`.
 { pkgs, osc7501-nu }:
+let
+  # The hash of the sources ci-agent is built from, as ci-launch.nu computes
+  # it for a ci.nu taken from the repository: equal means this package's
+  # agent already matches, so the launcher builds none.
+  agentHash = builtins.hashString "sha256" (
+    pkgs.lib.concatMapStrings (file: builtins.readFile (./agent + "/${file}")) [
+      "cli.mjs"
+      "machine.mjs"
+      "package-lock.json"
+      "package.nix"
+    ]
+  );
+in
 pkgs.symlinkJoin {
   name = "ci";
   paths = [
@@ -19,7 +33,8 @@ pkgs.symlinkJoin {
     wrapProgram "$out/bin/ci" --prefix PATH : $out/bin:${pkgs.git}/bin:${pkgs.gh}/bin \
       --suffix PATH : ${pkgs.jujutsu}/bin \
       --prefix NU_LIB_DIRS : ${osc7501-nu} \
-      --set CI_BUNDLED_SCRIPT ${./ci.nu}
+      --set CI_BUNDLED_SCRIPT ${./ci.nu} \
+      --set CI_BUNDLED_AGENT_HASH ${agentHash}
     # Deprecated alias for the former `jj-ci` name.
     ln -s ci "$out/bin/jj-ci"
   '';

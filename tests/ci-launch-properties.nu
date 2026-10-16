@@ -24,7 +24,7 @@ for-all "the bundled copy runs exactly outside the ci repository" {|key|
     assert equal ((launch-choice $facts) == "bundled") (not $facts.has_script)
 }
 
-for-all "a topic that edits ci.nu always runs its own copy" {|key|
+for-all "a topic that edits ci.nu or its agent always runs its own copy" {|key|
     let facts = (gen-launch-facts $key | upsert override false | upsert has_script true | upsert topic_edits true)
     assert equal (launch-choice $facts) "topic"
 }
@@ -45,3 +45,39 @@ for-all "every other ci workspace runs the trunk copy when it can read it" {|key
     let trunk = $facts.has_script and (not $facts.topic_edits) and $facts.trunk_readable
     assert equal ((launch-choice $facts) == "trunk") $trunk
 }
+
+# The agent beside the chosen copy (2026-10-16): main's ci.nu called a
+# ci-agent the installed package did not have yet.
+def gen-agent-facts [key: string] {
+    {
+        script: (pick-from $"($key)/script" ["override" "bundled" "topic" "trunk"])
+        has_agent: (flag $"($key)/agent")
+        matches_package: (flag $"($key)/matches")
+        cached: (flag $"($key)/cached")
+    }
+}
+
+for-all "the package's agent runs beside every copy not taken from the repository" {|key|
+    let facts = (gen-agent-facts $key)
+    if $facts.script in ["override" "bundled"] { assert equal (agent-choice $facts) "package" }
+}
+
+for-all "an agent whose sources match the package's is never built" {|key|
+    let facts = (gen-agent-facts $key | upsert matches_package true)
+    assert equal (agent-choice $facts) "package"
+}
+
+for-all "a repository copy with a different agent gets that agent, built at most once" {|key|
+    let facts = (gen-agent-facts $key)
+    let differs = ($facts.script in ["topic" "trunk"]) and $facts.has_agent and (not $facts.matches_package)
+    let choice = (agent-choice $facts)
+    assert equal ($choice != "package") $differs
+    if $differs { assert equal $choice (if $facts.cached { "cached" } else { "build" }) }
+}
+
+# ci-package.nix hashes the agent's files in this order, which must be the
+# order `jj file show` prints them in, so a revision whose agent matches the
+# package's is recognised without a build.
+assert equal $AGENT_FILES ($AGENT_FILES | sort)
+assert ($AGENT_FILES | all {|file| $file | str starts-with $"($AGENT)/" })
+print "ok agent files"
