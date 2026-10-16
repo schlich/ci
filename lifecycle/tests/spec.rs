@@ -35,6 +35,7 @@ struct Vars {
     landed_onto: Option<Commit>,
     delivered: bool,
     workspace_base: &'static str,
+    queued: bool,
 }
 
 fn workspace_base(workspace: Workspace) -> &'static str {
@@ -80,6 +81,7 @@ fn project(machine: &Machine) -> Vars {
             State::Released { workspace, .. } => workspace_base(*workspace),
             _ => "topic",
         },
+        queued: topic.queued,
     }
 }
 
@@ -161,16 +163,29 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.parent_landed = true;
         }
         Event::TrunkAdvances { main } => {
-            if v.delivered || *main == v.main_head {
+            if v.delivered || v.queued || *main == v.main_head {
                 return None;
             }
             n.main_head = main.clone();
+        }
+        Event::Queue => {
+            if !(owned && v.published && !v.delivered && !v.queued) {
+                return None;
+            }
+            n.queued = true;
+        }
+        Event::Dequeue => {
+            if !(v.queued && !v.delivered) {
+                return None;
+            }
+            n.queued = false;
         }
         Event::Land => {
             if !(owned
                 && v.published
                 && !v.conflict
                 && !v.delivered
+                && v.queued
                 && v.parent_landed
                 && v.published_head.as_ref() == Some(&v.head)
                 && v.passed_head.as_ref() == Some(&v.head)
@@ -181,6 +196,7 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.landed_onto = Some(v.main_head.clone());
             n.main_head = v.head.clone();
             n.delivered = true;
+            n.queued = false;
         }
         Event::Finish { workspace } => {
             if !(owned && !v.conflict && (v.delivered || !v.published)) {
@@ -244,6 +260,26 @@ fn invariants(v: &Vars) -> Vec<&'static str> {
             "LandingIsFastForward",
             !v.delivered || v.landed_onto.as_ref() == Some(&v.base),
         ),
+        (
+            "QueuedOnlyWhileLanding",
+            !v.queued || (v.owner && v.active && v.published && !v.delivered),
+        ),
+    ];
+    checks
+        .into_iter()
+        .filter(|(_, holds)| !holds)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The model's action properties, over one transition from `v` to `n`.
+fn action_properties(v: &Vars, n: &Vars) -> Vec<&'static str> {
+    let checks = [
+        (
+            "QueuedTopicStaysOnTrunk",
+            !(v.queued && n.queued && v.base == v.main_head) || n.base == n.main_head,
+        ),
+        ("LandsFromQueue", !(!v.delivered && n.delivered) || v.queued),
     ];
     checks
         .into_iter()
@@ -259,6 +295,8 @@ fn events() -> Vec<Event> {
         Event::Publish,
         Event::GatePasses,
         Event::ParentLands,
+        Event::Queue,
+        Event::Dequeue,
         Event::Land,
     ];
     for head in HEADS {
@@ -318,12 +356,16 @@ fn the_machine_refines_the_tla_model() {
                 machine.state()
             );
             match expected {
-                Some(expected) => assert_eq!(
-                    normalize(project(&next)),
-                    normalize(expected),
-                    "{event:?} from {:?}",
-                    machine.state()
-                ),
+                Some(expected) => {
+                    assert_eq!(
+                        normalize(project(&next)),
+                        normalize(expected),
+                        "{event:?} from {:?}",
+                        machine.state()
+                    );
+                    let broken = action_properties(&vars, &project(&next));
+                    assert!(broken.is_empty(), "{broken:?} broken by {event:?} from {vars:#?}");
+                }
                 None => assert!(next == machine, "rejected {event:?} changed the machine"),
             }
             if seen.insert((next.state().clone(), next.inner().clone())) {
@@ -345,8 +387,11 @@ fn a_topic_lands_only_through_validation_publication_and_a_gate() {
     assert!(apply(&mut machine, &Event::Publish));
     assert!(!apply(&mut machine, &Event::Land));
     assert!(apply(&mut machine, &Event::GatePasses));
+    assert!(!apply(&mut machine, &Event::Land), "landed outside the queue");
+    assert!(apply(&mut machine, &Event::Queue));
     assert!(apply(&mut machine, &Event::Land));
     assert!(matches!(machine.state(), State::Delivered { .. }));
+    assert!(!machine.inner().queued);
     assert_eq!(machine.inner().main, "h0");
     assert_eq!(machine.inner().landed_onto.as_deref(), Some("m0"));
 }
@@ -361,6 +406,7 @@ fn trunk_moving_after_publication_blocks_landing_until_republished() {
         &mut machine,
         &Event::TrunkAdvances { main: "m1".into() }
     ));
+    assert!(apply(&mut machine, &Event::Queue));
     assert!(!apply(&mut machine, &Event::Land));
     for event in [
         Event::Rebase {
@@ -375,4 +421,30 @@ fn trunk_moving_after_publication_blocks_landing_until_republished() {
         assert!(apply(&mut machine, &event), "{event:?}");
     }
     assert_eq!(machine.inner().landed_onto.as_deref(), Some("m1"));
+}
+
+/// Concurrent landings restarted one another (2026-10-16). At the front of
+/// the queue, no other landing moves trunk, so clearance taken there holds.
+#[test]
+fn clearance_taken_at_the_front_of_the_queue_is_never_thrown_away() {
+    let mut machine = Topic::new("h0", "m0", true).machine();
+    for event in [Event::Validate, Event::Publish, Event::Queue, Event::GatePasses] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert!(!apply(
+        &mut machine,
+        &Event::TrunkAdvances { main: "m1".into() }
+    ));
+    assert!(apply(&mut machine, &Event::Land));
+    assert_eq!(machine.inner().landed_onto.as_deref(), Some("m0"));
+
+    // Leaving the queue without landing lets trunk move again.
+    let mut machine = Topic::new("h0", "m0", true).machine();
+    for event in [Event::Validate, Event::Publish, Event::Queue, Event::Dequeue] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert!(apply(
+        &mut machine,
+        &Event::TrunkAdvances { main: "m1".into() }
+    ));
 }

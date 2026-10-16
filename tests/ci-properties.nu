@@ -1046,6 +1046,46 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
 }
 print "ok topic lock"
 
+# The landing queue (2026-10-16): landings that ran at once threw away one
+# another's clearance and restarted, up to five times each. Tickets are drawn
+# in arrival order and never twice, a landing runs only at the front, a dead
+# landing's ticket gives way, and a ticket leaves however its landing ends.
+
+with-env { XDG_STATE_HOME: $outcome_dir } {
+    let queue = (landing-queue-path)
+    assert equal (with-landing-queue 'kxqueue "alone"' { 9 }) 9
+    assert equal (landing-queue $queue) [] "the ticket outlived the landing"
+
+    let live = ({ topic: 'klive "live"' pid: $nu.pid start: (process-start $nu.pid) workspace: "/w/a" } | to json --raw)
+    let dead = ({ topic: 'kdead "dead"' pid: 99999999 start: "1" workspace: "/w/b" } | to json --raw)
+    let drawn = (0..7 | par-each {|_| enqueue-landing $queue $live } | each {|path| landing-ticket-number $path } | sort)
+    assert equal ($drawn | uniq | length) 8 $"concurrent landings drew the same ticket: ($drawn)"
+    assert equal (landing-queue $queue | get number) $drawn
+    ls $queue | get name | each {|path| rm $path } | ignore
+
+    let gone = (enqueue-landing $queue $dead)
+    let front = (enqueue-landing $queue $live)
+    let next = (enqueue-landing $queue $live)
+    assert ((landing-ticket-number $front) < (landing-ticket-number $next)) "a later landing drew a lower ticket"
+    assert equal (landing-queue $queue | get path) [$front $next] "a dead landing kept its place"
+    assert (not ($gone | path exists)) "a dead landing's ticket was not removed"
+    assert equal (landing-queue-wait (landing-queue $queue)) $"Waiting to land behind klive \"live\" \(pid ($nu.pid)) and 1 more."
+    assert equal (landing-queue-wait (landing-queue $queue | first 1)) $"Waiting to land behind klive \"live\" \(pid ($nu.pid))."
+
+    # A landing behind live tickets runs only once every one of them leaves.
+    job spawn { sleep 1sec; rm $front; sleep 1sec; rm $next } | ignore
+    let waited = (with-landing-queue 'kxqueue "behind"' {
+        [$front $next] | all {|path| not ($path | path exists) }
+    })
+    assert $waited "a landing ran before the ones ahead of it left the queue"
+    assert equal (landing-queue $queue) [] "the waiting landing's ticket outlived it"
+
+    let raised = (try { with-landing-queue 'kxqueue "fails"' { error make { msg: "boom" } }; null } catch {|err| $err.msg })
+    assert equal $raised "boom"
+    assert equal (landing-queue $queue) [] "a failed landing kept its ticket"
+}
+print "ok landing queue"
+
 rm --recursive $outcome_dir
 
 # Plan tips: every tip has its own name, and only a divergent change's copies

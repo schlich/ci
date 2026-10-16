@@ -555,10 +555,11 @@ async def land(
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
-    """`ci land`: dispatch, clear the exact head (every flake check by
-    default), fast-forward main on Tangled and GitHub, and tag releases.
-    Only on an explicit user request to deliver the topic. Takes minutes to
-    hours; poll the job."""
+    """`ci land`: dispatch, wait in the machine's landing queue, clear the
+    exact head (every flake check by default), fast-forward main on Tangled
+    and GitHub, and tag releases. Concurrent landings take turns instead of
+    restarting one another. Only on an explicit user request to deliver the
+    topic. Takes minutes to hours; poll the job."""
     args = ["land", "--clearance", clearance, "--timeout", timeout]
     args += ["--attempts", str(attempts)]
     return await run(args, workspace, wait_seconds, default_wait=20)

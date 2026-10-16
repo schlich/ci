@@ -17,6 +17,13 @@ EXTENDS Naturals, FiniteSets, TLC
 (* passed, pushed with a lease on the trunk the topic is based on. No     *)
 (* forge merges: a squash, rebase, or merge commit would put a commit on  *)
 (* main that no gate ran on.                                              *)
+(*                                                                       *)
+(* Landings go through one queue: a topic lands only from its front, and  *)
+(* every other topic lands through the same queue, so trunk never moves   *)
+(* while a topic holds the front. A topic that rebases there keeps the    *)
+(* clearance it then takes. The model leaves out what moves trunk from     *)
+(* outside the queue, such as another machine, which `ci land --attempts`  *)
+(* retries.                                                               *)
 (***************************************************************************)
 
 CONSTANTS Heads, MainHeads
@@ -25,12 +32,12 @@ ASSUME Heads # {} /\ MainHeads # {} /\ Heads \cap MainHeads = {}
 VARIABLES owner, active, head, base, conflict, validated, validatedHead,
           published, publishedHead, publishedValidated, publishedValidationHead,
           publishedConflictFree, publishedFresh, passedHead, parentLanded, mainHead,
-          landedOnto, delivered, workspaceBase
+          landedOnto, delivered, workspaceBase, queued
 
 vars == <<owner, active, head, base, conflict, validated, validatedHead,
           published, publishedHead, publishedValidated, publishedValidationHead,
           publishedConflictFree, publishedFresh, passedHead, parentLanded, mainHead,
-          landedOnto, delivered, workspaceBase>>
+          landedOnto, delivered, workspaceBase, queued>>
 
 (* Facts owned by the outside world: the gate's verdicts, the stack        *)
 (* parent, and other topics landing on trunk.                             *)
@@ -57,6 +64,7 @@ Init ==
     /\ parentLanded \in BOOLEAN
     /\ delivered = FALSE
     /\ workspaceBase = "topic"
+    /\ queued = FALSE
 
 Edit ==
     /\ owner /\ active /\ ~delivered
@@ -66,7 +74,8 @@ Edit ==
     /\ validatedHead' = "none"
     /\ UNCHANGED <<owner, active, base, conflict, published,
                    publishedHead, publishedValidated, publishedValidationHead,
-                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase>>
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase,
+                   queued>>
     /\ UNCHANGED worldVars
 
 (* A rebase onto the current trunk rewrites every commit in the topic, so  *)
@@ -80,7 +89,8 @@ RebaseClean ==
     /\ validatedHead' = "none"
     /\ UNCHANGED <<owner, active, conflict, published,
                    publishedHead, publishedValidated, publishedValidationHead,
-                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase>>
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase,
+                   queued>>
     /\ UNCHANGED worldVars
 
 RebaseConflicted ==
@@ -93,7 +103,7 @@ RebaseConflicted ==
     /\ validatedHead' = "none"
     /\ UNCHANGED <<owner, active, published, publishedHead,
                    publishedValidated, publishedValidationHead, publishedConflictFree, publishedFresh,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
     /\ UNCHANGED worldVars
 
 Resolve ==
@@ -103,7 +113,7 @@ Resolve ==
     /\ validatedHead' = "none"
     /\ UNCHANGED <<owner, active, head, base, published, publishedHead,
                    publishedValidated, publishedValidationHead, publishedConflictFree, publishedFresh,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
     /\ UNCHANGED worldVars
 
 Validate ==
@@ -112,7 +122,8 @@ Validate ==
     /\ validatedHead' = head
     /\ UNCHANGED <<owner, active, head, base, conflict, published,
                    publishedHead, publishedValidated, publishedValidationHead,
-                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase>>
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase,
+                   queued>>
     /\ UNCHANGED worldVars
 
 Publish ==
@@ -126,7 +137,7 @@ Publish ==
     /\ publishedValidationHead' = validatedHead
     /\ publishedConflictFree' = ~conflict
     /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
     /\ UNCHANGED worldVars
 
 (* The gate checks an exact published head (CI on every push, the local   *)
@@ -138,7 +149,7 @@ GatePasses ==
     /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
                    published, publishedHead, publishedValidated, publishedValidationHead,
                    publishedConflictFree, publishedFresh, parentLanded, mainHead,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
 
 (* The stack parent lands; the child is then based on trunk. *)
 ParentLands ==
@@ -147,23 +158,46 @@ ParentLands ==
     /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
                    published, publishedHead, publishedValidated, publishedValidationHead,
                    publishedConflictFree, publishedFresh, passedHead, mainHead,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
 
-(* Another topic lands first and moves trunk. *)
+(* Another topic lands first and moves trunk. It lands from the front of  *)
+(* the landing queue, so not while this topic holds the front.             *)
 TrunkAdvances ==
-    /\ ~delivered
+    /\ ~delivered /\ ~queued
     /\ \E m \in MainHeads \ {mainHead} :
          /\ mainHead' = m
     /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
                    published, publishedHead, publishedValidated, publishedValidationHead,
                    publishedConflictFree, publishedFresh, passedHead, parentLanded,
-                   landedOnto, delivered, workspaceBase>>
+                   landedOnto, delivered, workspaceBase, queued>>
 
-(* `ci land` fast-forwards main to the exact head the gate passed. The     *)
-(* push carries a lease on the trunk the topic is based on, so it fails if *)
-(* trunk moved, and the topic must rebase, republish, and pass again.      *)
+(* `ci land` reaches the front of the landing queue, once the topic is    *)
+(* published and its fast checks have passed.                             *)
+Queue ==
+    /\ owner /\ active /\ published /\ ~delivered /\ ~queued
+    /\ queued' = TRUE
+    /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
+                   published, publishedHead, publishedValidated, publishedValidationHead,
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase>>
+    /\ UNCHANGED worldVars
+
+(* A landing that stops short, on a conflict or a failed gate, leaves the  *)
+(* queue without landing.                                                 *)
+Dequeue ==
+    /\ queued /\ ~delivered
+    /\ queued' = FALSE
+    /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
+                   published, publishedHead, publishedValidated, publishedValidationHead,
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, workspaceBase>>
+    /\ UNCHANGED worldVars
+
+(* `ci land` fast-forwards main to the exact head the gate passed, from    *)
+(* the front of the landing queue, which it then leaves. The push carries *)
+(* a lease on the trunk the topic is based on, so it fails if trunk moved, *)
+(* and the topic must rebase, republish, and pass again.                  *)
 Land ==
     /\ owner /\ active /\ published /\ ~conflict /\ ~delivered
+    /\ queued
     /\ parentLanded
     /\ publishedHead = head
     /\ passedHead = head
@@ -171,6 +205,7 @@ Land ==
     /\ landedOnto' = mainHead
     /\ mainHead' = head
     /\ delivered' = TRUE
+    /\ queued' = FALSE
     /\ UNCHANGED <<owner, active, head, base, conflict, validated, validatedHead,
                    published, publishedHead, publishedValidated, publishedValidationHead,
                    publishedConflictFree, publishedFresh, passedHead, parentLanded, workspaceBase>>
@@ -186,7 +221,7 @@ Finish ==
     /\ workspaceBase' \in {"main", "dropped"}
     /\ UNCHANGED <<head, base, conflict, validated, validatedHead, published,
                    publishedHead, publishedValidated, publishedValidationHead,
-                   publishedConflictFree, publishedFresh, landedOnto, delivered>>
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, queued>>
     /\ UNCHANGED worldVars
 
 (* Abandoning discards unpublished work, conflicts included. The model    *)
@@ -199,12 +234,12 @@ Abandon ==
     /\ workspaceBase' \in {"main", "dropped"}
     /\ UNCHANGED <<head, base, validated, validatedHead, published,
                    publishedHead, publishedValidated, publishedValidationHead,
-                   publishedConflictFree, publishedFresh, landedOnto, delivered>>
+                   publishedConflictFree, publishedFresh, landedOnto, delivered, queued>>
     /\ UNCHANGED worldVars
 
 Next == Edit \/ RebaseClean \/ RebaseConflicted \/ Resolve \/ Validate
         \/ Publish \/ GatePasses \/ ParentLands \/ TrunkAdvances
-        \/ Land \/ Finish \/ Abandon
+        \/ Queue \/ Dequeue \/ Land \/ Finish \/ Abandon
 
 Spec == Init /\ [][Next]_vars
 
@@ -228,6 +263,7 @@ TypeOK ==
     /\ landedOnto \in MainHeads \cup {"none"}
     /\ delivered \in BOOLEAN
     /\ workspaceBase \in {"topic", "main", "dropped"}
+    /\ queued \in BOOLEAN
 
 NoPublishWhileUnsafe ==
     published => publishedHead \in Heads /\ publishedValidated /\ publishedConflictFree
@@ -252,5 +288,16 @@ LandsAfterParent == delivered => parentLanded
 (* Landing fast-forwards from the trunk the topic was based on: main moved *)
 (* from the topic's own base, never from a trunk the gate did not test.   *)
 LandingIsFastForward == delivered => landedOnto = base
+(* Only a published topic that its owner is still landing holds the front *)
+(* of the landing queue.                                                  *)
+QueuedOnlyWhileLanding == queued => owner /\ active /\ published /\ ~delivered
+
+(* While a topic holds the front of the landing queue, trunk stays put, so  *)
+(* a topic that rebased there stays on trunk, and the clearance it takes   *)
+(* is never thrown away: no landing restarts because another one landed.  *)
+QueuedTopicStaysOnTrunk ==
+    [][queued /\ queued' /\ base = mainHead => base' = mainHead']_vars
+(* A topic lands only from the front of the landing queue. *)
+LandsFromQueue == [][~delivered /\ delivered' => queued]_vars
 
 ===============================================================

@@ -41,6 +41,9 @@ pub struct Locks {
     pub checks: Option<Holder>,
     /// Topics being dispatched or landed, by full change id.
     pub topics: Vec<(String, Holder)>,
+    /// The landing queue, front first: the landing that may move main, then
+    /// those waiting behind it.
+    pub landing: Vec<Holder>,
 }
 
 /// A process's start time in clock ticks since boot, as ci's process-start.
@@ -132,7 +135,27 @@ impl LockReader {
             })
             .unwrap_or_default();
         topics.sort_by(|a, b| a.0.cmp(&b.0));
-        Locks { checks, topics }
+        // ci's landing-queue: tickets named by their number, lowest first.
+        let mut tickets: Vec<(u64, PathBuf)> = fs::read_dir(dir.join("landing-queue"))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                    .filter_map(|p| Some((p.file_stem()?.to_str()?.parse().ok()?, p)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tickets.sort();
+        let landing = tickets
+            .iter()
+            .filter_map(|(_, p)| holder(p, &mut self.units))
+            .collect();
+        Locks {
+            checks,
+            topics,
+            landing,
+        }
     }
 }
 

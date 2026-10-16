@@ -93,6 +93,7 @@ impl Observation {
             passed,
             parent_landed: true,
             landed_onto: None,
+            queued: false,
         };
         let state = if matches!(self.owner.as_str(), "delivered" | "discarded") {
             State::released(Workspace::Main, self.owner == "delivered")
@@ -183,36 +184,40 @@ impl Observation {
     }
 }
 
-/// The protocol steps the machine accepts, tried on a copy of it.
+/// The protocol steps the machine accepts, tried on a copy of it. `ci land`
+/// joins the landing queue and lands from its front, so its step is both.
 fn allowed(machine: &Machine) -> Vec<&'static str> {
     let steps = [
         (
             "rebase",
-            Event::Rebase {
+            vec![Event::Rebase {
                 head: "rebased".into(),
                 conflicted: false,
-            },
+            }],
         ),
-        ("resolve", Event::Resolve),
-        ("validate", Event::Validate),
-        ("publish", Event::Publish),
-        ("land", Event::Land),
+        ("resolve", vec![Event::Resolve]),
+        ("validate", vec![Event::Validate]),
+        ("publish", vec![Event::Publish]),
+        ("land", vec![Event::Queue, Event::Land]),
         (
             "finish",
-            Event::Finish {
+            vec![Event::Finish {
                 workspace: Workspace::Main,
-            },
+            }],
         ),
         (
             "abandon",
-            Event::Abandon {
+            vec![Event::Abandon {
                 workspace: Workspace::Main,
-            },
+            }],
         ),
     ];
     steps
         .into_iter()
-        .filter(|(_, event)| apply(&mut machine.clone(), event))
+        .filter(|(_, events)| {
+            let mut copy = machine.clone();
+            events.iter().all(|event| apply(&mut copy, event))
+        })
         .map(|(name, _)| name)
         .collect()
 }

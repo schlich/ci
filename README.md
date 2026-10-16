@@ -178,22 +178,40 @@ the repository by owner and name or by its repository DID; a trunk remote
 that is not on Tangled skips the pull request link.
 
 `ci land` is the only way a change reaches `main`. It dispatches the topic,
-which rebases it onto `main@tangled`; for a declared refactor, it proves that
-every NixOS closure matches that base. The proof compares the head with the
+which rebases it onto `main@tangled`. Then it runs the checks that fail fast:
+a stacked topic must wait for its parent to land, and a declared refactor
+must leave every NixOS closure as it was at that base. The proof compares the head with the
 commit it forks from, found once the proof holds the local checks lock, so a
-topic that lands while it waits is never counted as this one's change. It then
-passes that exact commit
-through the landing clearance, fast-forwards `main` to it, and tags any release.
+topic that lands while it waits is never counted as this one's change. Next
+the topic joins the landing queue, described below. Once at its front, `ci
+land` passes the exact commit through the landing clearance, fast-forwards
+`main` to it, mirrors it, and tags any release.
 `main` therefore holds only commits that were tested as they are, and history
-stays linear without squashing. Other workspaces land into the same trunk, so
-once clearance passes, `ci land` fetches `main@tangled` again, and the push
-of `main` carries JJ's lease on it. If another topic landed while clearance
-ran, `ci land` leaves `main` alone and starts again from the new trunk:
-it rebases and redispatches the topic and waits for clearance on the new
-head, up to `--attempts` times (default 5). A rebase conflict or failed
-clearance still stops it. A stacked
-topic lands after its parent. `ci dispatch --land` dispatches and lands in one
-step.
+stays linear without squashing. A stacked topic lands after its parent.
+`ci dispatch --land` dispatches and lands in one step.
+
+Every `ci land` on this machine waits its turn in one landing queue,
+`$XDG_STATE_HOME/jj-ci/landing-queue/`, shared by every workspace and
+session. Each waiting landing holds a ticket there, numbered in arrival
+order, and only the lowest live ticket may move `main`. From the front, a
+landing rebases onto `main@tangled` only if `main` moved while it waited,
+runs the fast checks again on the new head, and takes clearance. No other
+landing here moves `main` until it is done, so it never restarts and N
+landings at once cost about N clearances. Before the queue, they restarted
+one another: on 2026-10-16, landings that took 4 minutes alone took 30 to 77
+minutes each when five ran at once, and two never landed. While landings are
+ahead of it, `ci land` prints and reports, as a `blocked` record under
+`landing-queue`, `Waiting to land behind <topic> (pid N) and K more.`, so
+`watch-job` and `ci tower` show the wait. A landing that exits, however it
+ends, leaves the queue, and one that was killed is dropped by the next
+landing to look.
+
+Something outside the queue can still move `main`: another machine, or a push
+by hand. The push of `main` therefore still carries JJ's lease on it, and
+when clearance passes `ci land` fetches `main@tangled` again. If `main`
+moved, it leaves `main` alone, rebases and redispatches the topic, and takes
+clearance again on the new head, up to `--attempts` times (default 5). A
+rebase conflict or failed clearance still stops it.
 
 The installed `ci`, the dev shell's, and the ci MCP server's are one launcher
 (`ci-launch.nu`) that picks the `ci.nu` to run each time it starts. Other
@@ -264,6 +282,12 @@ Each topic also has its own lock while `ci dispatch` or `ci land` moves it,
 same topic at once rebased it separately and split it into divergent copies,
 so a second `ci` that finds a live holder fails at once, naming its pid and
 workspace, rather than waiting to move the topic again. Let that run finish.
+
+These locks are always taken in one order: the topic lock, which nothing
+waits for, then the landing queue, then the local checks lock. Nothing that
+holds the local checks lock waits for the queue, so no two `ci` processes can
+deadlock. `ci tower` shows the landing at the front of the queue as LANDING
+and those behind it as QUEUED.
 
 Other sessions' work cannot stop a landing either. The plan that places a
 topic names every other topic's tip by commit, so a divergent change in some

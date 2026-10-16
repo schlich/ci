@@ -658,6 +658,111 @@ def with-topic-lock [change: string, body: closure] {
     $outcome.value
 }
 
+# Concurrent landings restarted one another (2026-10-16): each rebased, took
+# clearance, and fast-forwarded main outside any lock, so a topic that landed
+# while another's clearance ran threw that clearance away. Landings that ran
+# alone took about 4 minutes; five at once took 30 to 77 minutes each, and two
+# never landed. So landing is a queue shared by every workspace and session
+# on this machine: each waiting landing holds a ticket, numbered in arrival
+# order, and only the lowest live ticket may rebase onto main, take
+# clearance, fast-forward main, and tag releases. A landing rebases once it
+# reaches the front, onto a main that no other landing here moves until it
+# is done, so N landings cost about N clearances.
+#
+# Locks are taken in one order, so no two processes ever wait on each other:
+# a topic lock (never waited for), then the landing queue, then the local
+# checks lock. Nothing that holds the local checks lock waits for the queue.
+def landing-queue-path [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "landing-queue"
+}
+
+# The number of the ticket at `path`, or null for any other file.
+def landing-ticket-number [path: string] {
+    let parsed = ($path | path parse)
+    if $parsed.extension != "json" { return null }
+    try { $parsed.stem | into int } catch { null }
+}
+
+# Take a ticket behind every landing already waiting: one more than the
+# highest ticket in `queue`, drawn under flock(1) on a guard file, so two
+# landings that arrive together never draw the same number and a later
+# arrival never draws a lower one. The ticket is renamed into place whole, so
+# no reader sees half of one. Returns its path.
+def enqueue-landing [queue: string, claim: string] {
+    let take = 'let numbers = (ls $env.QUEUE | get name | each {|path| let parsed = ($path | path parse); if $parsed.extension == "json" { try { $parsed.stem | into int } catch { null } } } | compact); let next = ($numbers | append 0 | math max) + 1; let path = ($env.QUEUE | path join $"($next | fill --alignment right --character "0" --width 12).json"); $env.CLAIM | save --force $"($path).tmp"; mv --force $"($path).tmp" $path; print --no-newline $path'
+    let result = (with-env { QUEUE: $queue CLAIM: $claim } {
+        ^flock ($queue | path join ".guard") $nu.current-exe --no-config-file --commands $take | complete
+    })
+    if $result.exit_code != 0 {
+        error make { msg: $"joining the landing queue in ($queue) failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
+    }
+    $result.stdout | str trim
+}
+
+# The live tickets in `queue`, oldest first, as { number, path, holder }. A
+# ticket whose landing has exited, or that cannot be read, is removed, so a
+# landing that was killed never holds up the ones behind it.
+def landing-queue [queue: string] {
+    ls $queue | get name | each {|path|
+        let number = (landing-ticket-number $path)
+        if $number == null { return null }
+        let holder = (try { open --raw $path | from json } catch { null })
+        if $holder != null and (try { lock-holder-alive $holder } catch { false }) {
+            { number: $number path: $path holder: $holder }
+        } else {
+            rm --force $path
+            null
+        }
+    } | compact | sort-by number
+}
+
+# What a landing waiting behind the live tickets `ahead` reports: the landing
+# at the front, and how many more wait between it and this one.
+def landing-queue-wait [ahead: list] {
+    let front = ($ahead | first | get holder)
+    let more = ($ahead | length) - 1
+    let others = if $more > 0 { $" and ($more) more" } else { "" }
+    $"Waiting to land behind ($front.topic? | default 'another topic') \(pid ($front.pid? | default '?'))($others)."
+}
+
+# Run `body` once this landing, named `topic`, reaches the front of the
+# landing queue. While landings are ahead of it, it reports blocked under
+# `landing-queue` whenever the front or the count changes, so `watch-job`
+# shows the wait. The ticket leaves the queue however `body` ends; if this
+# process is killed instead, the next landing finds it dead and drops it.
+def with-landing-queue [topic: string, body: closure] {
+    let queue = (landing-queue-path)
+    mkdir $queue
+    let claim = ({
+        topic: $topic
+        pid: $nu.pid
+        start: (process-start $nu.pid)
+        workspace: $env.PWD
+    } | to json --raw)
+    let ticket = (enqueue-landing $queue $claim)
+    let number = (landing-ticket-number $ticket)
+    let outcome = try {
+        mut announced = ""
+        loop {
+            let ahead = (landing-queue $queue | where number < $number)
+            if ($ahead | is-empty) { break }
+            let waiting = (landing-queue-wait $ahead)
+            if $waiting != $announced {
+                print $waiting
+                # Blocked on other landings, not a person, so no --kind.
+                report-status blocked $waiting --id landing-queue
+                $announced = $waiting
+            }
+            sleep 5sec
+        }
+        if $announced != "" { report-status clear --id landing-queue }
+        { value: (do $body) error: null }
+    } catch {|err| { value: null error: $err.msg } }
+    rm --force $ticket
+    if $outcome.error != null { error make { msg: $outcome.error } }
+    $outcome.value
+}
+
 # How a nix-fast-build run that exited with `exit_code` went, judged by the
 # result file it writes once it finishes. A signal, or a failure that left no
 # failed build or evaluation there, means something killed the run rather
@@ -2704,34 +2809,21 @@ def publish-topic [] {
     { branch: $branch parent: $parent impact: $impact head: (current-change "commit_id") }
 }
 
-# Land a published topic. A declared refactor must leave every closure
-# unchanged, and the gate must pass the exact head; main then fast-forwards
-# to that commit, so main only ever holds tested trees. If main moved while the
-# gate ran, landing would not be a fast-forward of what was tested, so this
-# returns false without touching main and the caller starts over from the new
-# main. Delivery is never a squash, rebase, or merge on a forge: both remotes
-# receive the same commits.
-def land-published [published: record, timeout: duration, gate: string] {
-    if $published.parent != null {
-        error make { msg: $"This topic is stacked on ($published.parent). Land that topic first, then land this one." }
-    }
-    let checker = (landing-gate $gate)
+# Fast-forward main on the trunk remote to `head`, which clearance passed,
+# then mirror it and tag a release for each user-facing revision in
+# `base..head`. `label` names what landed. If main moved since `head` was
+# rebased onto it, landing would not be a fast-forward of what was tested, so
+# this returns false without touching main. Delivery is never a squash,
+# rebase, or merge on a forge: both remotes receive the same commits.
+def advance-main [head: string, base: string, label: string] {
     let trunk = (trunk)
     let remote = $trunk.remote
     let main = $trunk.bookmark
-    # Other workspaces share this repository, so trunk() may already have
-    # moved past the commit the head was rebased onto.
-    let base = (fork-point "trunk()" $published.head)
-    if $published.impact == "refactor" {
-        phase closures "Proving every NixOS closure unchanged" { require-closure-neutral "trunk()" $published.head }
-    }
-    if $gate == "github" { push-bookmark $GITHUB_REMOTE $published.branch }
-    print $"Waiting for ($checker.name) to pass ($published.head | str substring 0..11)."
-    wait-for-pipeline $checker $published.head $timeout
-    # Other workspaces share this repository and may have landed meanwhile.
+    # The landing queue keeps other landings on this machine from moving main,
+    # but another machine, or a push by hand, still may.
     fetch-trunk
-    if not (contains-main $published.head) { return false }
-    run-command $"advancing ($main)" { ^jj bookmark set $main -r $published.head } | ignore
+    if not (contains-main $head) { return false }
+    run-command $"advancing ($main)" { ^jj bookmark set $main -r $head } | ignore
     # The first landing creates the bookmark on the trunk remote, which jj
     # pushes only once the bookmark is tracked there.
     if (revset-change-ids (remote-bookmark-revset $main $remote) | is-empty) {
@@ -2739,37 +2831,82 @@ def land-published [published: record, timeout: duration, gate: string] {
     }
     let pushed = (remote-complete $"advancing ($main)" { ^jj git push --remote $remote --bookmark $main })
     if $pushed.exit_code != 0 {
-        # The lease lost a race with a landing after the fetch above. Put the
+        # The lease lost a race with a push after the fetch above. Put the
         # local bookmark back on the trunk so the retry starts from it.
         fetch-trunk
-        if not (contains-main $published.head) {
+        if not (contains-main $head) {
             run-command $"resetting ($main)" { ^jj bookmark set $main -r "trunk()" --allow-backwards } | ignore
             return false
         }
         error make { msg: $"landing on ($remote) failed with exit code ($pushed.exit_code): ($pushed.stderr | str trim)" }
     }
-    report-status done $"Landed ($published.branch) on main at ($published.head | str substring 0..11)" --id land
+    report-status done $"Landed ($label) on main at ($head | str substring 0..11)" --id land
     mirror-main
-    cut-releases $"($base)..($published.head)" false
+    cut-releases $"($base)..($head)" false
+    true
+}
+
+# Land a published topic that holds the front of the landing queue: the gate
+# must pass the exact head, and main then fast-forwards to that commit, so
+# main only ever holds tested trees. Returns false when main moved anyway.
+def land-published [published: record, timeout: duration, gate: string] {
+    let checker = (landing-gate $gate)
+    # Other workspaces share this repository, so trunk() may already have
+    # moved past the commit the head was rebased onto.
+    let base = (fork-point "trunk()" $published.head)
+    if $gate == "github" { push-bookmark $GITHUB_REMOTE $published.branch }
+    print $"Waiting for ($checker.name) to pass ($published.head | str substring 0..11)."
+    wait-for-pipeline $checker $published.head $timeout
+    if not (advance-main $published.head $base $published.branch) { return false }
     print $"Landed ($published.branch) on main. `ci park` frees the workspace."
     true
 }
 
-# Land a published topic, starting over when main moves under it. Each retry
-# republishes (rebasing onto the new main and validating) and waits for the
-# gate to pass the new head; a rebase conflict or a failing gate still stops.
-def land-with-retries [published: record, timeout: duration, gate: string, attempts: int] {
-    if $attempts < 1 { error make { msg: "--attempts must be at least 1." } }
-    mut current = $published
-    for attempt in 1..$attempts {
-        if (land-published $current $timeout $gate) { return }
-        if $attempt == $attempts { break }
-        let retry = $"main moved while the gate ran; rebasing onto the new main and trying again \(attempt ($attempt + 1) of ($attempts))."
-        print $retry
-        report-status working $retry --id land
-        $current = (publish-topic)
+# Fail now on what would otherwise fail only after clearance: a stacked topic
+# cannot land before its parent, and a declared refactor must leave every
+# closure unchanged. A refactor once proved at `proven` is not proved again
+# while its head stays the same. On 2026-10-16 a refactor's proof ran only
+# after a restart, and the landing failed 16 minutes after it started.
+def require-landable [published: record, proven?: string] {
+    if $published.parent != null {
+        error make { msg: $"This topic is stacked on ($published.parent). Land that topic first, then land this one." }
     }
-    error make { msg: $"main moved during each of ($attempts) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+    if $published.impact == "refactor" and $published.head != $proven {
+        phase closures "Proving every NixOS closure unchanged" { require-closure-neutral "trunk()" $published.head }
+    }
+}
+
+# Land a published topic through the landing queue. The fast checks run
+# before it joins the queue, so a topic that cannot land fails before it
+# waits. Once at the front, it rebases onto main only if main moved while it
+# waited, runs the fast checks again on the new head, and takes clearance. No
+# other landing on this machine moves main from then on; only something else
+# can, such as another machine or a push by hand, and `attempts` bounds how
+# many times that may send it back to rebase and take clearance again. A
+# rebase conflict or failed clearance still stops it.
+def land-queued [published: record, timeout: duration, gate: string, attempts: int] {
+    if $attempts < 1 { error make { msg: "--attempts must be at least 1." } }
+    require-landable $published
+    with-landing-queue (lock-topic $published.head) {
+        mut current = $published
+        for attempt in 1..$attempts {
+            fetch-trunk
+            if not (contains-main $current.head) {
+                let moved = "main moved while this landing waited; rebasing onto it."
+                print $moved
+                report-status working $moved --id land
+                let proven = $current.head
+                $current = (publish-topic)
+                require-landable $current $proven
+            }
+            if (land-published $current $timeout $gate) { return }
+            if $attempt == $attempts { break }
+            let retry = $"main moved outside the landing queue while clearance ran; rebasing onto the new main and trying again \(attempt ($attempt + 1) of ($attempts))."
+            print $retry
+            report-status working $retry --id land
+        }
+        error make { msg: $"main moved outside the landing queue during each of ($attempts) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+    }
 }
 
 # Fast-forward GitHub's main to the trunk's. The trunk is authoritative, so a
@@ -2800,7 +2937,7 @@ def "main dispatch" [
     --land # Land the topic once it has clearance
     --clearance: string = "local" # What must pass the head before --land: local, spindle, or github
     --timeout: duration = 2hr # How long --land waits for the pipeline
-    --attempts: int = 5 # How many times --land starts over when main moves
+    --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
     --stack # Push one branch per revision for Tangled's stacked pull requests
 ] {
     if $stack {
@@ -2830,7 +2967,7 @@ def "main dispatch" [
             }
             print $"Impact: ($published.impact)"
             if $land {
-                land-with-retries $published $timeout $clearance $attempts
+                land-queued $published $timeout $clearance $attempts
             } else {
                 print "Dispatched this topic in place. Further edits update the same JJ series and branch; `ci land` delivers it."
             }
@@ -2842,7 +2979,7 @@ def "main publish" [
     --land # Land the topic once it has clearance
     --gate: string = "local" # What must pass the head before --land: local, spindle, or github
     --timeout: duration = 2hr # How long --land waits for the pipeline
-    --attempts: int = 5 # How many times --land starts over when main moves
+    --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
 ] {
     renamed "publish" "dispatch"
     main dispatch --land=$land --clearance $gate --timeout $timeout --attempts $attempts
@@ -2852,7 +2989,7 @@ def "main land" [
     --clearance: string = "local" # What must pass the head: local, spindle, or github
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
-    --attempts: int = 5 # How many times to start over when main moves
+    --attempts: int = 5 # How many times to start over when something outside the landing queue moves main
 ] {
     let cleared_by = if $gate == null { $clearance } else {
         print --stderr "`ci land --gate` is now `ci land --clearance`."
@@ -2861,7 +2998,7 @@ def "main land" [
     report-run "Landed the topic" {
         with-topic-lock (current-topic-id) {
             let published = (publish-topic)
-            land-with-retries $published $timeout $cleared_by $attempts
+            land-queued $published $timeout $cleared_by $attempts
         }
     }
 }

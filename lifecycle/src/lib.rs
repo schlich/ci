@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! topic                         GatePasses, ParentLands; rejects the rest
-//! ├── working                   Edit, TrunkAdvances, Abandon
+//! ├── working                   Edit, TrunkAdvances, Queue, Dequeue, Abandon
 //! │   ├── clean                 Rebase, Validate, Land, Finish
 //! │   │   ├── editing
 //! │   │   └── validated         Publish
@@ -17,9 +17,11 @@
 //!
 //! `owner` and `active` hold exactly outside `released`, `conflict` is the
 //! `conflicted` state, and `validated` is the `validated` state, whose head
-//! is always the current one. `tests/spec.rs` checks every transition of the
-//! bounded model against the TLA+ actions and every invariant against the
-//! reachable states.
+//! is always the current one. Holding the front of the landing queue is a
+//! fact, `queued`, rather than a state, since a topic keeps editing and
+//! rebasing there. `tests/spec.rs` checks every transition of the bounded
+//! model against the TLA+ actions, every invariant against the reachable
+//! states, and every action property against the transitions.
 
 pub mod stage;
 
@@ -58,7 +60,12 @@ pub enum Event {
     ParentLands,
     /// Another topic landed and moved trunk.
     TrunkAdvances { main: Commit },
-    /// `ci land` fast-forwarded main to the head the gate passed.
+    /// `ci land` reached the front of the landing queue.
+    Queue,
+    /// `ci land` left the landing queue without landing.
+    Dequeue,
+    /// `ci land` fast-forwarded main to the head the gate passed, from the
+    /// front of the landing queue, which it then left.
     Land,
     /// `ci park` released a delivered or unpublished topic.
     Finish { workspace: Workspace },
@@ -91,6 +98,9 @@ pub struct Topic {
     pub parent_landed: bool,
     /// The trunk that landing fast-forwarded from.
     pub landed_onto: Option<Commit>,
+    /// Whether the topic holds the front of the landing queue, where trunk
+    /// moves for no other landing.
+    pub queued: bool,
 }
 
 /// Collects whether the machine accepted an event; only the `topic`
@@ -114,6 +124,7 @@ impl Topic {
             passed: None,
             parent_landed,
             landed_onto: None,
+            queued: false,
         }
     }
 
@@ -139,6 +150,7 @@ impl Topic {
             && self.passed.as_ref() == Some(&self.head)
             && self.parent_landed
             && self.base == self.main
+            && self.queued
     }
 }
 
@@ -182,8 +194,18 @@ impl Topic {
                 self.head = head.clone();
                 Transition(State::editing())
             }
-            Event::TrunkAdvances { main } if *main != self.main => {
+            // Other topics land from the front of the same queue, so not
+            // while this one holds it.
+            Event::TrunkAdvances { main } if *main != self.main && !self.queued => {
                 self.main = main.clone();
+                Handled
+            }
+            Event::Queue if !self.queued && self.publication.is_some() => {
+                self.queued = true;
+                Handled
+            }
+            Event::Dequeue if self.queued => {
+                self.queued = false;
                 Handled
             }
             // Abandoning discards unpublished work, conflicts included.
@@ -210,10 +232,12 @@ impl Topic {
             }
             Event::Validate => Transition(State::validated()),
             // A fast-forward of main to the exact head a gate passed, with a
-            // lease on the trunk the topic is based on.
+            // lease on the trunk the topic is based on, from the front of the
+            // landing queue.
             Event::Land if self.can_land() => {
                 self.landed_onto = Some(self.main.clone());
                 self.main = self.head.clone();
+                self.queued = false;
                 Transition(State::delivered())
             }
             Event::Finish { workspace } if self.publication.is_none() => {

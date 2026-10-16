@@ -1816,6 +1816,29 @@ fn draw_trunk_side(frame: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled("free", theme.faint())],
         )),
     }
+    for (place, holder) in app.locks.landing.iter().enumerate() {
+        let (label, color) = if place == 0 {
+            ("LANDING", theme.warn)
+        } else {
+            ("QUEUED", theme.accent)
+        };
+        lines.push(field(
+            theme,
+            label,
+            vec![Span::styled(
+                truncate(
+                    &format!(
+                        "{} \"{}\" · pid {}",
+                        holder.change(),
+                        holder.title(),
+                        holder.pid
+                    ),
+                    text_w,
+                ),
+                theme.fg(color),
+            )],
+        ));
+    }
     for (_, holder) in &app.locks.topics {
         lines.push(field(
             theme,
