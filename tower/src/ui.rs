@@ -2140,7 +2140,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, app: &App) {
         Action::Dispatch => "Rebases onto main@tangled, runs preflight, and pushes the topic branch to Tangled.",
         Action::Land => "Dispatches, builds every flake check on this machine (holding the local checks lock), then fast-forwards main on Tangled and GitHub and tags any release.",
         Action::Park => "Checks that the topic landed, deletes its branch, and frees the workspace.",
-        Action::Cancel => "Deletes the topic branch and abandons its revisions above trunk. `jj op restore` with the printed checkpoint recovers it.",
+        Action::Cancel => "Deletes the topic branch and abandons its revisions above trunk. `ci recover` with the printed checkpoint recovers it.",
         Action::StopRun => "Sends SIGTERM to the run's process group. ci checkpoints before history surgery; inspect the workspace afterwards.",
         other => other.about(),
     };

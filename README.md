@@ -307,8 +307,9 @@ run it. It refuses while a live session owns the workspace.
 `ci cancel` drops a topic that will not land. It refuses while a Tangled
 pull request from the topic's branch is open, records a checkpoint, deletes
 the topic bookmark, abandons the revisions above `main@tangled`, and releases
-the workspace like `park`. `jj op restore` with the printed operation
-recovers it.
+the workspace like `park`. `ci recover` with the printed checkpoint, run from
+any workspace, brings back the revisions and the local bookmark; the deleted
+remote branch returns with the next dispatch.
 
 Workspace lifetime follows ownership rather than garbage collection:
 `ci start` creates a workspace for one concurrent actor's topic, and `park`
@@ -355,8 +356,29 @@ Run `ci conflicts` between revisions. Once it reports no conflicts, run
 
 The rebase itself has already completed when the conflict report appears. Do
 not run `ci rebase` again while conflicts remain; doing so would attempt to
-move an already-rebased topic a second time. If a resolution goes wrong, use
-the printed checkpoint with `jj op restore` and retry from the pre-rebase state.
+move an already-rebased topic a second time. To start over from the
+pre-rebase state instead, run `ci recover` with the printed checkpoint before
+resolving anything.
+
+### Recovering a checkpoint
+
+Every command that rewrites history (`rebase`, a restack in `dispatch` or
+`land`, `sequence --apply`, `sync`, `park`, and `cancel`) first prints
+`Recovery point: ci recover ID`, and passes that ID to each JJ command of the
+rewrite as `--config ci.checkpoint="ID"`. JJ records a command's arguments on
+every operation it makes, so `ci recover ID` (or plain `ci recover` for the
+workspace's latest checkpoint) reverts exactly the rewrite's operations,
+newest first, with `jj op revert`. Fetches and pushes are not part of it.
+Every other operation since the checkpoint stays, including other
+workspaces' dispatches and landings. `ci recover` refuses once someone has
+resolved, edited, or abandoned a commit the rewrite made, since reverting
+then would fork that work, and refuses a checkpoint it already recovered.
+
+Never `jj op restore` a recovery point: it rewinds the whole repository,
+every workspace included. On 2026-10-16 a session restored a failed
+landing's recovery point 14 seconds after it was recorded and undid another
+workspace's dispatch in between, which left that topic's pushed bookmark
+untracked and its commit immutable.
 
 ### Stale workspaces
 

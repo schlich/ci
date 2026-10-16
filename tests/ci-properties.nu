@@ -944,6 +944,84 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $proof_config } {
 rm --recursive --force $proof_repo $proof_config
 print "ok closure proof while trunk advances"
 
+# Recovery from a failed restack with another workspace busy (2026-10-16): a
+# landing in one workspace restacked its topic into a conflict, another
+# workspace dispatched its own topic, and a `jj op restore` of the landing's
+# recovery point 14 seconds later undid that dispatch too, leaving its pushed
+# bookmark untracked. `ci recover` reverts only the landing's rewrite.
+
+let recovery_repo = (mktemp --directory --tmpdir ci-recovery-XXXXXX)
+let recovery_remote = (mktemp --directory --tmpdir ci-recovery-remote-XXXXXX)
+let recovery_other = $"($recovery_repo)-other"
+let recovery_config = (mktemp --tmpdir ci-recovery-jj-XXXXXX.toml)
+'user.name = "ci"
+user.email = "ci@example.invalid"
+revset-aliases."trunk()" = "latest(present(main@tangled) | root())"
+' | save --force $recovery_config
+^git init --quiet --bare $recovery_remote
+with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $recovery_config } {
+    cd $recovery_repo
+    ^jj git init --quiet
+    ^jj git remote add tangled $recovery_remote
+    "base" | save --force f
+    ^jj commit --quiet -m base
+    ^jj bookmark create --quiet main -r @-
+    ^jj bookmark track --quiet main@tangled
+    ^jj git push --quiet --remote tangled --bookmark main
+    let base = (revision-id "main")
+    ^jj new --quiet $base
+    "parent" | save --force f
+    ^jj commit --quiet -m "parent topic"
+    ^jj bookmark create --quiet jj-parent -r @-
+    ^jj new --quiet $base
+    "topic" | save --force f
+    ^jj describe --quiet -m "landing topic"
+    let topic = (revision-id "@")
+    ^jj workspace add --quiet --name other --revision $base $recovery_other
+    "other" | save --force ($recovery_other | path join g)
+    ^jj --repository $recovery_other describe --quiet -m "dispatched topic"
+    let other = (revision-id "other@")
+
+    # The landing's restack conflicts and fails, pointing at `ci recover`.
+    let failed = (try { restack-topic "jj-parent"; null } catch {|err| $err.msg })
+    assert ($failed != null and ($failed | str contains "ci recover ")) $"the failed restack does not name its recovery: ($failed)"
+    assert (conflicted-revisions | is-not-empty) "the restack did not conflict"
+    let checkpoint = ($failed | parse --regex 'ci recover (?P<id>[^`]+)`' | get 0.id)
+    let recorded = (open ($recovery_repo | path join ".jj" "jj-ci-checkpoints" $checkpoint) | from json)
+
+    # Meanwhile the other workspace dispatches, as `ci dispatch` does.
+    ^jj --repository $recovery_other bookmark set --quiet jj-other -r @
+    ^jj --repository $recovery_other bookmark track --quiet jj-other@tangled
+    ^jj --repository $recovery_other git push --quiet --remote tangled --bookmark jj-other
+    let missing = (^jj --at-op $recorded.operation bookmark list jj-other | complete | get stdout | str trim)
+    assert ($missing | is-empty) "the dispatch predates the checkpoint, so restoring it would prove nothing"
+
+    let rewrite = (checkpoint-operations (operation-log) $checkpoint)
+    assert equal ($rewrite | length) 1 $"the restack tagged other operations: ($rewrite | get description)"
+    main recover
+    assert equal (revision-id "@") $topic "recovery did not put the landing topic back"
+    assert (conflicted-revisions | is-empty) "recovery left the restack's conflict"
+    assert equal (revision-id "jj-other") $other "recovery moved the other workspace's bookmark"
+    let tracked = (^jj bookmark list --tracked jj-other -T 'name ++ "@" ++ remote ++ "\n"' | complete | get stdout | lines)
+    assert ("jj-other@tangled" in $tracked) $"recovery untracked the other workspace's pushed bookmark: ($tracked)"
+    assert equal (revision-id "other@") $other "recovery moved the other workspace's working copy"
+
+    let again = (try { main recover $checkpoint; null } catch {|err| $err.msg })
+    assert ($again != null and ($again | str contains "already recovered")) $"a checkpoint was recovered twice: ($again)"
+
+    # Once someone starts resolving the restack, reverting it would fork the
+    # work. (A new description keeps JJ from rebuilding the first attempt's
+    # commit byte for byte, which it refuses.)
+    ^jj describe --quiet -m "landing topic, again"
+    let failed = (try { restack-topic "jj-parent"; null } catch {|err| $err.msg })
+    let checkpoint = ($failed | parse --regex 'ci recover (?P<id>[^`]+)`' | get 0.id)
+    ^jj describe --quiet -m "landing topic, resolving"
+    let refused = (try { main recover $checkpoint; null } catch {|err| $err.msg })
+    assert ($refused != null and ($refused | str contains "changed again")) $"recovery reverted over a resolution in progress: ($refused)"
+}
+rm --recursive --force $recovery_repo $recovery_other $recovery_remote $recovery_config
+print "ok recovery spares other workspaces"
+
 # The topic lock (2026-10-07): a second `ci` moving a topic that a live one is
 # already moving fails at once instead of waiting, and the lock goes with the
 # work however it ends.

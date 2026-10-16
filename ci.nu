@@ -1133,7 +1133,7 @@ def remote-bookmark-revset [bookmark: string, remote?: string] {
 # GitHub mirror if a GitHub-gated landing pushed it there.
 def delete-topic-bookmark [bookmark: string] {
     if (revset-change-ids (bookmark-revset $bookmark) | is-not-empty) {
-        run-command $"deleting ($bookmark)" { ^jj bookmark delete $bookmark } | ignore
+        run-command $"deleting ($bookmark)" { ^jj ...(checkpoint-tag) bookmark delete $bookmark } | ignore
     }
     for remote in ([(trunk-remote) $GITHUB_REMOTE] | uniq) {
         if (revset-change-ids (remote-bookmark-revset $bookmark $remote) | is-not-empty) {
@@ -1215,15 +1215,127 @@ def push-tangled-stack [] {
     print "Select `Submit as stacked PRs` in Tangled for these branches."
 }
 
-def checkpoint [label: string] {
-    let root = (run-command "locating the workspace" { ^jj root })
-    let operation = (run-command "recording a recovery point" {
+# A checkpoint lets `ci recover` undo the rewrite that follows it and nothing
+# else. Every JJ command that rewrites history under a checkpoint carries its
+# ID as `--config ci.checkpoint="ID"` (checkpoint-tag), and JJ keeps each
+# command's arguments with the operations it records, so recovery reverts
+# exactly those operations. Restoring the operation before the rewrite would
+# rewind the whole repository instead: on 2026-10-16 a session restored a
+# failed landing's recovery point 14 seconds later and undid another
+# workspace's dispatch in between, leaving its pushed bookmark untracked.
+const CHECKPOINT_KEY = "ci.checkpoint"
+const RECOVERED_KEY = "ci.recovered"
+
+# Record a checkpoint and tag the caller's later JJ rewrites with it. The tag
+# lives in the caller's environment, so it ends when the caller returns.
+def --env checkpoint [label: string] {
+    let root = (git-command "locating the workspace" { ^jj root })
+    let operation = (git-command "recording a recovery point" {
         ^jj op log -n 1 --no-graph -T 'self.id()'
     })
+    let id = $"(date now | format date '%Y%m%dT%H%M%S%f')-($label)-(random chars --length 6)"
     let directory = ($root | path join ".jj" "jj-ci-checkpoints")
     mkdir $directory
-    $operation | save --force ($directory | path join $"(date now | format date '%Y%m%dT%H%M%S%f')-($label)")
-    print $"Recovery point: jj op restore ($operation)"
+    { id: $id label: $label operation: $operation } | to json --raw | save --force ($directory | path join $id)
+    $env.CI_CHECKPOINT = $id
+    print $"Recovery point: `ci recover ($id)` undoes this ($label) and nothing else."
+}
+
+# The arguments that tag a JJ command with the current checkpoint, if any.
+def checkpoint-tag [] {
+    let id = ($env.CI_CHECKPOINT? | default "")
+    if $id == "" { [] } else { [--config $"($CHECKPOINT_KEY)=\"($id)\""] }
+}
+
+# How to undo the current checkpoint's rewrite, for an error message.
+def recovery-hint [] {
+    let id = ($env.CI_CHECKPOINT? | default "")
+    if $id == "" { "" } else { $" To put the topic back as it was instead, run `ci recover ($id)`." }
+}
+
+# JJ's operation log, newest first, as rows of { id description attributes
+# snapshot parents }.
+def operation-log [] {
+    let result = (local-complete {
+        ^jj op log --no-graph --ignore-working-copy -T 'self.id() ++ "\x1f" ++ self.description().first_line() ++ "\x1f" ++ self.attributes() ++ "\x1f" ++ self.snapshot() ++ "\x1f" ++ self.parents().len() ++ "\x1e"'
+    })
+    if $result.exit_code != 0 { error make { msg: ($result.stderr | str trim) } }
+    $result.stdout | split row (char -u "1e") | where {|row| $row | str trim | is-not-empty } | each {|row|
+        let fields = ($row | str trim --left | split row (char -u "1f"))
+        {
+            id: $fields.0
+            description: $fields.1
+            attributes: $fields.2
+            snapshot: ($fields.3 == "true")
+            parents: ($fields.4 | into int)
+        }
+    }
+}
+
+# The operations checkpoint `id`'s rewrite recorded, newest first. A tagged
+# command also tags the snapshot of edits made before it ran and the merge JJ
+# records when it reconciles concurrent operations; neither is the rewrite,
+# and reverting the merge would undo the other side's work.
+def checkpoint-operations [operations: list, id: string] {
+    let marker = $"($CHECKPOINT_KEY)=\"($id)\""
+    $operations | where {|op| ($op.attributes | str contains $marker) and not $op.snapshot and $op.parents == 1 }
+}
+
+# The revset of the commits a rewrite's operations (newest first) made and
+# left visible when its last operation finished.
+def rewrite-results []: list -> string {
+    let rewrite = $in
+    let made = ($rewrite | each {|op| $"\(at_operation\(($op.id), all\()) ~ at_operation\(($op.id)-, all\()))" } | str join " | ")
+    $"\(($made)) & at_operation\(($rewrite | first | get id), all\())"
+}
+
+# What stops `ci recover` from reverting `rewrite`, the operations of one
+# checkpoint, or null. Reverting is safe only while the rewrite's results stand
+# as it left them: once someone resolved, edited, or abandoned one of its
+# commits, reverting would fork that work into a divergent copy.
+def recovery-problem [operations: list, id: string, rewrite: list] {
+    let recovered = $"($RECOVERED_KEY)=\"($id)\""
+    if ($operations | any {|op| $op.attributes | str contains $recovered }) {
+        return $"Checkpoint ($id) was already recovered."
+    }
+    if ($rewrite | is-empty) {
+        return $"No operation carries checkpoint ($id): it rewrote nothing, or the rewrite predates `ci recover`."
+    }
+    # Not `~ all()`: all() also holds every hidden commit a revset names.
+    let changed = (revset-change-ids $"\(($rewrite | rewrite-results)) ~ ::visible_heads\()")
+    if ($changed | is-not-empty) {
+        return $"Since checkpoint ($id), ($changed | str join ', ') changed again, so reverting would fork that work. Resolve the topic in place, or revert its operations by hand with `jj op revert`."
+    }
+    null
+}
+
+# Undo a checkpoint's rewrite and nothing else, reverting its operations
+# newest first. Other workspaces' operations since the checkpoint stay.
+def "main recover" [
+    checkpoint?: string # The ID `ci` printed with "Recovery point"; defaults to this workspace's latest
+] {
+    require-jj-workspace-here
+    let id = if $checkpoint != null { $checkpoint } else {
+        let root = (git-command "locating the workspace" { ^jj root })
+        let directory = ($root | path join ".jj" "jj-ci-checkpoints")
+        let names = if ($directory | path exists) { ls $directory | get name | each { path basename } | sort } else { [] }
+        if ($names | is-empty) { error make { msg: "This workspace has no checkpoint to recover." } }
+        $names | last
+    }
+    with-topic-lock (current-topic-id) {
+        let operations = (operation-log)
+        let rewrite = (checkpoint-operations $operations $id)
+        let problem = (recovery-problem $operations $id $rewrite)
+        if $problem != null { error make { msg: $problem } }
+        let moved = (other-workspaces-in ($rewrite | rewrite-results))
+        for op in $rewrite {
+            run-command $"reverting ($op.description)" {
+                ^jj --config $"($RECOVERED_KEY)=\"($id)\"" op revert $op.id
+            } | ignore
+        }
+        update-moved-workspaces $moved
+        print $"Recovered checkpoint ($id): reverted ($rewrite | length) operation\(s); other workspaces' operations since then stay."
+    }
 }
 
 def session-owner [] {
@@ -1381,11 +1493,11 @@ def rebase-topic [] {
     let trunk = (trunk-revset)
     let moved = (other-workspaces-in $"roots\(($trunk)..@)::")
     run-command "rebasing the topic stack" {
-        ^jj rebase -s $"roots\(($trunk)..@)" -o $trunk --skip-emptied
+        ^jj ...(checkpoint-tag) rebase -s $"roots\(($trunk)..@)" -o $trunk --skip-emptied
     } | ignore
     update-moved-workspaces $moved
     if (print-conflicts "Rebase completed") {
-        error make { msg: "Rebase completed with conflicts. Resolve them before continuing." }
+        error make { msg: $"Rebase completed with conflicts. Resolve them before continuing.(recovery-hint)" }
     }
 }
 
@@ -1610,7 +1722,7 @@ def restack [tip: string, onto: string, workspace?: string] {
     let repository = if $workspace == null { [] } else { [--repository $workspace] }
     if (revset-change-ids $"($onto) & ~::($tip)" | is-not-empty) {
         run-command $"rebasing ($tip) onto ($onto)" {
-            ^jj ...$repository rebase -s $"roots\(::($tip) ~ ::($onto) ~ ::(trunk-revset))" -o $onto --skip-emptied
+            ^jj ...(checkpoint-tag) ...$repository rebase -s $"roots\(::($tip) ~ ::($onto) ~ ::(trunk-revset))" -o $onto --skip-emptied
         } | ignore
     }
     $"($onto)..($tip)"
@@ -2001,8 +2113,8 @@ def sync-main [] {
     checkpoint "sync"
     fetch-trunk
     let trunk = (trunk)
-    run-command $"advancing the ($trunk.bookmark) bookmark" { ^jj bookmark move $trunk.bookmark --to "trunk()" } | ignore
-    run-command "rebasing the working copy" { ^jj rebase -r @ -o "trunk()" } | ignore
+    run-command $"advancing the ($trunk.bookmark) bookmark" { ^jj ...(checkpoint-tag) bookmark move $trunk.bookmark --to "trunk()" } | ignore
+    run-command "rebasing the working copy" { ^jj ...(checkpoint-tag) rebase -r @ -o "trunk()" } | ignore
 }
 
 def review-versions [] {
@@ -2150,7 +2262,7 @@ def probe-state [probe: closure] {
 # inflight is everything on a running machine. Tools keep plain VCS words.
 def main [] {
     print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
-    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`."
 }
 
 # The control tower: a live terminal view of every workspace's topic, each
@@ -2562,7 +2674,7 @@ def restack-topic [parent: string] {
     if ($conflicts | is-not-empty) {
         print $"Restacked onto ($parent) with ($conflicts | length) conflicted revision\(s):"
         print-conflicted-files $conflicts "  "
-        error make { msg: "Resolve these conflicts locally, oldest first, then run `ci dispatch` again." }
+        error make { msg: $"Resolve these conflicts locally, oldest first, then run `ci dispatch` again.(recovery-hint)" }
     }
 }
 
@@ -3373,7 +3485,7 @@ def --env "main park" [
     delete-topic-bookmark $branch
     forget-publication-bookmark $change
     let main = (trunk).bookmark
-    run-command $"advancing ($main)" { ^jj bookmark move $main --to "trunk()" } | ignore
+    run-command $"advancing ($main)" { ^jj ...(checkpoint-tag) bookmark move $main --to "trunk()" } | ignore
     let summary = if $published { $"Parked ($branch)." } else { "Parked an undispatched topic." }
     # Past the checks above, a published or non-empty topic is on main.
     release-workspace $summary $change $keep (if $published or not $empty { "delivered" } else { "discarded" })
@@ -3415,7 +3527,7 @@ def --env "main cancel" [
     delete-topic-bookmark $branch
     if ($revisions | is-not-empty) {
         let moved = (other-workspaces-in $"\(($revisions | get commit_id | str join ' | '))::")
-        run-command "abandoning the topic" { ^jj abandon ...($revisions | get change_id) } | ignore
+        run-command "abandoning the topic" { ^jj ...(checkpoint-tag) abandon ...($revisions | get change_id) } | ignore
         update-moved-workspaces $moved
     }
     release-workspace $"Cancelled the topic and abandoned ($revisions | length) revision\(s)." $change $keep "discarded"

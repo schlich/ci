@@ -87,6 +87,11 @@ export extern "ci interdiff" [
 # Rebase the current topic onto main
 export extern "ci rebase" []
 
+# Undo a checkpoint's rewrite and nothing else, keeping other workspaces' work
+export extern "ci recover" [
+    checkpoint?: string # The ID printed with "Recovery point"; defaults to this workspace's latest
+]
+
 # Show how in-flight topics stack on the ones they conflict with, or restack them
 export extern "ci sequence" [
     --json # Print the sequence as JSON

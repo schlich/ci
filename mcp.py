@@ -478,6 +478,22 @@ async def rebase(workspace: Workspace = None, wait_seconds: Wait = None) -> dict
 
 
 @mcp.tool(annotations=LOCAL)
+async def recover(
+    checkpoint: Annotated[
+        str | None,
+        Field(description='The ID printed with "Recovery point"; omit for the latest'),
+    ] = None,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci recover [CHECKPOINT]`: undo a checkpoint's rebase, restack, sync,
+    or cancel by reverting only the operations it tagged. Other workspaces'
+    operations since then stay; never `jj op restore` a recovery point."""
+    args = ["recover"] if checkpoint is None else ["recover", checkpoint]
+    return await run(args, workspace, wait_seconds)
+
+
+@mcp.tool(annotations=LOCAL)
 async def review_snapshot(
     label: str, workspace: Workspace = None, wait_seconds: Wait = None
 ) -> dict:

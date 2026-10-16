@@ -80,6 +80,7 @@ Use the narrowest workflow that matches the request:
 | Land a topic on `main` | `ci land` | Requires an explicit user request. Dispatches, proves a refactor is closure-neutral, builds every flake check at the exact head on this machine (skipping cached outputs), fast-forwards `main` to it on Tangled and the GitHub mirror, and tags releases. `--clearance spindle` or `--clearance github` waits for that CI on the exact head instead (`--timeout`, default 2hr); the spindle runs only when started by hand. If `main` moves while the gate runs, it rebases, redispatches, and gates the new head again (`--attempts`, default 5) instead of landing. Refuses a stacked topic until its parent lands. `ci dispatch --land` does the same. Never merge a GitHub pull request; squash and rebase merges rewrite the tested commit. |
 | Decide whether a topic ships alone or stacked | `ci sequence` | Read-only apart from a fetch. Trial-merges in-flight topics (dispatched `jj-*` bookmarks and workspace changes) against `main@tangled` and each other, then proposes independent topics or stacks. `--json` for structured output. |
 | Update a topic from trunk | `ci rebase` | Checkpoints, fetches, and rebases the same change. |
+| Undo a failed rebase, restack, sync, or cancel | `ci recover [<id>]` | Reverts only the operations of the checkpoint printed as `Recovery point: ci recover ID` (default: this workspace's latest), keeping every other workspace's operations since. Refuses once a commit the rewrite made was edited or resolved. Never `jj op restore` a recovery point: it rewinds every workspace. |
 | Restack dispatched topics after trunk moves | `ci sequence --apply` | Run it by hand only on request. Restacks stacked topics onto their parent's bookmark and conflicting topics onto `main@tangled`, parents first. Checked-out topics are rebased from their own workspace only when a trial merge is clean. Pushes only conflict-free stacks. `--all` also rebases topics that are merely behind; `--no-push` stops before any remote change. |
 | Start a topic | `ci new [-m <message>]` | Fetches and starts a topic on `main@tangled` in the current workspace. An empty working copy that is unnamed, or that this session claimed, becomes the topic in place, keeping its change ID; otherwise a new change starts and the previous topic stays as a sibling (`jj edit` returns to it). Refuses while an active agent session owns another change here or an unfinished `ci start` topic is checked out. |
 | Start concurrent work | `ci start <name>` | Only when no workspace is free. Creates `.jj-workspaces/<name>` at `main@tangled` for an actor that runs alongside the current working copy (another agent task, a build, a dev server), inside the Git worktree it runs from if any (such as a Claude Code worktree); refuses a name already in use. |
@@ -155,7 +156,10 @@ reach `main`.
 
 Use `ci conflicts` after a rebase to list conflicted revisions and files.
 A conflicted rebase has already rewritten the topic: resolve revisions from
-oldest to newest, then verify with `ci conflicts` before validating.
+oldest to newest, then verify with `ci conflicts` before validating. To drop
+the attempt instead, run `ci recover` before resolving anything; never
+`jj op restore` its recovery point, which also undoes every other workspace's
+operations since, such as a concurrent dispatch.
 Never run an automatic conflict resolver. `ci sequence --apply` is the only
 unattended rebase.
 
