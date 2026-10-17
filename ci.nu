@@ -3160,7 +3160,12 @@ def plan-parent-for-current-topic [branch: string] {
         return $nearest.name
     }
     let tip = (current-change 'change_id.short()')
-    let entry = (build-plan ($published | where parent == null) | where tip == $tip | get 0?)
+    # Plan with the topic's own bookmark, as `ci sequence` does. Without it a
+    # dispatched topic ranks as unpublished, behind every other published topic
+    # and unpublished refactor in its conflict component, so a component of
+    # four or more held each of its published topics and none could land
+    # (2026-10-17).
+    let entry = (build-plan (topic-bookmarks | where parent == null) | where tip == $tip | get 0?)
     if $entry == null { return null }
     match $entry.action {
         "hold" => {
