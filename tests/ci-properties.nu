@@ -1,5 +1,5 @@
 # Property-based tests for the pure planning helpers in ci.nu, derived from
-# the invariants in JjCi.tla. Run with:
+# the invariants in JjCi.qnt. Run with:
 #
 #   nu --no-config-file -c "source tests/ci-properties.nu"
 #

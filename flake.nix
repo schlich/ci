@@ -87,14 +87,24 @@
           test -x ${ci}/bin/ci-agent
           touch "$out"
         '';
-        # TLC explores every state of the bounded model and checks its
-        # invariants.
-        ci-model = pkgs.runCommand "ci-model-check" { nativeBuildInputs = [ pkgs.tlaplus ]; } ''
-          cp ${./JjCi.tla} JjCi.tla
-          cp ${./JjCi.cfg} JjCi.cfg
-          tlc -metadir "$TMPDIR/tlc" -config JjCi.cfg JjCi.tla
-          touch "$out"
-        '';
+        # Quint drives TLC to explore the finite model and check its state and
+        # temporal properties exhaustively.
+        ci-model =
+          pkgs.runCommand "ci-model-check"
+            {
+              nativeBuildInputs = [
+                pkgs.quint
+                pkgs.tlaplus
+              ];
+            }
+            ''
+              cp ${./JjCi.qnt} JjCi.qnt
+              quint verify --backend=tlc \
+                --invariant=TypeOK,NoPublishWhileUnsafe,PublishedFromFreshBase,PublishedHeadWasValidated,NoFinishWithConflict,FinishLeavesMain,NoDropWhilePending,MainOnlyHoldsPassedHeads,DeliveryIsPublishedHead,DeliveredHeadIsLocal,LandsAfterParent,LandingIsFastForward,QueuedOnlyWhileLanding \
+                --temporal=QueuedTopicStaysOnTrunk,LandsFromQueue \
+                JjCi.qnt
+              touch "$out"
+            '';
         # Its tests check the state machine against every action and
         # invariant of the same bounded model.
         ci-lifecycle = lifecycle;
@@ -160,6 +170,7 @@
           rust-analyzer
           rustc
           rustfmt
+          quint
           tlaplus
           util-linux
         ];

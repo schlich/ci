@@ -1,6 +1,6 @@
-//! Conformance with `JjCi.tla` over the bounded model in `JjCi.cfg`.
+//! Conformance with `JjCi.qnt` over its finite state space.
 //!
-//! `step` transcribes each TLA+ action over the model's flat variables,
+//! `step` transcribes each Quint action over the model state,
 //! independently of the state machine. A breadth-first search from every
 //! initial state then checks, for every reachable state and every event, that
 //! the machine accepts exactly the events whose action is enabled and lands on
@@ -13,7 +13,7 @@ use jj_ci_lifecycle::{apply, Commit, Event, Machine, State, Topic, Workspace};
 const HEADS: [&str; 2] = ["h0", "h1"];
 const MAIN_HEADS: [&str; 2] = ["m0", "m1"];
 
-/// The variables of `JjCi.tla`, with `"none"` as `None`.
+/// The fields of `JjCi.qnt`, with `"none"` as `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Vars {
     owner: bool,
@@ -95,7 +95,7 @@ fn normalize(mut vars: Vars) -> Vars {
     vars
 }
 
-/// The TLA+ action an event stands for, or `None` when it is disabled.
+/// The Quint action an event stands for, or `None` when it is disabled.
 fn step(v: &Vars, event: &Event) -> Option<Vars> {
     let mut n = v.clone();
     let owned = v.owner && v.active;

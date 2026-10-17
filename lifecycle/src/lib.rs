@@ -1,7 +1,7 @@
-//! The `ci` topic lifecycle modelled by `JjCi.tla`, as an executable
+//! The `ci` topic lifecycle modelled by `JjCi.qnt`, as an executable
 //! hierarchical state machine.
 //!
-//! The TLA+ model tracks the lifecycle as a set of flat variables. Here the
+//! The Quint model tracks the lifecycle state. Here the
 //! control facts become states and the data facts stay in shared storage:
 //!
 //! ```text
@@ -20,7 +20,7 @@
 //! is always the current one. Holding the front of the landing queue is a
 //! fact, `queued`, rather than a state, since a topic keeps editing and
 //! rebasing there. `tests/spec.rs` checks every transition of the bounded
-//! model against the TLA+ actions, every invariant against the reachable
+//! model against the Quint actions, every invariant against the reachable
 //! states, and every action property against the transitions.
 //!
 //! `agent/machine.mjs` refines this protocol into dispatch/landing command
@@ -46,7 +46,7 @@ pub enum Workspace {
 }
 
 /// Something that happens to a topic: a `ci` step or a fact of the outside
-/// world. Parameters stand in for the TLA+ model's nondeterministic choices.
+/// world. Parameters stand in for the Quint model's nondeterministic choices.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Event {
     /// The working copy changed, giving the topic a new head.

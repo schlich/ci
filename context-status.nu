@@ -311,7 +311,7 @@ def ttl [ci: record] {
 
 # Where the topic stands in the `ci` lifecycle, its next step, and the
 # protocol steps allowed from there, from the statig state machine in
-# lifecycle/ that implements JjCi.tla.
+# lifecycle/ that implements JjCi.qnt.
 def classify [facts: record] {
     {
         owner: $facts.owner
@@ -773,7 +773,7 @@ def "main handoff" [
 }
 
 # Audit: every workspace of the repository checked against the ownership and
-# publication invariants in JjCi.tla. It reads state and reports; each
+# publication invariants in JjCi.qnt. It reads state and reports; each
 # finding names the command that repairs it.
 
 const SEVERITIES = ["error" "warning" "info"]

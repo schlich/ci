@@ -1126,7 +1126,7 @@ fn draw_topic_detail(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     if !topic.allowed.is_empty() {
-        // The machine names TLA+ actions; say them in ci's own words.
+        // The machine names model actions; say them in ci's own words.
         let steps: Vec<&str> = topic
             .allowed
             .iter()

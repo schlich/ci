@@ -4,8 +4,8 @@
   description; Git is only JJ's backend.
 - The user's shell is Nushell; give user-facing commands in Nushell syntax,
   and use Nushell for scripts and data processing.
-- `ci.nu` implements the protocol modelled in `JjCi.tla` and `lifecycle/`.
-  Change the model, the machine, and the workflow together; `ci-model`,
+- `ci.nu` implements the protocol modelled in `JjCi.qnt` and `lifecycle/`.
+  Change the Quint model, the machine, and the workflow together; `ci-model`,
   `ci-lifecycle`, and `ci-properties` check them against each other.
 - The tower (`tower/`), `context-status.nu`, and the MCP server read the
   records `ci.nu` writes (`.jj/jj-ci-*.json`, the ci MCP job store, OSC 7501

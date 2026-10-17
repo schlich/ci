@@ -11,7 +11,7 @@ change to these files (`jj log -- jj/ci.nu` there).
 | Path | What it is |
 | --- | --- |
 | `ci.nu`, `ci-launch.nu`, `ci-package.nix` | the workflow, the launcher that picks which `ci.nu` runs, and its package |
-| `JjCi.tla`, `JjCi.cfg`, `lifecycle/` | the protocol as a TLA+ model and as the statig machine checked against it |
+| `JjCi.qnt`, `lifecycle/` | the protocol as a Quint model and as the statig machine checked against it |
 | `context-status.nu` | the topic readout for the prompt, the shell, and agent hooks |
 | `codex-session.nu`, `guard.nu` | Codex task ownership, and the interactive `jj new` guard (Claude Code sessions claim through `context-status guard`) |
 | `mcp.py`, `mcp-package.nix` | the workflow as MCP tools, run as jobs agents can follow |
@@ -67,16 +67,16 @@ $env.CI_AGENT_SCRIPT = '/path/to/ci/agent/cli.mjs'
 `checks.x86_64-linux.ci-agent` covers dispatch-only termination, queue and
 clearance ordering, stale-head rejection, rewriting and reproving, bounded
 races, and terminal failures. It uses no repository or remote mutations.
-The existing TLA+ and Rust lifecycle model continue to define protocol
+The existing Quint and Rust lifecycle model continue to define protocol
 safety; this command machine refines their Publish, Queue, GatePasses, and
 Land operations.
 
 ## Protocol
 
-`JjCi.tla` is a bounded TLA+ state-machine model of topic rebase, conflict
+`JjCi.qnt` is a finite-state Quint model of topic rebase, conflict
 resolution, validation, dispatch, the landing clearance, fast-forward landing,
-and workspace finish. `JjCi.cfg` supplies a small TLC state space for checking
-its safety invariants. Validation records the exact topic head it checked, and
+and workspace finish. Quint invokes TLC to check its safety and temporal
+properties exhaustively. Validation records the exact topic head it checked, and
 dispatch must capture that same head from the current trunk. Landing moves
 `main` only to the exact head a gate passed, and only from the trunk that head
 was based on, so `main` never holds a commit no gate ran on. The model
@@ -87,8 +87,8 @@ topology; the operational rules below remain authoritative.
 machine with [statig](https://crates.io/crates/statig): the control facts
 (editing, validated, conflicted, delivered, released) are states, and the data
 facts (heads, trunk, publication, gate verdict) are shared storage. Its tests
-walk every state of the bounded model in `JjCi.cfg`, require the machine to
-accept exactly the events whose TLA+ action is enabled and to reach the same
+walk every state of the bounded model, require the machine to
+accept exactly the events whose Quint action is enabled and to reach the same
 variables, and check every invariant, so `checks.x86_64-linux.ci-lifecycle`
 keeps the Rust machine and the specification in step. Change both together.
 
@@ -635,7 +635,7 @@ never fails the run.
 ### Context status
 
 `context-status` summarizes the current workspace's topic: its stage in the
-lifecycle modelled by `JjCi.tla` (stage names editing, validated, published, passed,
+lifecycle modelled by `JjCi.qnt` (stage names editing, validated, published, passed,
 failed, landed, finished, or off topic when the working copy left it), the next `ci` step, the changes above trunk and
 trunk commits the topic lacks, conflicts, lint freshness, the task owner, and
 the pipeline verdict and pull request for the dispatched head.

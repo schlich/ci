@@ -1,3 +1,4 @@
 /result*
 target/
 node_modules/
+_apalache-out/
