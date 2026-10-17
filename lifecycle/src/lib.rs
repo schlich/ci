@@ -59,7 +59,7 @@ pub enum Event {
     Validate,
     /// `ci dispatch` pushed the validated head.
     Publish,
-    /// A gate (the local flake checks, the spindle, or GitHub) passed the
+    /// A gate (the local flake checks, the spindle, GitHub, or nixbot) passed the
     /// published head.
     GatePasses,
     /// The stack parent landed.

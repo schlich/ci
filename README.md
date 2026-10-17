@@ -122,7 +122,7 @@ ci review snapshot v2
 ci interdiff v1 v2
 # At topic closeout:
 ci land                     # Build the flake checks locally, then fast-forward main.
-ci land --clearance spindle # Take clearance from the spindle (or github) instead.
+ci land --clearance spindle # Take clearance from the spindle (or github, or nixbot) instead.
 ci park                     # Confirm the landing and free the workspace.
 # To drop an undispatched or closed topic instead:
 ci cancel
@@ -384,6 +384,19 @@ impact declarations keyed by them would be lost, and `park` and `prune` could no
 tell that the topic landed. The GitHub repository therefore allows only
 merge commits, which its linear-history rule rejects, so its merge button
 cannot land anything; its `main` rule accepts only fast-forward pushes.
+
+`ci land --clearance nixbot` takes clearance from a
+[nixbot](https://github.com/Mic92/nixbot) instance that builds the GitHub
+mirror. Like `github`, it pushes the topic branch to `origin`, then waits for
+nixbot's `nixbot/nix-eval` and `nixbot/nix-build` check runs to pass the exact
+head. nixbot builds a branch on push only when the default branch's
+`nixbot.toml` names it, so that file needs `build_branches = ["jj-*"]`. A topic
+whose root holds `nixbot.toml` is also pushed to `origin` on every
+`ci dispatch`, so nixbot builds it while it waits to land. A rejected mirror
+push is reported under `mirror-topic` and does not fail the dispatch. nixbot
+builds in its host's own store, so a binary cache served from that host (such
+as Harmonia) lets the default local clearance substitute what nixbot built,
+too.
 
 `ci park` checks that the current revision is on `main@tangled`. It then
 deletes the topic bookmark locally and on Tangled, advances local main, and

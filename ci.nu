@@ -672,6 +672,14 @@ const GITHUB_REMOTE = "origin"
 # Impact declarations live in this machine's ci log, which GitHub cannot read,
 # so `ci land` classifies the topic itself and GitHub only builds it.
 const GITHUB_REQUIRED_CHECKS = ["nix flake checks"]
+# nixbot (github.com/Mic92/nixbot) reports its evaluation and the build of
+# every check as two combined check runs on the mirror's commits. A repository
+# whose root holds nixbot.toml has each topic mirrored on dispatch, so nixbot
+# builds it before `ci land --clearance nixbot` waits for these.
+const NIXBOT_REQUIRED_CHECKS = ["nixbot/nix-eval" "nixbot/nix-build"]
+const NIXBOT_CONFIG = "nixbot.toml"
+# Clearances that read check runs on the mirror and so need the head there.
+const GITHUB_CLEARANCES = ["github" "nixbot"]
 const TANGLED_INDEX = "https://api.tangled.org"
 const TANGLED_WEB = "https://tangled.org"
 const IDENTITY_RESOLVER = "https://slingshot.microcosm.blue"
@@ -874,12 +882,12 @@ def github-repo [] {
 # GitHub's verdict on one commit, in the spindle's shape: the newest run of
 # each required check decides, and a check that has not reported is missing.
 # A skipped run proves nothing, so it counts as not having reported.
-def github-checks-state [repo: string, commit: string] {
+def github-checks-state [repo: string, commit: string, required: list<string> = $GITHUB_REQUIRED_CHECKS] {
     let runs = (git-command "reading GitHub check runs" {
         ^gh api --paginate $"repos/($repo)/commits/($commit)/check-runs?per_page=100" --jq '.check_runs[] | {name, status, conclusion, id}'
     } | lines | where {|line| $line | is-not-empty } | each {|line| $line | from json }
     | where {|run| $run.conclusion not-in ["skipped" "neutral"] })
-    let workflows = ($GITHUB_REQUIRED_CHECKS | each {|name|
+    let workflows = ($required | each {|name|
         let matching = ($runs | where name == $name)
         let run = if ($matching | is-empty) { null } else { $matching | sort-by id | last }
         let status = if $run == null {
@@ -1439,7 +1447,8 @@ def local-checks-state [commit: string] {
 }
 
 # The check that gates a landing: the flake checks built on this machine, the
-# repository's spindle, or GitHub Actions on the mirror.
+# repository's spindle, GitHub Actions on the mirror, or nixbot's check runs
+# on the mirror.
 def landing-gate [gate: string] {
     match $gate {
         "local" => {
@@ -1471,7 +1480,16 @@ def landing-gate [gate: string] {
                 started_by_hand: false
             }
         }
-        _ => { error make { msg: $"Unknown clearance ($gate); use local, spindle, or github." } }
+        "nixbot" => {
+            let github = (github-repo)
+            {
+                name: $"nixbot on ($github)"
+                probe: {|commit| github-checks-state $github $commit $NIXBOT_REQUIRED_CHECKS }
+                hint: $"If none started, check that ($NIXBOT_CONFIG) on main lists jj-* in build_branches, the project is enabled in nixbot, and the GitHub App's webhook deliveries succeed."
+                started_by_hand: false
+            }
+        }
+        _ => { error make { msg: $"Unknown clearance ($gate); use local, spindle, github, or nixbot." } }
     }
 }
 
@@ -3207,6 +3225,7 @@ def publish-topic [] {
     run-command "setting the publication bookmark" { ^jj bookmark set $branch -r @ } | ignore
     remember-publication-bookmark $branch
     phase push $"Pushing ($branch)" { push-topic-bookmark $branch }
+    mirror-topic $branch
     { branch: $branch parent: $parent impact: $impact head: (current-change "commit_id") }
 }
 
@@ -3336,7 +3355,7 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
             "clearing" => {
                 let checker = (landing-gate $gate)
                 $base = (fork-point "trunk()" $current.head)
-                if $gate == "github" { push-bookmark $GITHUB_REMOTE $current.branch }
+                if $gate in $GITHUB_CLEARANCES { push-bookmark $GITHUB_REMOTE $current.branch }
                 print $"Waiting for ($checker.name) to pass ($current.head | str substring 0..11)."
                 wait-for-pipeline $checker $current.head $timeout
                 { type: CLEARED head: $current.head }
@@ -3412,7 +3431,7 @@ def bisect-train [count: int, failure: any, clear: closure] {
 # whether it passed. Remote clearance needs the head pushed: GitHub's to the
 # mirror, the spindle's to the trunk remote, where it is started by hand.
 def train-clearance [checker: record, gate: string, entry: record, timeout: duration] {
-    if $gate == "github" { push-bookmark $GITHUB_REMOTE $entry.name }
+    if $gate in $GITHUB_CLEARANCES { push-bookmark $GITHUB_REMOTE $entry.name }
     if $gate == "spindle" { push-topic-bookmark $entry.name }
     print $"Waiting for ($checker.name) to pass ($entry.name) at ($entry.head | str substring 0..11)."
     try {
@@ -3620,12 +3639,34 @@ def mirror-main [] {
     }
 }
 
+# Push a dispatched topic's branch to the GitHub mirror too when the topic
+# holds nixbot.toml, so nixbot builds it while it waits to land and
+# `ci land` then finds its checks built or substitutes them. The trunk is
+# authoritative and the mirror only a head start, so a rejected push is
+# reported under `mirror-topic` without failing the dispatch.
+def mirror-topic [branch: string] {
+    if (trunk-remote) == $GITHUB_REMOTE or $GITHUB_REMOTE not-in (remotes | get name) { return }
+    let config = (do { ^jj file list -r @ $"root-file:\"($NIXBOT_CONFIG)\"" } | complete)
+    if $config.exit_code != 0 or ($config.stdout | str trim | is-empty) { return }
+    let pushed = (try {
+        push-bookmark $GITHUB_REMOTE $branch
+        null
+    } catch {|err| $err.msg })
+    if $pushed != null {
+        let failure = $"Mirroring ($branch) to ($GITHUB_REMOTE) for nixbot failed: ($pushed). `ci land --clearance nixbot` pushes it again."
+        print --stderr $failure
+        report-status error $failure --id mirror-topic
+    } else {
+        report-status done $"Mirrored ($branch) to ($GITHUB_REMOTE) for nixbot" --id mirror-topic
+    }
+}
+
 # Clear the topic for departure: rebase, run preflight, and push its branch,
 # where it waits to land. --stack pushes each layer as its own branch for
 # stacked review on Tangled instead.
 def "main dispatch" [
     --land # Land the topic once it has clearance
-    --clearance: string = "local" # What must pass the head before --land: local, spindle, or github
+    --clearance: string = "local" # What must pass the head before --land: local, spindle, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
     --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
     --stack # Push one branch per revision for Tangled's stacked pull requests
@@ -3669,7 +3710,7 @@ def "main dispatch" [
 
 def "main publish" [
     --land # Land the topic once it has clearance
-    --gate: string = "local" # What must pass the head before --land: local, spindle, or github
+    --gate: string = "local" # What must pass the head before --land: local, spindle, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
     --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
 ] {
@@ -3678,7 +3719,7 @@ def "main publish" [
 }
 
 def "main land" [
-    --clearance: string = "local" # What must pass the head: local, spindle, or github
+    --clearance: string = "local" # What must pass the head: local, spindle, github, or nixbot
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
     --attempts: int = 5 # How many times to start over when something outside the landing queue moves main

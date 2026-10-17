@@ -610,7 +610,7 @@ async def dispatch(
             "explicit user request to deliver."
         ),
     ] = False,
-    clearance: Literal["local", "spindle", "github"] = "local",
+    clearance: Literal["local", "spindle", "github", "nixbot"] = "local",
     timeout: Annotated[
         str, Field(description="Nushell duration --land waits, e.g. 2hr.")
     ] = "2hr",
@@ -629,7 +629,7 @@ async def dispatch(
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def land(
-    clearance: Literal["local", "spindle", "github"] = "local",
+    clearance: Literal["local", "spindle", "github", "nixbot"] = "local",
     timeout: Annotated[
         str, Field(description="Nushell duration to wait, e.g. 2hr.")
     ] = "2hr",
