@@ -1225,11 +1225,15 @@ def unit-exit-code [recorded: string, systemd_run: int] {
 
 # nix-eval-jobs' memory budget per worker, in MiB. The budget is workers times
 # this; past it, nix-eval-jobs kills the largest worker mid-check and retries
-# that check alone, failing it if it exceeds the budget even then. Measured
-# on the dotfiles checks (2026-10-16), 4 GiB evaluates them in 224 s against
-# 178 s at 6 GiB, and keeps 2 GiB more of a 16 GiB machine free; their
-# largest check needs about 3.1 GiB alone, and 2 GiB fails three of them.
-const EVAL_MEMORY_MIB = 4096
+# that check alone, failing it if it exceeds the budget even then. Size it
+# from nix-eval-jobs' own peak, not `nix eval`'s, which reports about 1.7 GiB
+# less for the same check: a 4 GiB budget measured with `nix eval` (largest
+# check 3.1 GiB) failed every dotfiles landing that evaluated homelab. Under
+# nix-eval-jobs alone (2026-10-16) the largest dotfiles checks peak at 4.8 GiB
+# (clan-machine-homelab) and 3.8 GiB (clan-machine-asus); 6 GiB leaves a
+# quarter of headroom and evaluated them faster than 4 GiB, 178 s against
+# 224 s. Keep it a whole number of GiB: failures name it in GiB.
+const EVAL_MEMORY_MIB = 6144
 
 # The status record for one check: a child of `clearance`, its name cut to
 # the characters and length an OSC 7501 id segment allows.

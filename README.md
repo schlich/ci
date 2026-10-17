@@ -309,7 +309,7 @@ corresponding stack layer and review round.
 The default clearance, `--clearance local`, exports the exact commit's tree with
 `git archive` and builds its `checks.x86_64-linux` on this machine with the
 same `nix-fast-build --skip-cached` command the spindle workflow runs,
-streaming the build log. It evaluates with one worker and a 4 GiB budget:
+streaming the build log. It evaluates with one worker and a 6 GiB budget:
 past the budget, nix-eval-jobs kills the worker and retries the check alone,
 so the largest single check, not the whole set, has to fit. Anything already
 in the local store or a binary
@@ -332,7 +332,7 @@ such as `workbench did not build: AssertionError: unexpected changes: …
 `watch-job` monitor therefore delivers the cause, and an agent or person
 reads the rest from that file. An evaluation that outgrows its worker's
 memory budget reports as an error under its own name, such as
-`den-host-evaluation exceeded 4 GiB`. A run killed outright reports the
+`den-host-evaluation exceeded 6 GiB`. A run killed outright reports the
 builds and the evaluation it cut short as errors, and names them in the
 clearance failure. Checks substituted from a cache report nothing.
 
