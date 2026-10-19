@@ -60,6 +60,9 @@
         codex-jj-session = pkgs.writeNuScriptBin "codex-jj-session" (builtins.readFile ./codex-session.nu);
       };
 
+      # services.ci-prune: the daily `ci prune --apply` backstop.
+      homeModules.default = import ./prune-timer.nix { inherit ci; };
+
       apps.${system}.default = {
         type = "app";
         program = "${ci}/bin/ci";

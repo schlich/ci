@@ -441,13 +441,25 @@ Prune treats that claim as ended once the task's rollout under
 record, and removes the workspace if nothing in it is pending. Prune also
 deletes topic branches whose every copy, local, on Tangled, and on GitHub,
 is already on `main`, unless a remaining workspace still records the branch
-for its topic, whose `park` needs it.
+for its topic, whose `park` needs it. It deletes the `stack/<series>/<change-id>`
+layers of a stacked dispatch the same way, but only once every layer of the
+series has landed, since each stacked pull request targets the layer below it.
 
 `--idle DURATION` keeps every workspace used more recently than that, judged
 from its `ci start` marker and JJ's tree state on disk, before any JJ command
 runs there, so a live session's working copy is never snapshotted under it.
-The `ci-prune` user timer runs `ci prune --apply --idle 1day` in the default
-checkout once a day.
+
+The flake's `homeModules.default` schedules that backstop: with
+`services.ci-prune.enable` and the checkouts listed in
+`services.ci-prune.repositories`, a `ci-prune` user timer runs
+`ci prune --apply --idle 1day` in each of them once a day. Nothing prunes on
+its own without it; before the module existed, the timer lived in one
+consumer's configuration and was lost when ci moved to its own repository.
+
+After every command, the launcher copies JJ's bookmarks into the repository's
+Git store with `jj git export`. JJ does that by itself only inside a colocated
+workspace, so a branch that `ci` deleted or moved from any other workspace kept
+a stale `@git` copy that `jj bookmark list` still showed.
 
 ### Rebasing with conflicts
 

@@ -588,6 +588,25 @@ for-all "only branches landed in every copy and recorded by no workspace are del
     }
 }
 
+for-all "a stack layer is deleted only once every layer of its series has landed" {|key|
+    let series = (0..<(1 + (pick $"($key)/series" 3)) | each {|s| $"series($s)" })
+    let names = ($series | each {|s|
+        0..<(1 + (pick $"($key)/($s)/layers" 3)) | each {|i| $"stack/($s)/change($i)" }
+    } | flatten | append "jj-topic-0")
+    let copies = ($names | each {|name|
+        0..<(1 + (pick $"($key)/($name)/copies" 2)) | each {|i| { name: $name landed: (flag $"($key)/($name)/landed/($i)") } }
+    } | flatten)
+    let deleted = (landed-branches $copies [])
+    let landed = {|name| $copies | where name == $name | all {|copy| $copy.landed } }
+    for name in $names {
+        let siblings = if ($name | str starts-with "stack/") {
+            let s = ($name | split row "/" | get 1)
+            $names | where {|other| $other | str starts-with $"stack/($s)/" }
+        } else { [$name] }
+        assert equal ($name in $deleted) ($siblings | all {|other| do $landed $other }) $name
+    }
+}
+
 for-all "prune reclaims every released, delivered workspace" {|key|
     let facts = (gen-workspace-facts $key | merge {
         name: "topic" current: false exists: true git_worktree: false codex_worktree: false

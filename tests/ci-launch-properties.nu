@@ -75,6 +75,31 @@ for-all "a repository copy with a different agent gets that agent, built at most
     if $differs { assert equal $choice (if $facts.cached { "cached" } else { "build" }) }
 }
 
+for-all "bookmarks are exported from the workspace ci ran in, else from the repository's home" {|key|
+    let facts = {
+        checkout: "/repo/.jj-workspaces/topic"
+        checkout_exists: (flag $"($key)/checkout")
+        home: "/repo"
+        home_exists: (flag $"($key)/home")
+    }
+    let expected = if $facts.checkout_exists { $facts.checkout } else if $facts.home_exists { $facts.home } else { null }
+    assert equal (export-root $facts) $expected
+}
+
+# A secondary workspace's `.jj/repo` names the home's `.jj/repo` relative to
+# its own `.jj`, the way `ci start` and `jj workspace add` write it.
+let home = (mktemp --directory)
+mkdir ($home | path join ".jj" "repo")
+let secondary = ($home | path join ".jj-workspaces" "topic")
+mkdir ($secondary | path join ".jj")
+"../../../.jj/repo" | save ($secondary | path join ".jj" "repo")
+assert equal (repo-home $home) $home
+assert equal (repo-home $secondary) ($home | path expand)
+assert equal (repo-home "") ""
+assert equal (repo-home ($home | path join "elsewhere")) ""
+rm --recursive $home
+print "ok repo home"
+
 # ci-package.nix hashes the agent's files in this order, which must be the
 # order `jj file show` prints them in, so a revision whose agent matches the
 # package's is recognised without a build.

@@ -4646,16 +4646,29 @@ def prune-checkpoints [root: string, cutoff: datetime, apply: bool] {
 # kept its branch: seventeen such `jj-*` branches stood on 2026-10-07.
 # Branches a remaining workspace still records for its topic stay for its
 # `ci park`, which reads them to tell a delivered topic from a discarded one.
+# A `stack/SERIES/CHANGE` layer that `ci dispatch --stack` pushed stays until
+# every layer of its series has landed, since the stacked pull request above
+# it targets its branch; landed layers had piled up beside an open one
+# (2026-10-19).
 def landed-branches [copies: list, in_use: list] {
+    let pending = ($copies | where {|copy| not $copy.landed } | each {|copy| stack-series $copy.name } | where {|series| $series != null } | uniq)
     $copies | group-by name | transpose name rows
     | where {|branch| ($branch.rows | all {|copy| $copy.landed }) and $branch.name not-in $in_use }
+    | where {|branch| (stack-series $branch.name) == null or (stack-series $branch.name) not-in $pending }
     | get name
+}
+
+# The series a `stack/SERIES/CHANGE` layer branch belongs to, or null for any
+# other branch.
+def stack-series [name: string] {
+    let parts = ($name | split row "/")
+    if ($parts | length) == 3 and ($parts | first) == "stack" { $parts | get 1 } else { null }
 }
 
 def topic-branch-copies [] {
     let trunk = (trunk-revset)
     git-command "listing topic branches" {
-        ^jj bookmark list --all-remotes -T 'if(normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*'
+        ^jj bookmark list --all-remotes -T 'if(normal_target, name ++ "\t" ++ normal_target.commit_id() ++ "\n")' 'glob:jj-*' 'glob:stack/*'
     } | lines | where {|line| $line | is-not-empty } | parse "{name}\t{commit}" | uniq
     | each {|copy| { name: $copy.name landed: (revset-change-ids $"($copy.commit) & ::($trunk)" | is-not-empty) } }
 }

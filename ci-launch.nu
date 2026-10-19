@@ -105,6 +105,44 @@ def stale-working-copy [stderr: string] {
     $stderr | str contains "working copy is stale"
 }
 
+# The workspace that holds a repository's `.jj/repo` directory, found from any
+# of its workspaces: the default one holds it, and a secondary workspace's
+# `.jj/repo` file names it relative to that `.jj`. Empty outside a repository.
+def repo-home [checkout: string] {
+    if ($checkout | is-empty) { return "" }
+    let dot_jj = ($checkout | path join ".jj")
+    let pointer = ($dot_jj | path join "repo")
+    match ($pointer | path type) {
+        "dir" => $checkout
+        "file" => ($dot_jj | path join (open --raw $pointer | str trim) | path expand | path dirname | path dirname)
+        _ => ""
+    }
+}
+
+# Where to run `jj git export` once ci.nu exits, or null for nowhere: the
+# workspace ci ran in, unless the run removed it (`ci park` and `ci cancel`
+# remove a workspace `ci start` made), then the repository's home workspace.
+def export-root [facts: record] {
+    if $facts.checkout_exists { return $facts.checkout }
+    if $facts.home_exists { return $facts.home }
+    null
+}
+
+# JJ copies its bookmarks into the backing Git repository only in a colocated
+# workspace, and only as part of its own command there. ci runs in secondary
+# workspaces, and many repositories keep Git inside `.jj`, so a branch that
+# ci deleted or moved kept a stale `@git` copy, listed as `(deleted)` beside
+# the real ones, and Git's main lagged trunk (2026-10-19). Export after every
+# run, without snapshotting anyone's working copy; it changes nothing when
+# the two already agree.
+def export-to-git [root: any] {
+    if $root == null { return }
+    let exported = (do { cd $root; ^jj --ignore-working-copy git export } | complete)
+    if $exported.exit_code != 0 {
+        print --stderr $"ci: could not copy bookmarks to Git: ($exported.stderr | str trim)"
+    }
+}
+
 def --wrapped main [...args] {
     let bundled = $env.CI_BUNDLED_SCRIPT
     let override = ($env.CI_SCRIPT? | default "")
@@ -158,9 +196,23 @@ def --wrapped main [...args] {
         _ => false
     }
     if $built { $env.PATH = ($env.PATH | prepend ($link | path join "bin")) }
-    # This nu has already parsed NU_LIB_DIRS into a list, which `exec` does
-    # not pass on as the script's module path, so hand it over explicitly.
+    # This nu has already parsed NU_LIB_DIRS into a list, which the child nu
+    # does not take as the script's module path, so hand it over explicitly.
     let lib_dirs = ($env.NU_LIB_DIRS? | default [] | each {|dirs| $dirs | split row (char esep) } | flatten | where {|dir| $dir | is-not-empty })
     let include = if ($lib_dirs | is-empty) { [] } else { ["--include-path" ($lib_dirs | str join (char record_sep))] }
-    exec $nu.current-exe --no-config-file ...$include $script ...$args
+    # Run ci.nu as a child rather than exec it, so the launcher can copy the
+    # run's bookmarks to Git afterwards and still exit with its status.
+    let home = (repo-home $checkout)
+    # A child that never started leaves no exit code; it still failed.
+    let status = (try { ^$nu.current-exe --no-config-file ...$include $script ...$args; 0 } catch {
+        let code = ($env.LAST_EXIT_CODE? | default 0)
+        if $code == 0 { 1 } else { $code }
+    })
+    export-to-git (export-root {
+        checkout: $checkout
+        checkout_exists: (($checkout | is-not-empty) and ($checkout | path join ".jj" | path exists))
+        home: $home
+        home_exists: (($home | is-not-empty) and ($home | path join ".jj" | path exists))
+    })
+    exit $status
 }
