@@ -141,6 +141,14 @@ export extern "ci queue list" [
     --json # Print the record instead of tables
 ]
 
+def "nu-complete ci queue places" [] { [first last up down] }
+
+# Move a held topic in the line; a stacked topic never passes its parent
+export extern "ci queue move" [
+    place: string@"nu-complete ci queue places" # first, last, up, down, or a position counting from 1
+    --change: string # The held change to move (default: the current topic); a prefix will do
+]
+
 # Take the current topic out of the line without landing it
 export extern "ci queue drop" []
 

@@ -1285,11 +1285,16 @@ def hold-topic [published: record, clearance: string, timeout: duration, attempt
     mkdir $logs
     let change = (current-topic-id)
     let log = ($logs | path join $"(date now | format date '%Y%m%dT%H%M%S')-($change | str substring 0..<8).log")
+    let parent = if $published.parent? == null { null } else {
+        held-topics | where {|entry| $entry.hold.branch == $published.parent } | get --optional 0.hold
+    }
     let hold = {
         topic: (lock-topic $published.head)
         change: $change
         head: $published.head
         branch: $published.branch
+        parent_branch: ($published.parent? | default null)
+        parent_change: ($parent.change? | default null)
         repo: (git-command "locating the repository" { ^jj git root })
         workspace: (git-command "locating the workspace" { ^jj root })
         clearance: $clearance
@@ -1301,11 +1306,17 @@ def hold-topic [published: record, clearance: string, timeout: duration, attempt
         log: $log
     }
     $"Held ($hold.topic) at ($hold.head | str substring 0..11) for the drainer.\n" | save --force $log
+    # Queued afresh, a topic takes its arrival place, not one it was moved to.
+    let order = (read-landing-order)
+    if $change in $order.order {
+        save-landing-order { order: ($order.order | where {|other| $other != $change }) moved: ($order.moved | where {|other| $other != $change }) }
+    }
     let path = (draw-ticket $dir ($hold | to json --raw))
-    let number = (landing-ticket-number $path)
     let pid = (ensure-drainer $launcher)
     hold-job-record $hold ($pid | default $nu.pid)
-    { hold: $hold path: $path ahead: (held-topics | where number < $number | length) }
+    let line = (landing-plan)
+    let place = ($line | enumerate | where item.change == $change | get --optional 0.index | default (($line | length) - 1))
+    { hold: $hold path: $path ahead: $place }
 }
 
 # Write the `.job.nuon` that `watch-job` reads for a hold's log, naming the
@@ -1332,35 +1343,227 @@ def finish-hold [held: record, outcome: record] {
     try { $"($record | to json --raw)\n" | save --append ((holds-path) | path join "outcomes.jsonl") }
 }
 
-# Why `hold` cannot land as held, or null when it can: its workspace must
-# still have the held change checked out at the held head, and that change
-# must not be on trunk already.
-def hold-problem [hold: record] {
-    if not ($hold.workspace | path join ".jj" | path exists) { return $"its workspace ($hold.workspace) is gone" }
+# Where `hold` stands before the drainer flies it, as { problem, head }:
+# `problem` says why it cannot land as held, or is null when it can, and
+# `head` is the head to land. Its workspace must still have the held change
+# checked out, at the held head or at a rebase of it that leaves the change's
+# own diff alone: a train rebases the topics it puts back in line, and a
+# stacked topic moves with its parent. A stacked topic whose parent is no
+# longer `held` must find that parent on trunk.
+def hold-standing [hold: record, held: list = []] {
+    let refused = {|problem| { problem: $problem head: $hold.head } }
+    if not ($hold.workspace | path join ".jj" | path exists) { return (do $refused $"its workspace ($hold.workspace) is gone") }
     let at = (do { cd $hold.workspace; ^jj log -r @ --no-graph -T 'change_id ++ " " ++ commit_id' } | complete)
-    if $at.exit_code != 0 { return $"reading its workspace failed: ($at.stderr | str trim)" }
+    if $at.exit_code != 0 { return (do $refused $"reading its workspace failed: ($at.stderr | str trim)") }
     let fields = ($at.stdout | str trim | split row " ")
-    if ($fields | first) != $hold.change { return "its workspace no longer has the held change checked out" }
-    if ($fields | last) != $hold.head { return "it changed since it was queued; `ci queue` it again to land the new head" }
-    null
+    if ($fields | first) != $hold.change { return (do $refused "its workspace no longer has the held change checked out") }
+    let head = ($fields | last)
+    if $head != $hold.head and not (rebased-only $hold.workspace $hold.change $hold.head $head) {
+        return (do $refused "it changed since it was queued; `ci queue` it again to land the new head")
+    }
+    let parent = $hold.parent_change?
+    if $parent != null and $parent not-in $held {
+        let landed = (do { cd $hold.workspace; ^jj log -r $"trunk\() & change_id\(($parent))" --no-graph -T 'change_id' } | complete)
+        if $landed.exit_code != 0 or ($landed.stdout | str trim | is-empty) {
+            return (do $refused $"its parent ($hold.parent_branch? | default $parent) left the line without landing")
+        }
+    }
+    { problem: null head: $head }
 }
 
-# The holds the drainer lands next, as one flight: the oldest, and with it
-# every later hold of the same repository and clearance, which fly together
-# as one train. Arrival is the only order for now; ordering the holds by
-# their dependencies would change this function alone.
-def next-flight [held: list] {
-    let lead = ($held | first | get hold)
-    $held | where {|entry| $entry.hold.repo == $lead.repo and $entry.hold.clearance == $lead.clearance }
+# Why `hold` cannot land as held, or null when it can; see hold-standing.
+def hold-problem [hold: record, held: list = []] {
+    (hold-standing $hold $held).problem
+}
+
+# Whether `new` only rebases `old`, an earlier commit of `change`: the
+# change's own diff is the same, as `jj interdiff` sees it from `workspace`.
+def rebased-only [workspace: string, change: string, old: string, new: string] {
+    let was = (do { cd $workspace; ^jj log -r $old --no-graph -T 'change_id' } | complete)
+    if $was.exit_code != 0 or ($was.stdout | str trim) != $change { return false }
+    let diff = (do { cd $workspace; ^jj interdiff --from $old --to $new --git } | complete)
+    $diff.exit_code == 0 and ($diff.stdout | str trim | is-empty)
+}
+
+# Put the held topics `entries` back in line after a train put them back on
+# main, in the place they held: each keeps its arrival, and its head moves on
+# once hold-standing sees the rebase. One put back `attempts` times already
+# ends instead, so a main that keeps moving cannot hold the drainer forever.
+def rehold [entries: list, why: string] {
+    let dir = (holds-path)
+    for entry in $entries {
+        let count = ($entry.hold.requeued? | default 0) + 1
+        if $count > ($entry.hold.attempts? | default 5) {
+            finish-hold $entry { exit_code: 1 error: $"did not land after going back in line ($count - 1) times; last: ($why)" }
+            continue
+        }
+        try { $"Back in line: ($why).\n" | save --append $entry.hold.log }
+        draw-ticket $dir ($entry.hold | upsert requeued $count | to json --raw) | ignore
+    }
+}
+
+# The order a person gave the line with `ci queue move`: `order`, the held
+# changes in the order they chose, and `moved`, the changes they moved. A
+# hold held since comes after every change `order` names, in arrival order.
+# The drainer forgets it once no hold waits.
+def landing-order-path [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "landing-order.json"
+}
+
+def read-landing-order [] {
+    let order = (try { open --raw (landing-order-path) | from json } catch { {} })
+    { order: ($order.order? | default []) moved: ($order.moved? | default []) }
+}
+
+def save-landing-order [order: record] {
+    let path = (landing-order-path)
+    mkdir ($path | path dirname)
+    $order | to json --raw | save --force $"($path).tmp"
+    mv --force $"($path).tmp" $path
+}
+
+# The held topics `held` in the order the drainer lands them, each with the
+# `reason` for its place. Holds come in the order a person gave with `ci
+# queue move`, then in arrival order: when `ci queue` first held them, which
+# a hold the drainer puts back in line keeps. A stacked topic always comes
+# after its held parent. Nothing else reorders the line; there is no cost
+# model, so a held topic is never passed over for a cheaper one.
+def plan-holds [held: list, order: record] {
+    let arrived = ($held
+        | insert arrival {|entry| try { $entry.hold.held_at | into datetime } catch { 0 | into datetime } }
+        | sort-by arrival number
+        | reject arrival)
+    let chosen = ($order.order | enumerate | reduce --fold {} {|entry, ranks| $ranks | upsert $entry.item $entry.index })
+    let ranked = ($arrived | enumerate | each {|entry|
+        let rank = ($chosen | get --optional $entry.item.hold.change)
+        $entry.item | insert rank (if $rank == null { ($order.order | length) + $entry.index } else { $rank })
+    } | sort-by rank)
+    let changes = ($ranked | get --optional hold.change | default [])
+    mut planned = []
+    mut rest = $ranked
+    while ($rest | is-not-empty) {
+        let placed = ($planned | get --optional hold.change | default [])
+        let next = ($rest | enumerate | where {|entry|
+            let parent = $entry.item.hold.parent_change?
+            $parent == null or $parent not-in $changes or $parent in $placed
+        } | get --optional 0.index)
+        # A cycle cannot come from JJ's graph; keep the rest in rank order.
+        let index = ($next | default 0)
+        $planned = ($planned | append ($rest | get $index))
+        $rest = ($rest | drop nth $index)
+    }
+    let topics = ($ranked | each {|entry| { change: $entry.hold.change topic: $entry.hold.topic } })
+    $planned | each {|entry|
+        let parent = $entry.hold.parent_change?
+        let reason = if $parent != null and $parent in $changes {
+            $"stacked on ($topics | where change == $parent | get 0.topic)"
+        } else if $entry.hold.change in $order.moved {
+            "moved by hand"
+        } else if ($entry.hold.requeued? | default 0) > 0 {
+            "back in line after a train failed"
+        } else {
+            "arrival"
+        }
+        $entry | reject rank | insert reason $reason
+    }
+}
+
+# The holds the drainer lands next, as one flight, from `planned`, the line
+# as plan-holds orders it: the first, and with it every later hold of the
+# same repository and clearance, which fly together as one train. A stacked
+# topic joins only behind its parent; one whose held parent flies later
+# waits for it.
+def next-flight [planned: list] {
+    let lead = ($planned | first | get hold)
+    let held = ($planned | get hold.change)
+    $planned | reduce --fold [] {|entry, flight|
+        let parent = $entry.hold.parent_change?
+        let same = $entry.hold.repo == $lead.repo and $entry.hold.clearance == $lead.clearance
+        let behind = $parent == null or $parent not-in $held or $parent in ($flight | get --optional hold.change | default [])
+        if $same and $behind { $flight | append $entry } else { $flight }
+    }
+}
+
+# Every flight the drainer would fly for `planned`, in turn, if nothing were
+# held, dropped, or put back in line meanwhile.
+def plan-flights [planned: list] {
+    mut flights = []
+    mut rest = $planned
+    while ($rest | is-not-empty) {
+        let flight = (next-flight $rest)
+        let taken = ($flight | get hold.change)
+        $flights = ($flights | append [$flight])
+        $rest = ($rest | where {|entry| $entry.hold.change not-in $taken })
+    }
+    $flights
+}
+
+# The line as `ci queue list` and the tower show it: one row per hold, in
+# landing order, with its flight and the reason for its place. Written to
+# `landing-plan.json` whenever ci reads or changes the line, for the tower.
+def landing-plan [] {
+    let planned = (plan-holds (held-topics) (read-landing-order))
+    let rows = (plan-flights $planned | enumerate | each {|flight|
+        $flight.item | each {|entry| {
+            change: $entry.hold.change
+            topic: $entry.hold.topic
+            head: $entry.hold.head
+            clearance: $entry.hold.clearance
+            flight: ($flight.index + 1)
+            reason: $entry.reason
+            held_at: $entry.hold.held_at
+            log: $entry.hold.log
+        } }
+    } | flatten)
+    let path = ((holds-path) | path dirname | path join "landing-plan.json")
+    try {
+        mkdir ($path | path dirname)
+        $rows | to json --raw | save --force $"($path).tmp"
+        mv --force $"($path).tmp" $path
+    }
+    $rows
+}
+
+# Move the hold of `change` in the line, as landing-plan shows it, to
+# `place`: first, last, up, down, or a 1-based position. The line keeps that
+# order until the drainer goes idle. A stacked topic still never passes its
+# parent, and a topic still flies in the train of the first topic of its
+# repository and clearance, so a move inside a flight changes only the
+# train's order. Returns the new line.
+def move-hold [change: string, place: string] {
+    let order = (read-landing-order)
+    let changes = (landing-plan | get --optional change | default [])
+    let from = ($changes | enumerate | where item == $change | get --optional 0.index)
+    if $from == null { error make { msg: "This topic is not held; `ci queue` holds it." } }
+    let last = ($changes | length) - 1
+    let to = match $place {
+        "first" => 0
+        "last" => $last
+        "up" => ([($from - 1) 0] | math max)
+        "down" => ([($from + 1) $last] | math min)
+        _ => {
+            let position = (try { $place | into int } catch {
+                error make { msg: $"Move a hold first, last, up, down, or to a position from 1 to ($last + 1), not ($place)." }
+            })
+            ([([$position 1] | math max) ($last + 1)] | math min) - 1
+        }
+    }
+    let rest = ($changes | where {|other| $other != $change })
+    let reordered = ($rest | first $to) ++ [$change] ++ ($rest | skip $to)
+    save-landing-order { order: $reordered moved: ($order.moved | append $change | uniq) }
+    landing-plan
 }
 
 # Land `flight`, holds that `next-flight` chose and that can land as held,
 # with the `ci` launcher in the lead's workspace: `ci land` for one, a train
 # for more. Its log, status reports, and outcome go to the lead's hold; the
-# others' logs point there.
+# others' logs point there. A train reports each topic's outcome to
+# CI_TRAIN_REPORT, and train-verdicts decides each hold's from it.
 def fly [flight: list] {
     let lead = ($flight | first | get hold)
     let held = ($flight | get path | str join ":")
+    let report = $"($lead.log).train.json"
+    rm --force $report
     let common = [--clearance $lead.clearance --timeout $"($lead.timeout_sec)sec" --held $held]
     let args = if ($flight | length) == 1 {
         [land ...$common --attempts $lead.attempts]
@@ -1371,7 +1574,7 @@ def fly [flight: list] {
         try { $"Landing in a train led by ($lead.topic); its log is ($lead.log).\n" | save --append $entry.hold.log }
     }
     let script = if $lead.ci_script == null { {} } else { { CI_SCRIPT: $lead.ci_script } }
-    let code = (with-env ({ PST_FILE: $"($lead.log).status.jsonl" } | merge $script) {
+    let code = (with-env ({ PST_FILE: $"($lead.log).status.jsonl" CI_TRAIN_REPORT: $report } | merge $script) {
         try {
             cd $lead.workspace
             ^$lead.launcher ...$args o+e>> $lead.log
@@ -1382,18 +1585,53 @@ def fly [flight: list] {
         }
     })
     let last = (try { open --raw $lead.log | lines | where {|line| $line | str trim | is-not-empty } | last } catch { "" })
-    for entry in $flight {
-        let landed = if ($flight | length) == 1 { $code == 0 } else {
-            let found = (do { cd $lead.workspace; ^jj log -r $"trunk\() & change_id\(($entry.hold.change))" --no-graph -T 'change_id' } | complete)
-            $found.exit_code == 0 and ($found.stdout | str trim | is-not-empty)
-        }
-        let outcome = if $landed { { exit_code: 0 } } else if ($flight | length) == 1 {
-            { exit_code: $code error: $"did not land: ($last)" }
-        } else {
-            { exit_code: 1 error: $"did not land with the train; see ($lead.log)" }
-        }
-        finish-hold $entry $outcome
+    if ($flight | length) == 1 {
+        finish-hold ($flight | first) (if $code == 0 { { exit_code: 0 } } else { { exit_code: $code error: $"did not land: ($last)" } })
+        return
     }
+    let landed = ($flight | where {|entry|
+        let found = (do { cd $lead.workspace; ^jj log -r $"trunk\() & change_id\(($entry.hold.change))" --no-graph -T 'change_id' } | complete)
+        $found.exit_code == 0 and ($found.stdout | str trim | is-not-empty)
+    } | get hold.change)
+    let rows = (try { open --raw $report | from json } catch { [] })
+    rm --force $report
+    let verdicts = (train-verdicts $flight $rows $landed $"see ($lead.log)")
+    let culprit = ($rows | where kind == "culprit" | get --optional 0.topic)
+    let why = if $culprit == null { "main moved while the train cleared" } else { $"($culprit) failed clearance in the train" }
+    for verdict in ($verdicts | where verdict == "landed") { finish-hold $verdict.entry { exit_code: 0 } }
+    for verdict in ($verdicts | where verdict == "fail") { finish-hold $verdict.entry { exit_code: 1 error: $verdict.error } }
+    rehold ($verdicts | where verdict == "rehold" | get entry) $why
+}
+
+# What becomes of each hold in a train's `flight`, given the `rows` the train
+# reported ({ topic, kind } per branch, kind one of landed, culprit,
+# returned, conflicted, or skipped) and the changes `landed` on trunk. Only
+# the culprit and the topics stacked on it fail for its sake; a topic the
+# train put back on main cleanly goes back in line. A topic it left out, or
+# put back with conflicts, needs its owner and fails. With no rows, as when
+# the train itself failed, every hold that did not land fails, with `hint`.
+# Returns { entry, verdict, error } per hold, verdict landed, rehold, or fail.
+def train-verdicts [flight: list, rows: list, landed: list, hint: string] {
+    $flight | reduce --fold { failed: [] verdicts: [] } {|entry, state|
+        let row = ($rows | where topic == $entry.hold.branch | get --optional 0)
+        let parent = $entry.hold.parent_change?
+        let parent_topic = ($flight | where hold.change == $parent | get --optional 0.hold.topic)
+        let found = if $entry.hold.change in $landed {
+            { verdict: "landed" error: null }
+        } else if $parent != null and $parent in $state.failed {
+            { verdict: "fail" error: $"did not land: its parent ($parent_topic | default $parent) did not land" }
+        } else if $row == null {
+            { verdict: "fail" error: $"did not land with the train; ($hint)" }
+        } else {
+            match $row.kind {
+                "returned" => { verdict: "rehold" error: null }
+                "culprit" => { verdict: "fail" error: $"failed clearance in the train; ($hint)" }
+                _ => { verdict: "fail" error: $"did not land: ($row.outcome? | default $row.kind)" }
+            }
+        }
+        let failed = if $found.verdict == "fail" { $state.failed | append $entry.hold.change } else { $state.failed }
+        { failed: $failed verdicts: ($state.verdicts | append ($found | insert entry $entry)) }
+    } | get verdicts
 }
 
 # Release the drainer lock `lock`, held with `claim`, but only if no hold
@@ -1434,18 +1672,39 @@ def drain-holds [unit?: string] {
         loop {
             let held = (held-topics)
             if ($held | is-empty) {
-                if (release-idle-drainer $lock $claim) { break }
+                if (release-idle-drainer $lock $claim) {
+                    rm --force (landing-order-path)
+                    landing-plan | ignore
+                    break
+                }
                 continue
             }
             for entry in $held { try { hold-job-record $entry.hold $nu.pid } }
-            let flight = (next-flight $held | each {|entry|
-                let problem = (try { hold-problem $entry.hold } catch {|err| $err.msg })
-                if $problem == null { $entry } else {
-                    print $"Dropping ($entry.hold.topic): ($problem)."
-                    finish-hold $entry { exit_code: 1 error: $"dropped: ($problem)" }
-                    null
+            let planned = (plan-holds $held (read-landing-order))
+            let changes = ($planned | get hold.change)
+            # A hold whose parent was dropped from this flight is dropped
+            # with it; one rebased since it was held flies at its new head.
+            let flight = (next-flight $planned | reduce --fold { kept: [] dropped: [] } {|entry, state|
+                let parent = $entry.hold.parent_change?
+                let standing = if $parent != null and $parent in $state.dropped {
+                    { problem: $"its parent ($entry.hold.parent_branch? | default $parent) was dropped" head: $entry.hold.head }
+                } else {
+                    try { hold-standing $entry.hold $changes } catch {|err| { problem: $err.msg head: $entry.hold.head } }
                 }
-            } | compact)
+                if $standing.problem != null {
+                    print $"Dropping ($entry.hold.topic): ($standing.problem)."
+                    finish-hold $entry { exit_code: 1 error: $"dropped: ($standing.problem)" }
+                    $state | update dropped ($state.dropped | append $entry.hold.change)
+                } else if $standing.head != $entry.hold.head {
+                    let hold = ($entry.hold | update head $standing.head)
+                    $hold | to json --raw | save --force $"($entry.path).tmp"
+                    mv --force $"($entry.path).tmp" $entry.path
+                    $state | update kept ($state.kept | append ($entry | update hold $hold))
+                } else {
+                    $state | update kept ($state.kept | append $entry)
+                }
+            } | get kept)
+            landing-plan | ignore
             if ($flight | is-not-empty) {
                 print $"Landing ($flight | each {|entry| $entry.hold.topic } | str join ', ')."
                 fly $flight
@@ -3061,7 +3320,7 @@ def probe-state [probe: closure] {
 # inflight is everything on a running machine. Tools keep plain VCS words.
 def main [] {
     print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` on a clear runway, or `ci queue` to be landed in turn → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
-    print "Also: `ci tower`, `ci start`, `ci status`, `ci queue list`, `ci queue drop`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`, `ci trace export`."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci queue list`, `ci queue move`, `ci queue drop`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`, `ci trace export`."
 }
 
 # The control tower: a live terminal view of every workspace's topic, each
@@ -3612,9 +3871,17 @@ def advance-main [head: string, base: string, label: string, clearance: string] 
 # closure unchanged. A refactor once proved at `proven` is not proved again
 # while its head stays the same. On 2026-10-16 a refactor's proof ran only
 # after a restart, and the landing failed 16 minutes after it started.
-def require-landable [published: record, proven?: string] {
+#
+# `--queue` (`ci queue`) also takes a topic stacked on a held one: the drainer
+# lands it right behind its parent, in the same train when they share a
+# clearance.
+def require-landable [published: record, proven?: string, --queue] {
     if $published.parent != null {
-        error make { msg: $"This topic is stacked on ($published.parent). Land that topic first, then land this one." }
+        let parent_held = $queue and (held-topics | any {|entry| $entry.hold.branch == $published.parent })
+        if not $parent_held {
+            let hint = if $queue { $"`ci queue` ($published.parent) first; this topic then waits in line behind it." } else { "Land that topic first, then land this one, or `ci queue` both and the drainer lands them in order." }
+            error make { msg: $"This topic is stacked on ($published.parent). ($hint)" }
+        }
     }
     if $published.impact == "refactor" and $published.head != $proven {
         phase closures "Proving every NixOS closure unchanged" { require-closure-neutral "trunk()" $published.head }
@@ -3664,7 +3931,7 @@ def topic-agent-step [state?: record, event?: record, --land, --hold, --attempts
 # fast-forwards. No failure is automatically retried or conflict resolved.
 # `held` names the hold files a drainer's landing flies for: it waits its turn
 # on the runway instead of refusing a busy one.
-def drive-topic-agent [state: record, published: record, timeout: duration, gate: string, --held: string] {
+def drive-topic-agent [state: record, published: record, timeout: duration, gate: string, --held: string, --queue] {
     mut step = $state
     mut current = $published
     mut base = ""
@@ -3687,7 +3954,7 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
         }
         let event = try { match $active.state {
             "checking" => {
-                require-landable $current
+                require-landable $current --queue=$queue
                 { type: LANDABLE }
             }
             "holding" => {
@@ -3752,6 +4019,26 @@ def publish-with-agent [land: bool, attempts: int, --hold] {
         error make $err.raw
     }
     { published: $published state: (topic-agent-step $initial { type: PUBLISHED head: $published.head }) }
+}
+
+# The drainer's train, from `holds` in the order it planned them, as plan
+# entries { bookmark, commit, parent, main, impact }. A topic stacked on
+# another hold in the train names that parent's bookmark, counts its own
+# commits' impact, and is checked against main through the chain it joins.
+def held-train-plan [holds: list] {
+    let branches = ($holds | get branch)
+    $holds | each {|hold|
+        let head = (revision-id (bookmark-revset $hold.branch))
+        let parent = if ($hold.parent_branch? != null) and $hold.parent_branch in $branches { $hold.parent_branch } else { null }
+        let base = if $parent == null { trunk-revset } else { bookmark-revset $parent }
+        {
+            bookmark: $hold.branch
+            commit: $head
+            parent: $parent
+            main: (if $parent == null { plan-main-status { current: (contains-main $head) commit: $head } } else { "clean" })
+            impact: (revset-impact $"($base)..($head)")
+        }
+    }
 }
 
 # Why a topic in `ci sequence` cannot join a train, or null when it can.
@@ -3826,8 +4113,8 @@ def release-topic-locks [claims: list] {
 def land-train [timeout: duration, gate: string, --checker: record, --fingerprint: closure, --held: string] {
     let checker = if $checker == null { landing-gate $gate } else { $checker }
     let fingerprint = (select-fingerprint $fingerprint {|flake| closure-fingerprint $flake })
-    let only = if $held == null { null } else {
-        $held | split row ":" | where {|path| $path | is-not-empty } | each {|path| open --raw $path | from json | get branch }
+    let holds = if $held == null { null } else {
+        $held | split row ":" | where {|path| $path | is-not-empty } | each {|path| open --raw $path | from json }
     }
     with-runway 'train "ci land --train"' --alone=($held == null) --hold $held --busy {|ahead|
         report-status error $"The runway is busy: ($ahead)" --id runway
@@ -3836,7 +4123,6 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
         fetch-trunk
         checkpoint "train"
         let base = (revision-id "trunk()")
-        let published = (topic-bookmarks | where parent == null)
         # Snapshot every workspace with work above main first, so edits made
         # there since the last JJ command show as undispatched.
         let busy = (workspaces-in $"(trunk-revset)..working_copies\()")
@@ -3846,9 +4132,25 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 local-complete { ^jj --repository $root status } | ignore
             }
         }
-        let plan = (build-plan $published | where bookmark != null | where {|entry| $only == null or $entry.bookmark in $only })
-        let moved = if ($published | is-empty) { [] } else {
-            other-workspaces-in $"\(($published | each {|topic| bookmark-revset $topic.name } | str join ' | '))::"
+        # The drainer's train flies its holds in the order it planned, a
+        # stacked topic right behind its parent; `ci land --train` takes
+        # every unstacked topic in `ci sequence` order.
+        let planned = if $holds == null {
+            build-plan (topic-bookmarks | where parent == null) | where bookmark != null | insert parent null
+        } else {
+            held-train-plan $holds
+        }
+        let plan = ($planned | each {|entry|
+            # Whether each topic is dispatched as it stands is read before
+            # the train moves any of them: a stacked topic moves with its
+            # parent.
+            let head = (revision-id (bookmark-revset $entry.bookmark))
+            $entry
+            | insert pushed ($head == (try { revision-id (remote-bookmark-revset $entry.bookmark) } catch { "" }))
+            | insert dispatched ($entry.commit == $head)
+        })
+        let moved = if ($plan | is-empty) { [] } else {
+            other-workspaces-in $"\(($plan | each {|entry| bookmark-revset $entry.bookmark } | str join ' | '))::"
         }
         mut claims = []
         mut chain = []
@@ -3858,14 +4160,14 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
             for entry in $plan {
                 let bookmark = (bookmark-revset $entry.bookmark)
                 let head = (revision-id $bookmark)
-                let reason = (train-exclusion {
-                    main: $entry.main
-                    impact: $entry.impact
-                    pushed: ($head == (try { revision-id (remote-bookmark-revset $entry.bookmark) } catch { "" }))
-                    dispatched: ($entry.commit == $head)
-                })
+                let joined = ($chain | get --optional name | default [])
+                let reason = if $entry.parent != null and $entry.parent not-in $joined {
+                    $"its parent ($entry.parent) did not join the train"
+                } else {
+                    train-exclusion ($entry | select main impact pushed dispatched)
+                }
                 if $reason != null {
-                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($reason)" })
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($reason)" kind: "skipped" })
                     continue
                 }
                 let change = (revision-field $head 'change_id')
@@ -3874,15 +4176,18 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 let claim = ({ topic: (lock-topic $head) pid: $nu.pid start: (process-start $nu.pid) workspace: $env.PWD } | to json --raw)
                 let holder = (claim-local-checks-lock $lock $claim)
                 if $holder != null {
-                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: pid ($holder.pid? | default '?') is moving it" })
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: pid ($holder.pid? | default '?') is moving it" kind: "skipped" })
                     continue
                 }
                 $claims = ($claims | append { lock: $lock claim: $claim })
-                let on_tip = (contains-main $head) and $tip == $base
+                # A topic already on the train's tip joins as it is: one on
+                # main while the train is empty, or a stacked topic that
+                # moved with its parent, the topic before it.
                 let candidate = $tip
+                let on_tip = (revset-change-ids $"($candidate) & ::($head)" | is-not-empty)
                 let trial = if $on_tip { { conflict: false } } else { trial-merge [$candidate $head] }
                 if $trial.conflict {
-                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: "skipped: conflicts with the train" })
+                    $skipped = ($skipped | append { topic: $entry.bookmark outcome: "skipped: conflicts with the train" kind: "skipped" })
                     continue
                 }
                 if $entry.impact == "refactor" {
@@ -3899,7 +4204,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                         null
                     } catch {|err| $err.msg })
                     if $proof != null {
-                        $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($proof | lines | first)" })
+                        $skipped = ($skipped | append { topic: $entry.bookmark outcome: $"skipped: ($proof | lines | first)" kind: "skipped" })
                         continue
                     }
                 }
@@ -3911,7 +4216,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 }
                 let rebased = (revision-id $bookmark)
                 print $"($entry.bookmark) joins the train at ($rebased | str substring 0..11)."
-                $chain = ($chain | append { name: $entry.bookmark head: $rebased below: $candidate impact: $entry.impact })
+                $chain = ($chain | append { name: $entry.bookmark head: $rebased below: $candidate impact: $entry.impact parent: $entry.parent })
                 $tip = $rebased
             }
             if ($chain | is-empty) {
@@ -3948,31 +4253,42 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
         }
         let result = $outcome.value
         # Return every topic that did not land to main: the first stays where
-        # it is, on the landed prefix or on main; the rest are moved onto
-        # main newest first, so the commits above the topic below each one
-        # are still its own.
+        # it is, on the landed prefix or on main; the rest are moved newest
+        # first, so the commits above the topic below each one are still its
+        # own. A stacked topic whose parent also returns goes back onto that
+        # parent, and moves to main with it.
         let returned = ($result.chain | skip $result.landed)
-        let returns = ($returned | enumerate | reverse | each {|entry|
-            if $entry.index > 0 {
-                let own = $"roots\(($entry.item.below)..(bookmark-revset $entry.item.name))"
-                run-command $"returning ($entry.item.name) to main" {
-                    ^jj ...(checkpoint-tag) rebase -s $own -o (trunk-revset) --skip-emptied
-                } | ignore
-            }
-            let conflicted = (conflicted-revisions $"(trunk-revset)..(bookmark-revset $entry.item.name)" | is-not-empty)
-            if not $conflicted { push-topic-bookmark $entry.item.name }
-            { topic: $entry.item.name conflicted: $conflicted }
-        } | reverse)
+        let returning = ($returned | get name)
+        for entry in ($returned | enumerate | reverse) {
+            if $entry.index == 0 { continue }
+            let own = $"roots\(($entry.item.below)..(bookmark-revset $entry.item.name))"
+            let parent = $entry.item.parent
+            let onto = if $parent != null and $parent in $returning { bookmark-revset $parent } else { trunk-revset }
+            let place = if $onto == (trunk-revset) { "main" } else { $parent }
+            run-command $"returning ($entry.item.name) to ($place)" {
+                ^jj ...(checkpoint-tag) rebase -s $own -o $onto --skip-emptied
+            } | ignore
+        }
+        let returns = ($returned | each {|entry|
+            let conflicted = (conflicted-revisions $"(trunk-revset)..(bookmark-revset $entry.name)" | is-not-empty)
+            if not $conflicted { push-topic-bookmark $entry.name }
+            { topic: $entry.name conflicted: $conflicted }
+        })
         update-moved-workspaces $moved
         release-topic-locks $claims
         let culprit = $result.failure.culprit?
-        let rows = (($result.chain | first $result.landed | each {|entry| { topic: $entry.name outcome: "landed" } })
+        let rows = (($result.chain | first $result.landed | each {|entry| { topic: $entry.name outcome: "landed" kind: "landed" } })
             ++ ($returns | each {|entry|
                 let state = if $entry.conflicted { "returned to main with conflicts; resolve before landing" } else { "returned to main" }
-                { topic: $entry.topic outcome: (if $entry.topic == $culprit { $"failed clearance, ($state)" } else { $state }) }
+                let kind = if $entry.topic == $culprit { "culprit" } else if $entry.conflicted { "conflicted" } else { "returned" }
+                { topic: $entry.topic outcome: (if $entry.topic == $culprit { $"failed clearance, ($state)" } else { $state }) kind: $kind }
             })
             ++ $skipped)
-        if ($rows | is-not-empty) { print ($rows | table) }
+        # The drainer reads each topic's outcome here to decide its hold's.
+        if ($env.CI_TRAIN_REPORT? | is-not-empty) {
+            try { $rows | to json --raw | save --force $env.CI_TRAIN_REPORT }
+        }
+        if ($rows | is-not-empty) { print ($rows | select topic outcome | table) }
         if $culprit != null {
             let message = $"($culprit) failed clearance on top of the ($result.landed) topic\(s) that landed: ($result.failure.failure? | default 'no reason given')"
             report-status error $message --id train
@@ -4169,7 +4485,7 @@ def "main queue" [
                 finish-hold $entry { exit_code: 1 error: "dropped: queued again" }
             }
             let run = (publish-with-agent false $attempts --hold)
-            drive-topic-agent $run.state $run.published $timeout $clearance
+            drive-topic-agent $run.state $run.published $timeout $clearance --queue
         }
     }
 }
@@ -4184,15 +4500,7 @@ def "main queue list" [
     let runway = (runway-tickets $queue | each {|ticket|
         { topic: ($ticket.holder.topic? | default "") pid: $ticket.holder.pid? workspace: ($ticket.holder.workspace? | default "") }
     })
-    let held = (held-topics | each {|entry|
-        {
-            topic: $entry.hold.topic
-            head: ($entry.hold.head | str substring 0..11)
-            clearance: $entry.hold.clearance
-            held_at: $entry.hold.held_at
-            log: $entry.hold.log
-        }
-    })
+    let held = (landing-plan | each {|row| $row | update head ($row.head | str substring 0..11) })
     let holder = (try { open --raw (drainer-lock-path) | from json } catch { null })
     let drainer = if $holder != null and (try { lock-holder-alive $holder } catch { false }) { { pid: $holder.pid unit: $holder.unit? } } else { null }
     let outcomes = ((holds-path) | path join "outcomes.jsonl")
@@ -4203,13 +4511,30 @@ def "main queue list" [
     if $json { return ($report | to json) }
     print (if ($runway | is-empty) { "Runway: clear." } else { "Runway:" })
     if ($runway | is-not-empty) { print ($runway | table) }
-    print (if ($held | is-empty) { "Held: none." } else { "Held, in landing order:" })
-    if ($held | is-not-empty) { print ($held | table) }
+    print (if ($held | is-empty) { "Held: none." } else { "Held, in landing order (one flight lands as one train):" })
+    if ($held | is-not-empty) { print ($held | select flight topic head clearance reason held_at | table --index 1) }
     print (if $drainer == null { "Drainer: not running." } else { $"Drainer: pid ($drainer.pid) \(($drainer.unit? | default 'no unit'))." })
     if ($recent | is-not-empty) {
         print "Recent held landings:"
         print ($recent | select --optional at topic exit_code error | table)
     }
+}
+
+# Move a held topic in the line: `first`, `last`, `up`, `down`, or to a
+# 1-based position. A stacked topic never passes its parent, and the order
+# lasts until the drainer goes idle. The drainer reads the line before each
+# flight, so a flight already landing keeps its topics.
+def "main queue move" [
+    place: string # first, last, up, down, or a position counting from 1
+    --change: string # The held change to move (default: this workspace's topic); a prefix will do
+] {
+    let held = (held-topics | get hold.change)
+    let wanted = if $change == null { current-topic-id } else { $change }
+    let matches = ($held | where {|candidate| $candidate | str starts-with $wanted })
+    if ($matches | length) > 1 { error make { msg: $"($wanted) names more than one held change: ($matches | str join ', ')." } }
+    let line = (move-hold ($matches | get --optional 0 | default $wanted) $place)
+    print "Held, in landing order:"
+    print ($line | select flight topic reason | table --index 1)
 }
 
 # Take this topic out of the line: its hold ends without landing.

@@ -48,13 +48,20 @@ pub struct Locks {
     pub held: Vec<Held>,
 }
 
-/// A topic held for the drainer: ci's hold-topic record.
+/// A topic held for the drainer: ci's hold-topic record, with its place in
+/// the line from ci's landing-plan.json.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Held {
     /// `change "title"`, as ci's lock-topic writes it.
     pub topic: String,
+    /// The full change id, which `ci queue move --change` takes.
+    pub change_id: String,
     pub workspace: String,
     pub since_ms: Option<i64>,
+    /// The flight it lands in, counting from 1; one flight is one train.
+    pub flight: Option<u64>,
+    /// Why it holds its place: arrival, moved by hand, stacked on a parent.
+    pub reason: Option<String>,
 }
 
 impl Held {
@@ -92,9 +99,35 @@ fn held(path: &Path) -> Option<Held> {
     let field = |key: &str| value.get(key).and_then(|v| v.as_str());
     Some(Held {
         topic: field("topic")?.to_string(),
+        change_id: field("change").unwrap_or("").to_string(),
         workspace: field("workspace").unwrap_or("").to_string(),
         since_ms: field("held_at").and_then(time::parse),
+        flight: None,
+        reason: None,
     })
+}
+
+/// Put `held`, in ticket order, in the order of ci's line, `plan` (the rows
+/// of landing-plan.json), with each one's flight and reason. ci writes the
+/// plan whenever it reads or changes the line; a hold it has not planned
+/// yet keeps its ticket order after the planned ones.
+fn order_held(mut held: Vec<Held>, plan: &[serde_json::Value]) -> Vec<Held> {
+    let place = |change: &str| {
+        plan.iter()
+            .position(|row| row.get("change").and_then(|c| c.as_str()) == Some(change))
+    };
+    for hold in &mut held {
+        if let Some(row) = place(&hold.change_id).map(|index| &plan[index]) {
+            hold.flight = row.get("flight").and_then(|f| f.as_u64());
+            hold.reason = row
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+        }
+    }
+    // A stable sort keeps unplanned holds in ticket order.
+    held.sort_by_key(|hold| place(&hold.change_id).unwrap_or(usize::MAX));
+    held
 }
 
 /// A process's start time in clock ticks since boot, as ci's process-start.
@@ -196,6 +229,11 @@ impl LockReader {
             .iter()
             .filter_map(|p| held(p))
             .collect();
+        let plan: Vec<serde_json::Value> = fs::read_to_string(dir.join("landing-plan.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let held = order_held(held, &plan);
         Locks {
             checks,
             topics,
@@ -267,6 +305,38 @@ pub fn host_info() -> HostInfo {
         queued,
         activated_ms,
         running,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hold(change: &str) -> Held {
+        Held {
+            topic: format!("{change} \"{change}\""),
+            change_id: change.into(),
+            workspace: String::new(),
+            since_ms: None,
+            flight: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn held_topics_follow_the_line_ci_planned() {
+        let plan: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"change": "kc", "flight": 1, "reason": "moved by hand"},
+                {"change": "ka", "flight": 1, "reason": "arrival"},
+                {"change": "kgone", "flight": 2, "reason": "arrival"}]"#,
+        )
+        .unwrap();
+        let held = order_held(vec![hold("ka"), hold("kb"), hold("kc")], &plan);
+        let changes: Vec<&str> = held.iter().map(|h| h.change_id.as_str()).collect();
+        assert_eq!(changes, ["kc", "ka", "kb"], "unplanned holds go last");
+        assert_eq!(held[0].reason.as_deref(), Some("moved by hand"));
+        assert_eq!(held[1].flight, Some(1));
+        assert_eq!(held[2].flight, None);
     }
 }
 

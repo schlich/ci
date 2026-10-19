@@ -239,6 +239,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_hints(frame, hints, app);
     match &app.mode {
         Mode::Action => draw_actions(frame, body, app),
+        Mode::Queue => draw_queue(frame, body, app),
         Mode::Confirm(_) => draw_confirm(frame, area, app),
         Mode::Help => draw_help(frame, area, app),
         _ => {}
@@ -1841,12 +1842,23 @@ fn draw_trunk_side(frame: &mut Frame, area: Rect, app: &App) {
             .since_ms
             .map(|s| format!(" · {}", time::duration(now - s)))
             .unwrap_or_default();
+        let flight = held.flight.map(|f| format!("✈{f} ")).unwrap_or_default();
+        let reason = held
+            .reason
+            .as_ref()
+            .filter(|r| r.as_str() != "arrival")
+            .map(|r| format!(" · {r}"))
+            .unwrap_or_default();
         lines.push(field(
             theme,
             "HELD",
             vec![Span::styled(
                 truncate(
-                    &format!("{} \"{}\"{since}", held.change(), held.title()),
+                    &format!(
+                        "{flight}{} \"{}\"{reason}{since}",
+                        held.change(),
+                        held.title()
+                    ),
                     text_w,
                 ),
                 theme.fg(theme.accent),
@@ -1972,12 +1984,21 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("x", "stop run"),
             ("␣/esc", "back"),
         ],
+        Mode::Queue => vec![
+            ("j/k", "select"),
+            ("K", "move up"),
+            ("J", "move down"),
+            ("T", "first"),
+            ("B", "last"),
+            ("l/esc", "back"),
+        ],
         Mode::Confirm(_) => vec![("y", "run it"), ("n/esc", "back")],
         Mode::Help => vec![("esc/?", "close")],
         Mode::Normal => match app.view {
             View::Board => vec![
                 ("j/k", "move"),
                 ("␣", "actions"),
+                ("l", "line"),
                 ("⏎", "runs"),
                 ("/", "filter"),
                 ("i", "idle"),
@@ -2001,6 +2022,7 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("PgUp/PgDn", "scroll"),
                 ("f", "follow"),
                 ("␣", "actions"),
+                ("l", "line"),
                 ("/", "filter"),
                 ("y", "yank id"),
                 ("⇥", "view"),
@@ -2009,6 +2031,7 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ],
             View::Trunk => vec![
                 ("j/k", "move"),
+                ("l", "line"),
                 ("y", "yank commit"),
                 ("⇥", "view"),
                 ("r", "reread"),
@@ -2024,6 +2047,7 @@ fn mode_color(theme: &Theme, mode: &Mode) -> Color {
         Mode::Normal => theme.accent2,
         Mode::Filter => theme.warn,
         Mode::Action => theme.accent,
+        Mode::Queue => theme.orange,
         Mode::Confirm(_) => theme.err,
         Mode::Help => theme.purple,
     }
@@ -2133,6 +2157,64 @@ fn draw_actions(frame: &mut Frame, body: Rect, app: &App) {
                 Span::styled(format!("  {}  ", action.key()), key_style),
                 Span::styled(format!("{:<15}", action.label()), label_style),
                 Span::styled(action.about(), theme.faint()),
+            ],
+            inner.width as usize,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// QUEUE mode: the held topics in the order the drainer lands them, flight
+/// by flight, each with the reason for its place.
+fn draw_queue(frame: &mut Frame, body: Rect, app: &App) {
+    let theme = &app.theme;
+    let held = &app.locks.held;
+    let selected = app.selected_hold();
+    let w = 78.min(body.width.saturating_sub(2));
+    let h = held.len() as u16 + 4;
+    let area = Rect::new(
+        body.x + (body.width.saturating_sub(w)) / 2,
+        body.y + body.height.saturating_sub(h),
+        w,
+        h.min(body.height),
+    );
+    frame.render_widget(Clear, area);
+    let block = panel(
+        theme,
+        title_spans(theme, "Line · held topics in landing order", true),
+        true,
+    )
+    .style(Style::default().bg(theme.bar));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let now = time::now_ms();
+    let mut lines = vec![Line::raw("")];
+    for (index, hold) in held.iter().enumerate() {
+        let chosen = selected == Some(index);
+        let marker = if chosen { "▶" } else { " " };
+        let flight = hold
+            .flight
+            .map(|f| format!("✈{f:<2}"))
+            .unwrap_or_else(|| "   ".into());
+        let since = hold
+            .since_ms
+            .map(|s| format!(" · {}", time::duration(now - s)))
+            .unwrap_or_default();
+        let title_style = if chosen {
+            theme.bold(theme.text)
+        } else {
+            theme.fg(theme.text)
+        };
+        lines.push(Line::from(fit(
+            vec![
+                Span::styled(format!(" {marker} {:>2}. ", index + 1), theme.bold(theme.orange)),
+                Span::styled(format!("{flight} "), theme.fg(theme.accent)),
+                Span::styled(format!("{} ", hold.change()), theme.fg(theme.purple)),
+                Span::styled(format!("\"{}\" ", hold.title()), title_style),
+                Span::styled(
+                    format!("{}{since}", hold.reason.as_deref().unwrap_or("not planned yet")),
+                    theme.faint(),
+                ),
             ],
             inner.width as usize,
         )));
@@ -2255,6 +2337,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         key("j k ↑ ↓", "move the selection; g G jump to the ends"),
         key("⇥ ⇤ 1 2 3", "switch view: Board, Runs, Trunk"),
         key("␣", "ACTION mode: run a ci step for the selection"),
+        key("l", "QUEUE mode: the line of held topics"),
         key("/", "FILTER mode: narrow topics or runs"),
         key("y Y", "copy the change id / the path (OSC 52)"),
         key("r", "read the graph again now"),
@@ -2268,9 +2351,14 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         key("⏎", "zoom the log; esc unzooms"),
         key("PgUp PgDn", "scroll the log; f follows it again"),
         Line::raw(""),
+        head("QUEUE"),
+        key("j k", "select a held topic"),
+        key("K J", "move it up or down the line"),
+        key("T B", "move it first or last"),
+        Line::raw(""),
         head("MODES"),
         key("esc", "back to NORMAL from any mode"),
-        key("␣ / ? again", "leave the mode the key entered"),
+        key("␣ l ? again", "leave the mode the key entered"),
         Line::raw(""),
         head("STAGES"),
     ];

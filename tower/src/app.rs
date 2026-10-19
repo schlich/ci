@@ -182,6 +182,8 @@ pub enum Mode {
     Normal,
     Filter,
     Action,
+    /// The line of held topics, where a person reorders it.
+    Queue,
     Confirm(Pending),
     Help,
 }
@@ -192,8 +194,29 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Filter => "FILTER",
             Mode::Action => "ACTION",
+            Mode::Queue => "QUEUE",
             Mode::Confirm(_) => "CONFIRM",
             Mode::Help => "HELP",
+        }
+    }
+}
+
+/// Where QUEUE mode moves the selected hold: `ci queue move PLACE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
+    First,
+    Last,
+}
+
+impl Move {
+    pub fn place(self) -> &'static str {
+        match self {
+            Move::Up => "up",
+            Move::Down => "down",
+            Move::First => "first",
+            Move::Last => "last",
         }
     }
 }
@@ -264,6 +287,9 @@ pub struct App {
     pub run_id: Option<String>,
     pub run_index: usize,
     pub trunk_index: usize,
+    /// The selected hold in QUEUE mode, by change id, so it stays selected
+    /// as the line moves.
+    pub queue_change: Option<String>,
     pub log: LogView,
     pub toast: Option<Toast>,
     pub frame: usize,
@@ -297,6 +323,7 @@ impl App {
             run_id: None,
             run_index: 0,
             trunk_index: 0,
+            queue_change: None,
             log: LogView {
                 run: None,
                 lines: vec![],
@@ -615,6 +642,16 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Queue => match key.code {
+                KeyCode::Esc | KeyCode::Char('l') => self.mode = Mode::Normal,
+                KeyCode::Char('j') | KeyCode::Down => self.select_hold(1),
+                KeyCode::Char('k') | KeyCode::Up => self.select_hold(-1),
+                KeyCode::Char('K') => self.move_hold(Move::Up),
+                KeyCode::Char('J') => self.move_hold(Move::Down),
+                KeyCode::Char('T') => self.move_hold(Move::First),
+                KeyCode::Char('B') => self.move_hold(Move::Last),
+                _ => {}
+            },
             Mode::Confirm(pending) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.mode = Mode::Normal;
@@ -663,6 +700,13 @@ impl App {
             KeyCode::PageUp => self.page(-1),
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char(' ') => self.mode = Mode::Action,
+            KeyCode::Char('l') => {
+                if self.locks.held.is_empty() {
+                    self.toast(Level::Info, "No topic is held; ␣ Q queues one");
+                } else {
+                    self.mode = Mode::Queue;
+                }
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('i') if self.view == View::Board => {
                 self.show_idle = !self.show_idle;
@@ -713,6 +757,72 @@ impl App {
                 View::Trunk => {}
             },
             _ => {}
+        }
+    }
+
+    /// The selected hold's place in the line, in QUEUE mode.
+    pub fn selected_hold(&self) -> Option<usize> {
+        let held = &self.locks.held;
+        if held.is_empty() {
+            return None;
+        }
+        self.queue_change
+            .as_ref()
+            .and_then(|change| held.iter().position(|h| &h.change_id == change))
+            .or(Some(0))
+    }
+
+    fn select_hold(&mut self, delta: isize) {
+        let Some(current) = self.selected_hold() else {
+            return;
+        };
+        let last = self.locks.held.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        self.queue_change = Some(self.locks.held[next].change_id.clone());
+    }
+
+    /// Move the selected hold with `ci queue move`, run from the hold's
+    /// workspace so it is that repository's ci. It takes a moment and
+    /// changes only the line's order file, so the tower waits for it. The
+    /// line is reordered here at once; the next read of ci's plan confirms
+    /// it.
+    fn move_hold(&mut self, to: Move) {
+        let Some(index) = self.selected_hold() else {
+            return;
+        };
+        let hold = self.locks.held[index].clone();
+        let mut command = Command::new(&self.ci);
+        command.args(["queue", "move", to.place(), "--change", &hold.change_id]);
+        if std::path::Path::new(&hold.workspace).is_dir() {
+            command.current_dir(&hold.workspace);
+        }
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let held = &mut self.locks.held;
+                let moved = held.remove(index);
+                let at = match to {
+                    Move::Up => index.saturating_sub(1),
+                    Move::Down => (index + 1).min(held.len()),
+                    Move::First => 0,
+                    Move::Last => held.len(),
+                };
+                held.insert(at, moved);
+                self.queue_change = Some(hold.change_id.clone());
+                self.toast(
+                    Level::Ok,
+                    format!("Moved {} {}", hold.change(), to.place()),
+                );
+            }
+            Ok(output) => {
+                let error = String::from_utf8_lossy(&output.stderr);
+                let reason = error
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with('x') || line.contains("held"))
+                    .unwrap_or("ci queue move failed");
+                self.toast(Level::Error, reason.trim_start_matches("x ").to_string());
+            }
+            Err(error) => self.toast(Level::Error, format!("Could not run ci: {error}")),
         }
     }
 

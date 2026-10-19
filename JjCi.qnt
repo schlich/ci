@@ -20,7 +20,11 @@
 // then takes. `ci land` takes the runway only when it is clear, with no
 // landing in flight and no topic held ahead; otherwise it refuses. `ci queue`
 // holds the topic's exact head instead, and the drainer takes the runway for
-// each held topic in turn, only for the head that was held. The model leaves
+// each held topic in turn, only for the head that was held or a clean rebase
+// of it. A topic stacked on an unlanded parent may be held: the drainer
+// orders it behind its parent, and it still lands only once that parent has
+// landed. A train that fails on another topic may put this one back in line
+// as it leaves the runway. The model leaves
 // out what moves trunk from outside the runway, such as another machine,
 // which `ci land --attempts` retries. A train (`ci land --train`, or the
 // drainer with several held topics) lands several topics in one fast-forward
@@ -113,7 +117,10 @@ module JjCi {
   }
 
   // A rebase onto the current trunk rewrites every commit in the topic, so
-  // the head changes too.
+  // the head changes too. A clean rebase leaves the change's own diff alone,
+  // so a hold follows it to the new head: the drainer lands a held topic that
+  // a train put back on main, or that moved with its stack parent, at its
+  // rebased head.
   action RebaseClean = {
     nondet h = Heads.oneOf()
     all {
@@ -121,7 +128,14 @@ module JjCi {
       s.active,
       not(s.conflict),
       not(s.delivered),
-      s' = { base: s.mainHead, head: h, validated: false, validatedHead: "none", ...s }
+      s' = {
+        base: s.mainHead,
+        head: h,
+        validated: false,
+        validatedHead: "none",
+        heldHead: if (s.holding) h else s.heldHead,
+        ...s
+      }
     }
   }
 
@@ -273,12 +287,20 @@ module JjCi {
   }
 
   // A landing that stops short, on a conflict or a failed gate, leaves the
-  // runway without landing.
+  // runway without landing. A drainer's train whose clearance another topic
+  // failed puts this one back in line instead: held again at its head, in
+  // the place it held before.
   action LeaveRunway = {
+    nondet requeue = Set(true, false).oneOf()
     all {
       s.onRunway,
       not(s.delivered),
-      s' = { onRunway: false, ...s }
+      s' = {
+        onRunway: false,
+        holding: requeue,
+        heldHead: if (requeue) s.head else "none",
+        ...s
+      }
     }
   }
 

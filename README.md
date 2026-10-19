@@ -128,7 +128,8 @@ ci interdiff v1 v2
 ci land                     # On a clear runway: build the flake checks locally, then fast-forward main.
 ci land --clearance github  # Take clearance from GitHub Actions (or nixbot) instead.
 ci queue                    # With a landing in flight: hold the topic; the drainer lands it in turn.
-ci queue list               # The runway, the held topics, and how recent ones ended.
+ci queue list               # The runway, the line of held topics and why each holds its place, recent outcomes.
+ci queue move first         # Move this topic in the line: first, last, up, down, or a position.
 ci park                     # Confirm the landing and free the workspace.
 # To drop an undispatched or closed topic instead:
 ci cancel
@@ -276,25 +277,68 @@ that session may not live to see. `ci queue` is for the rest. It dispatches
 the topic, runs the same fast checks, and holds the exact head it pushed in
 `$XDG_STATE_HOME/jj-ci/landing-holds/`, then returns. The drainer, a
 transient systemd user unit (`ci-landing-drain-*`) that `ci queue` starts
-when none runs, lands held topics in the order they were held. Holds of the
-same repository and clearance fly together as one train (below), so a
-backlog costs one clearance rather than one per topic. The drainer waits its
+when none runs, lands held topics a flight at a time. The drainer waits its
 turn on the runway like any landing, reporting the wait as `working` under
 `runway`, since waiting one's turn is progress rather than something for a
-person to unblock. Before each flight it drops a hold whose workspace no
-longer has the held change checked out at the held head: an edit after `ci
-queue` ends the hold instead of landing a head nobody queued, and `ci queue`
-again holds the new head. Its landing takes a runway ticket before the hold
-goes, so no `ci land` finds the runway clear between the two.
+person to unblock. Its landing takes a runway ticket before the hold goes,
+so no `ci land` finds the runway clear between the two.
+
+The line has three rules, and nothing else reorders it:
+
+1. Holds come in the order a person gave with `ci queue move`, then in the
+   order they were first held. A hold put back in line (below) keeps its
+   place.
+2. A topic stacked on a held topic comes after its parent. `ci queue`
+   accepts a stacked topic only while its parent is held, and the drainer
+   lands it only behind that parent, or once the parent is on `main`.
+3. A flight is the first hold in line together with every later hold of the
+   same repository and clearance, so a backlog costs one clearance rather
+   than one per topic. A train (below) flies the holds in line order. A
+   stacked topic joins only behind its parent; one whose parent waits for a
+   later flight, as with a different clearance, waits for that flight.
+
+There is no cost model. History in the ci log gives only per-repository
+clearance times, which cannot tell apart the topics of one train. Counting
+the derivations a head would build costs about as much as a cached clearance.
+So no hold is ever passed over for a cheaper one.
+
+Before each flight the drainer checks every hold in it. It drops a hold whose
+workspace no longer has the held change checked out, or whose head changed
+other than by a clean rebase: an edit after `ci queue` ends the hold instead
+of landing a head nobody queued, and `ci queue` again holds the new head. A
+clean rebase, one that `jj interdiff` shows leaves the change's own diff
+alone, keeps the hold at the new head: a train puts topics back on `main`
+that way, and a stacked topic moves with its parent. It also drops a stacked
+hold whose parent left the line without landing, and every hold stacked on a
+hold it drops.
+
+When a train's clearance fails, only the culprit and the topics stacked on
+it lose their holds. Every other topic the train put back on `main` cleanly
+goes back in line, at the place it held, and flies again in the next flight
+without the culprit. A topic the train left out, or put back with conflicts,
+needs its owner and loses its hold. A hold goes back in line at most
+`--attempts` times. If something outside the runway keeps moving `main`, the
+train lands nothing each time, and the hold then ends.
+
+`ci queue list` shows the runway, the line with each hold's flight and the
+reason for its place (arrival, moved by hand, stacked on its parent, or back
+in line after a train failed), the drainer, and recent outcomes. `ci queue
+move PLACE` moves the current topic, or `--change ID`, in the line as shown:
+`first`, `last`, `up`, `down`, or a position counting from 1. A stacked topic
+still never passes its parent, and a topic still flies in the train of the
+first held topic of its repository and clearance, so a move inside a flight
+only reorders that train. The order is kept in `jj-ci/landing-order.json`
+until the drainer goes idle; a topic queued afresh takes its arrival place.
+`ci queue drop` takes the current topic out of the line. ci writes the line
+to `jj-ci/landing-plan.json` whenever it reads or changes it, for the tower,
+whose QUEUE mode (`l`) shows it and moves holds with `ci queue move`.
 
 Each hold has a log under `landing-holds/logs/` in `job-log`'s shape:
 `ci queue` prints its path, `watch-job LOG` follows the landing to its DONE
 line, and the outcome lands in `LOG.done.nuon` and in
-`landing-holds/outcomes.jsonl`. `ci queue list` shows the runway, the held
-topics in landing order, the drainer, and recent outcomes; `ci queue drop`
-takes the current topic out of the line. The drainer leaves once no hold
-waits, checking under the same guard that hold creation takes, so a hold
-drawn at that moment is either seen or starts a new drainer.
+`landing-holds/outcomes.jsonl`. The drainer leaves once no hold waits,
+checking under the same guard that hold creation takes, so a hold drawn at
+that moment is either seen or starts a new drainer.
 
 Something outside the runway can still move `main`: another machine, or a push
 by hand. The push of `main` therefore still carries JJ's lease on it, and
@@ -311,7 +355,9 @@ sequence` lists, in that order, and rebases each onto the one before it,
 forming one linear chain on `main`. A topic joins only as it was dispatched:
 its local bookmark is the one on the trunk remote, with no edits above it,
 it is not stacked on another topic, does not conflict with `main`, and has
-one declared impact. A topic whose rebase onto the chain would conflict, or
+one declared impact. The drainer's train also takes a held topic stacked on
+another topic in the same flight. It joins right behind its parent's place
+in the chain, and its own commits count for its impact. A topic whose rebase onto the chain would conflict, or
 that another `ci` is moving (its topic lock is held), is left untouched.
 Each declared refactor proves its closures unchanged against the chain
 below it, on a trial merge, before it joins, and stays out if they changed.
@@ -322,9 +368,11 @@ would. When it fails, `ci land --train` bisects: it takes clearance on
 prefixes of the chain to find the first topic that fails, about log2(N) more
 runs, lands the prefix before that topic, and reports the culprit with its
 failure. The culprit stays on the new `main`, the topics after it move back
-onto `main` without it, and each is pushed unless it conflicts there; their
-owners land them again. The run ends with a table of what happened to each
-topic, and fails when a culprit was found. Workspaces with a train topic
+onto `main` without it, and each is pushed unless it conflicts there. A
+stacked topic whose parent also moves back goes back onto that parent. Their
+owners land them again, or the drainer puts its holds back in line. The run
+ends with a table of what happened to each topic, and fails when a culprit
+was found. The drainer reads each topic's outcome from `CI_TRAIN_REPORT`. Workspaces with a train topic
 checked out are snapshotted before planning and updated afterwards, and the
 whole rewrite has one `ci recover` checkpoint. A train does not retry: if
 something outside the runway moves `main` while it clears, nothing lands and
@@ -408,8 +456,8 @@ waits for, then the runway, then the local checks lock. Nothing that holds
 the local checks lock waits for the runway, so no two `ci` processes can
 deadlock. `ci tower` shows the landing on the runway as LANDING, any
 landings waiting behind it (the drainer's, or a train) as WAITING, and the
-topics held for the drainer as HELD; `Q` in ACTION mode queues the selected
-topic.
+topics held for the drainer as HELD, in line order with their flight and
+the reason for their place; `Q` in ACTION mode queues the selected topic.
 
 Other sessions' work cannot stop a landing either. The plan that places a
 topic names every other topic's tip by commit, so a divergent change in some
@@ -737,8 +785,11 @@ the ci MCP server's layout, so agents see it with the `jobs` and `job` tools
 and `watch-job` follows it, and it outlives the tower. Dispatch, land, park,
 cancel, and stopping a run ask first, as does any change to a workspace an
 active Codex task owns; a workspace with a mutating job still running refuses
-another, as the MCP server does. The hint bar always lists the keys of the
-current mode, and Esc returns to NORMAL.
+another, as the MCP server does. `l` opens QUEUE mode on the line of held
+topics, flight by flight: `j`/`k` select a hold, `K`/`J` move it up or down,
+`T`/`B` move it first or last, each through `ci queue move`, and `l` or Esc
+goes back. The hint bar always lists the keys of the current mode, and Esc
+returns to NORMAL.
 
 The tower reads JJ with `--ignore-working-copy`, so it never snapshots
 another session's working copy, and it reads the graph again only when the

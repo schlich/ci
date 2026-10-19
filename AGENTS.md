@@ -16,7 +16,8 @@
   `ci-launch.nu`'s choice rules in step with `tests/ci-launch-properties.nu`,
   and test a workflow change from another repository with
   `CI_SCRIPT=/path/to/ci.nu ci ...`.
-- The tower only reads, except for jobs a user starts from ACTION mode. Keep
+- The tower only reads, except for jobs a user starts from ACTION mode and
+  holds a user moves in the line from QUEUE mode (`ci queue move`). Keep
   JJ reads on `--ignore-working-copy`, and keep every key it binds in the
   hint bar of the mode where it works, with Esc returning to NORMAL.
 - Check changes with `nix flake check path:.`; `cargo test` in `lifecycle/`

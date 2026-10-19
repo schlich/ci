@@ -748,8 +748,30 @@ async def queue(
 @mcp.tool(annotations=READ_ONLY)
 async def queue_list(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
     """`ci queue list --json`: the runway, the topics held for it in landing
-    order, the drainer, and how the latest held topics ended."""
+    order with each one's flight and the reason for its place, the drainer,
+    and how the latest held topics ended."""
     return await run(["queue", "list", "--json"], workspace, wait_seconds)
+
+
+@mcp.tool(annotations=LOCAL)
+async def queue_move(
+    place: Annotated[
+        str,
+        Field(description="first, last, up, down, or a position counting from 1."),
+    ],
+    change: Annotated[
+        str | None,
+        Field(description="The held change to move; default this workspace's topic."),
+    ] = None,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci queue move PLACE`: reorder the line of held topics. A stacked
+    topic never passes its parent. Only on an explicit user request."""
+    args = ["queue", "move", place]
+    if change:
+        args += ["--change", change]
+    return await run(args, workspace, wait_seconds)
 
 
 @mcp.tool(annotations=LOCAL)

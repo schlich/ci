@@ -82,8 +82,10 @@ pub enum Event {
     /// The topic took the runway: `ci land` on a clear runway, or the drainer
     /// from its hold.
     TakeRunway,
-    /// The landing left the runway without landing.
-    LeaveRunway,
+    /// The landing left the runway without landing. With `requeue`, a
+    /// drainer's train that another topic failed put this one back in line,
+    /// held at its head.
+    LeaveRunway { requeue: bool },
     /// The topic fast-forwarded main to the head the gate passed, from the
     /// runway, which it then left.
     Land,
@@ -270,8 +272,9 @@ impl Topic {
                 self.held = None;
                 Handled
             }
-            Event::LeaveRunway if self.on_runway => {
+            Event::LeaveRunway { requeue } if self.on_runway => {
                 self.on_runway = false;
+                self.held = requeue.then(|| self.head.clone());
                 Handled
             }
             // Abandoning discards unpublished work, conflicts included.
@@ -286,10 +289,14 @@ impl Topic {
     fn clean(&mut self, event: &Event) -> Outcome<State> {
         match event {
             // A rebase onto the current trunk rewrites every commit in the
-            // topic, so the head changes too.
+            // topic, so the head changes too. A clean one leaves the change's
+            // own diff alone, so a hold follows it to the new head.
             Event::Rebase { head, conflicted } => {
                 self.base = self.main.clone();
                 self.head = head.clone();
+                if !*conflicted && self.held.is_some() {
+                    self.held = Some(head.clone());
+                }
                 if *conflicted {
                     Transition(State::conflicted())
                 } else {

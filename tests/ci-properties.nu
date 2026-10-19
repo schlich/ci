@@ -1306,7 +1306,25 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
     let third = (do $hold "c" "/r/one" "local")
     let fourth = (do $hold "d" "/r/one" "github")
     assert equal (held-topics | get path) [$first $second $third $fourth] "holds came back out of order"
-    assert equal (next-flight (held-topics) | get hold.change) [ka kc] "a flight mixed repositories or clearances"
+    assert equal (next-flight (plan-holds (held-topics) (read-landing-order)) | get hold.change) [ka kc] "a flight mixed repositories or clearances"
+
+    # The line lands flight by flight: ka and kc share a repository and
+    # clearance, so they fly as one train ahead of kb. `ci queue move`
+    # reorders the line as shown until the drainer goes idle, and the tower
+    # reads the line from landing-plan.json.
+    assert equal (landing-plan | get change) [ka kc kb kd]
+    assert equal (move-hold kd first | get change) [kd ka kc kb]
+    assert equal (move-hold ka down | get change) [kd kc ka kb]
+    assert equal (move-hold kb 1 | get change) [kb kd kc ka]
+    assert equal (move-hold kd last | get change) [kb kc ka kd]
+    let line = (open ((holds-path) | path dirname | path join "landing-plan.json"))
+    assert equal ($line | get change) [kb kc ka kd]
+    assert equal ($line | get flight) [1 2 2 3]
+    assert equal ($line | get reason) ["moved by hand" "arrival" "moved by hand" "moved by hand"]
+    assert ((try { move-hold kz first; "moved" } catch {|err| $err.msg }) | str contains "not held")
+    assert ((try { move-hold ka sideways; "moved" } catch {|err| $err.msg }) | str contains "first, last, up, down")
+    rm (landing-order-path)
+    assert equal (landing-plan | get change) [ka kc kb kd] "the line kept an order nobody chose"
 
     let refused = (with-runway 'kxqueue "now"' --alone --busy {|ahead| $ahead } { "landed" })
     assert equal $refused "4 topics are held for the drainer, first ka \"a\", but no drainer is running: `ci queue drain` lands them, or `ci queue drop` in their workspace takes one out" "ci land landed ahead of a held topic"
@@ -1333,6 +1351,29 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
     let outcomes = (open --raw ($holds | path join "outcomes.jsonl") | lines | each {|line| $line | from json })
     assert equal ($outcomes | get topic) ['kb "b"' 'kd "d"']
     assert equal (held-topics) [] "a finished hold stayed held"
+
+    # A train's bystander goes back in line in the place it held, and ends
+    # once it has gone back `attempts` times.
+    let early = (do $hold "e" "/r/one" "local")
+    let early_hold = (open $early)
+    sleep 1sec
+    do $hold "f" "/r/one" "local" | ignore
+    let back = { number: 0 path: $early hold: ($early_hold | update attempts 2) }
+    rm $early
+    rehold [$back] "kx failed clearance in the train"
+    assert equal (landing-plan | get change) [ke kf] "a hold put back in line lost its place"
+    assert equal (landing-plan | get reason) ["back in line after a train failed" "arrival"]
+    let again = (held-topics | where hold.change == ke | first)
+    rm $again.path
+    rehold [$again] "again"
+    let third = (held-topics | where hold.change == ke | first)
+    assert equal $third.hold.requeued 2
+    rm $third.path
+    rehold [$third] "and again"
+    assert equal (held-topics | get hold.change) [kf] "a hold went back in line past its attempts"
+    assert ((open ($holds | path join "logs" "e.log.done.nuon") | get error) | str contains "going back in line 2 times")
+    finish-hold (held-topics | first) { exit_code: 1 error: "dropped: by test" }
+    assert equal (landing-plan) [] "the line kept a hold that ended"
     assert (release-idle-drainer $lock $claim) "an idle drainer kept its lock"
     assert (not ($lock | path exists))
     assert equal (with-runway 'kxqueue "now"' --alone --busy {|ahead| "refused" } { "landed" }) "landed" "ci land refused a clear runway"
@@ -1424,6 +1465,92 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
     assert ((hold-problem ($held | update head "0000")) | str contains "changed since it was queued")
     assert ((hold-problem ($held | update change "kother")) | str contains "no longer has the held change")
     assert ((hold-problem ($held | update workspace "/nonexistent")) | str contains "is gone")
+
+    # The drainer's train: stacked topics fly right behind their parent, and
+    # the train reports each topic's outcome for the drainer. Here x fails
+    # clearance: p lands, x is the culprit, and q, stacked on p, returns to
+    # main on the landed p for the drainer to put back in line.
+    let without_x = ($without_b | update probe {|_| {|commit|
+        if "x" in (^jj file list -r $commit | lines) {
+            { state: "failed" workflows: [{ name: "fake" status: "failed" error: "x breaks" }] }
+        } else {
+            { state: "success" workflows: [] }
+        }
+    } })
+    let dispatch = {|name, file, on|
+        ^jj new --quiet $on -m $"topic ($name)"
+        $name | save --force $file
+        ^jj bookmark create --quiet $"jj-($name)" -r @
+        ^jj bookmark track --quiet $"jj-($name)@tangled"
+        ^jj git push --quiet --remote tangled --bookmark $"jj-($name)"
+        declare-impact (revisions-in "@") "behavior" [] | ignore
+        { branch: $"jj-($name)" change: (current-topic-id) }
+    }
+    let p = (do $dispatch "p" "p" "main@tangled")
+    let q = (do $dispatch "q" "q" "jj-p")
+    let x = (do $dispatch "x" "x" "main@tangled")
+    ^jj new --quiet "main@tangled"
+    let hold_dir = (mktemp --directory --tmpdir ci-train-holds-XXXXXX)
+    let held_files = ([
+        ($p | insert parent_branch null)
+        ($x | insert parent_branch null)
+        ($q | insert parent_branch "jj-p")
+    ] | enumerate | each {|entry|
+        let path = ($hold_dir | path join $"($entry.index + 1).json")
+        $entry.item | to json --raw | save --force $path
+        $path
+    } | str join ":")
+    let report = ($hold_dir | path join "train.json")
+    let failed = (with-env { CI_TRAIN_REPORT: $report } {
+        try { land-train 1min local --checker $without_x --fingerprint $fingerprint --held $held_files; null } catch {|err| $err.msg }
+    })
+    assert ($failed != null and ($failed | str contains "jj-x failed clearance")) $"the culprit was not named: ($failed)"
+    assert equal (revision-id "main@tangled") (revision-id "jj-p") "the stacked train's passing prefix did not land"
+    assert equal (revision-id "jj-q-") (revision-id "jj-p") "the stacked topic left its landed parent"
+    assert (revset-change-ids "jj-x & ::jj-q" | is-empty) "the stacked topic still carries the culprit"
+    let rows = (open $report)
+    assert equal ($rows | select topic kind) [[topic kind]; [jj-p landed] [jj-x culprit] [jj-q returned]]
+
+    # Failing on its parent, a stacked topic returns onto that parent.
+    let s = (do $dispatch "s" "x" "main@tangled")
+    let t = (do $dispatch "t" "t" "jj-s")
+    ^jj new --quiet "main@tangled"
+    let main_before = (revision-id "main@tangled")
+    let held_files = ([($s | insert parent_branch null) ($t | insert parent_branch "jj-s")] | enumerate | each {|entry|
+        let path = ($hold_dir | path join $"($entry.index + 1).json")
+        $entry.item | to json --raw | save --force $path
+        $path
+    } | str join ":")
+    with-env { CI_TRAIN_REPORT: $report } {
+        try { land-train 1min local --checker $without_x --fingerprint $fingerprint --held $held_files } catch { null }
+    }
+    assert equal (revision-id "main@tangled") $main_before "a train whose first topic failed landed something"
+    assert equal (revision-id "jj-t-") (revision-id "jj-s") "the stacked topic left its returned parent"
+    assert equal (open $report | select topic kind) [[topic kind]; [jj-s culprit] [jj-t returned]]
+    rm --recursive --force $hold_dir
+
+    # A held topic rebased cleanly, as a train puts it back on main or its
+    # parent's landing carries it, still flies at its new head; an edit, or
+    # a parent that left the line without landing, ends the hold.
+    ^jj new --quiet "main@tangled" -m "held topic"
+    "held" | save --force held.txt
+    let held_change = (current-topic-id)
+    let held_head = (current-change 'commit_id')
+    ^jj new --quiet "main@tangled" -m "elsewhere"
+    "elsewhere" | save --force elsewhere.txt
+    let elsewhere = (revision-id "@")
+    ^jj edit --quiet $held_change
+    ^jj rebase --quiet -r @ -o $elsewhere
+    let rebased = { workspace: $train_repo change: $held_change head: $held_head }
+    let standing = (hold-standing $rebased)
+    assert equal $standing.problem null $"a clean rebase ended the hold: ($standing.problem)"
+    assert equal $standing.head (current-change 'commit_id')
+    assert ((hold-problem ($rebased | insert parent_change "zzzzzzzz" | insert parent_branch "jj-gone")) | str contains "jj-gone left the line")
+    assert equal (hold-problem ($rebased | insert parent_change $p.change)) null "a landed parent ended its child's hold"
+    assert equal (hold-problem ($rebased | insert parent_change "zzzzzzzz") ["zzzzzzzz"]) null "a held parent ended its child's hold"
+    "edited" | save --force held.txt
+    assert ((hold-problem $rebased) | str contains "changed since it was queued") "an edit kept the hold"
+    ^jj new --quiet "main@tangled"
 }
 rm --recursive --force $train_repo $train_remote $train_config
 print "ok land train"
@@ -1627,4 +1754,131 @@ for-all "a topic joins a train only when dispatched as it stands, clean, and cla
     }
     let joins = $facts.main == "clean" and $facts.pushed and $facts.dispatched and $facts.impact != null
     assert equal ((train-exclusion $facts) == null) $joins $"($facts)"
+}
+
+# The drainer's line (2026-10-19): holds land in the order a person chose
+# with `ci queue move`, then in arrival order, and a stacked topic always
+# after its held parent. A flight takes the first hold and every later one of
+# its repository and clearance whose held parent flies before it. Nothing
+# else reorders the line: there is no cost model.
+
+# Held topics as held-topics returns them, in ticket order. A stacked one
+# names an earlier hold as its parent and shares its repository; arrival
+# times are drawn independently, so a parent may arrive after its child, as
+# when the drainer puts a parent back in line.
+def gen-holds [key: string, --flat] {
+    let count = 1 + (pick $"($key)/count" 7)
+    0..<$count | reduce --fold [] {|i, holds|
+        let parent = if $flat or $i == 0 or (flag $"($key)/($i)/stacked") { null } else { $holds | get (pick $"($key)/($i)/parent" $i) | get hold }
+        let repo = if $parent == null { pick-from $"($key)/($i)/repo" ["/r/one" "/r/two"] } else { $parent.repo }
+        $holds | append {
+            number: ($i + 1)
+            path: $"/h/($i + 1).json"
+            hold: {
+                topic: $"k($i) \"($i)\""
+                change: $"k($i)"
+                branch: $"jj-($i)"
+                head: $"h($i)"
+                repo: $repo
+                clearance: (pick-from $"($key)/($i)/clearance" ["local" "github"])
+                held_at: ('2026-10-19T12:00:00+00:00' | into datetime | $in + ((pick $"($key)/($i)/at" 4) * 1min) | format date '%+')
+                parent_change: ($parent.change? | default null)
+                parent_branch: ($parent.branch? | default null)
+                requeued: 0
+            }
+        }
+    }
+}
+
+# A line order a person might have chosen: some held changes, shuffled,
+# some of them moved by hand.
+def gen-line-order [key: string, holds: list] {
+    let chosen = (shuffle $"($key)/order" ($holds | get hold.change) | where {|change| flag $"($key)/in/($change)" })
+    { order: $chosen moved: ($chosen | where {|change| flag $"($key)/moved/($change)" }) }
+}
+
+for-all "plan-holds keeps every hold and puts each stacked topic after its parent" {|key|
+    let holds = (gen-holds $key)
+    let planned = (plan-holds $holds (gen-line-order $key $holds))
+    let changes = ($planned | get hold.change)
+    assert equal ($changes | sort) ($holds | get hold.change | sort) "the line lost or doubled a hold"
+    for entry in ($planned | enumerate) {
+        let parent = $entry.item.hold.parent_change
+        if $parent != null {
+            let at = ($changes | enumerate | where item == $parent | get 0.index)
+            assert ($at < $entry.index) $"($entry.item.hold.change) lands before its parent ($parent): ($changes)"
+            assert ($entry.item.reason | str starts-with "stacked on") $"($entry.item.reason)"
+        }
+    }
+}
+
+for-all "plan-holds follows the chosen order, then arrival" {|key|
+    let holds = (gen-holds $key --flat)
+    let order = (gen-line-order $key $holds)
+    let planned = (plan-holds $holds $order)
+    let arrival = ($holds | sort-by {|entry| $entry.hold.held_at | into datetime } number | get hold.change)
+    let expected = ($order.order ++ ($arrival | where {|change| $change not-in $order.order }))
+    assert equal ($planned | get hold.change) $expected
+    for entry in $planned {
+        let reason = if $entry.hold.change in $order.moved { "moved by hand" } else { "arrival" }
+        assert equal $entry.reason $reason
+    }
+}
+
+for-all "a flight is the first hold and every later one of its repository and clearance behind its parent" {|key|
+    let holds = (gen-holds $key)
+    let planned = (plan-holds $holds (gen-line-order $key $holds))
+    let held = ($planned | get hold.change)
+    let flight = (next-flight $planned)
+    let flown = ($flight | get hold.change)
+    let lead = ($planned | first | get hold)
+    assert equal ($flown | first) $lead.change "the flight skipped the first hold"
+    assert equal $flown ($held | where {|change| $change in $flown }) "the flight reordered the line"
+    for entry in $planned {
+        let parent = $entry.hold.parent_change
+        let same = $entry.hold.repo == $lead.repo and $entry.hold.clearance == $lead.clearance
+        let flies = $entry.hold.change in $flown
+        if $flies {
+            assert $same $"($entry.hold.change) flew with another repository or clearance"
+            if $parent != null {
+                assert ($parent in $flown) $"($entry.hold.change) flew without its held parent"
+            }
+        } else if $same {
+            assert ($parent != null and $parent not-in $flown) $"($entry.hold.change) could have flown but waited"
+        }
+    }
+    let flights = (plan-flights $planned)
+    assert equal ($flights | flatten | get hold.change | sort) ($held | sort) "the flights lost or doubled a hold"
+    assert equal ($flights | first | get hold.change) $flown
+}
+
+# A train's holds: each lands, goes back in line, or fails. Only the culprit
+# and the topics stacked on it fail for its sake; a topic the train put back
+# on main cleanly goes back in line, and one it left out or put back with
+# conflicts needs its owner.
+for-all "a failed train fails only its culprit and the topics stacked on it" {|key|
+    let flight = (gen-holds $key | each {|entry| $entry | update hold.repo "/r/one" | update hold.clearance "local" })
+    let count = ($flight | length)
+    let landing = (pick $"($key)/landed" ($count + 1))
+    let reported = (flag $"($key)/reported")
+    let rows = if not $reported { [] } else {
+        $flight | enumerate | each {|entry|
+            let kind = if $entry.index < $landing { "landed" } else if $entry.index == $landing { "culprit" } else {
+                pick-from $"($key)/kind/($entry.index)" ["returned" "returned" "conflicted" "skipped" "missing"]
+            }
+            if $kind == "missing" { null } else { { topic: $entry.item.hold.branch kind: $kind outcome: $kind } }
+        } | compact
+    }
+    let landed = ($flight | first $landing | get hold.change)
+    let verdicts = (train-verdicts $flight $rows $landed "see the log")
+    assert equal ($verdicts | get entry.hold.change) ($flight | get hold.change)
+    let failed = ($verdicts | where verdict == "fail" | get entry.hold.change)
+    for verdict in $verdicts {
+        let hold = $verdict.entry.hold
+        let row = ($rows | where topic == $hold.branch | get --optional 0)
+        let parent_failed = $hold.parent_change != null and $hold.parent_change in $failed
+        let expected = if $hold.change in $landed { "landed" } else if $parent_failed or $row == null or $row.kind != "returned" { "fail" } else { "rehold" }
+        assert equal $verdict.verdict $expected $"($hold.change) with ($row) after ($failed)"
+        if $verdict.verdict == "fail" { assert ($verdict.error | is-not-empty) "a failed hold gave no reason" }
+    }
 }

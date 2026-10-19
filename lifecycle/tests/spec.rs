@@ -123,6 +123,9 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.conflict = *conflicted;
             n.validated = false;
             n.validated_head = None;
+            if v.holding && !*conflicted {
+                n.held_head = Some(head.clone());
+            }
         }
         Event::Resolve => {
             if !(owned && v.conflict && !v.delivered) {
@@ -219,11 +222,13 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.holding = false;
             n.held_head = None;
         }
-        Event::LeaveRunway => {
+        Event::LeaveRunway { requeue } => {
             if !(v.on_runway && !v.delivered) {
                 return None;
             }
             n.on_runway = false;
+            n.holding = *requeue;
+            n.held_head = requeue.then(|| v.head.clone());
         }
         Event::Land => {
             if !(owned
@@ -362,7 +367,8 @@ fn events() -> Vec<Event> {
         Event::Hold,
         Event::DropHold,
         Event::TakeRunway,
-        Event::LeaveRunway,
+        Event::LeaveRunway { requeue: false },
+        Event::LeaveRunway { requeue: true },
         Event::Land,
     ];
     for head in HEADS {
@@ -515,7 +521,7 @@ fn clearance_taken_on_the_runway_is_never_thrown_away() {
         Event::Validate,
         Event::Publish,
         Event::TakeRunway,
-        Event::LeaveRunway,
+        Event::LeaveRunway { requeue: false },
     ] {
         assert!(apply(&mut machine, &event), "{event:?}");
     }
@@ -564,4 +570,39 @@ fn a_held_topic_edited_since_its_hold_never_takes_the_runway() {
     assert!(!apply(&mut machine, &Event::TakeRunway));
     assert!(apply(&mut machine, &Event::DropHold));
     assert!(!apply(&mut machine, &Event::Hold), "held a head never dispatched");
+}
+
+/// A clean rebase, as when a train puts a held topic back on main or its
+/// stack parent lands, keeps the hold at the rebased head; a stacked topic
+/// may be held before its parent lands but lands only after it.
+#[test]
+fn a_hold_follows_a_clean_rebase_and_a_stacked_topic_waits_for_its_parent() {
+    let mut machine = Topic::new("h0", "m0", false).machine();
+    for event in [Event::Validate, Event::Publish, Event::GatePasses, Event::Hold] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert!(apply(&mut machine, &Event::TakeRunway));
+    assert!(!apply(&mut machine, &Event::Land), "landed before its parent");
+    assert!(apply(&mut machine, &Event::LeaveRunway { requeue: true }));
+    assert_eq!(machine.inner().held.as_deref(), Some("h0"));
+    assert!(apply(&mut machine, &Event::ParentLands));
+    assert!(apply(&mut machine, &Event::TrunkAdvances { main: "m1".into() }));
+    assert!(apply(
+        &mut machine,
+        &Event::Rebase {
+            head: "h1".into(),
+            conflicted: false,
+        }
+    ));
+    assert_eq!(machine.inner().held.as_deref(), Some("h1"));
+    for event in [
+        Event::TakeRunway,
+        Event::Validate,
+        Event::Publish,
+        Event::GatePasses,
+        Event::Land,
+    ] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert_eq!(machine.inner().main, "h1");
 }
