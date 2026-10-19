@@ -4394,7 +4394,7 @@ def mirror-topic [branch: string] {
 # Clear the topic for departure: rebase, run preflight, and push its branch,
 # where it waits to land. --stack pushes each layer as its own branch for
 # stacked review on Tangled instead.
-def "main dispatch" [
+def --env "main dispatch" [
     --land # Land the topic once it has clearance
     --clearance: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
@@ -4439,7 +4439,7 @@ def "main dispatch" [
     if $land { park-after-landing }
 }
 
-def "main publish" [
+def --env "main publish" [
     --land # Land the topic once it has clearance
     --gate: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
@@ -4452,7 +4452,7 @@ def "main publish" [
 # Land the topic now, from this session. It takes the runway only when the
 # runway is clear: with another landing in flight or a topic held for the
 # drainer, it refuses and names them, and `ci queue` holds the topic instead.
-def "main land" [
+def --env "main land" [
     --clearance: string = "local" # What must pass the head: local, github, or nixbot
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
@@ -4488,7 +4488,10 @@ def "main land" [
 # its landing never runs: thirteen landed workspaces had piled up in dotfiles
 # by 2026-10-19. Any other workspace stays as it is. Parking runs after the
 # landing's run report, and a failure only warns, since the landing stands.
-def park-after-landing [] {
+# Parking removes the directory this run is in, so it and every caller up to
+# `main` keep park's move to the default checkout: a landing that returned
+# into the removed workspace exited 1 after it succeeded (2026-10-19).
+def --env park-after-landing [] {
     let workspace = (current-workspace)
     if $workspace.name == "default" or not (owned-workspace-marker $workspace.root | path exists) { return }
     print $"Parking ($workspace.name), which `ci start` made for this topic."

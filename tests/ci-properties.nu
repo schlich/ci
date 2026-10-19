@@ -1219,6 +1219,45 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $recovery_config } {
 rm --recursive --force $recovery_repo $recovery_other $recovery_remote $recovery_config
 print "ok recovery spares other workspaces"
 
+# A landing from a `ci start` workspace parks it, then exited 1 into the
+# removed directory (2026-10-19): park's move to the default checkout must
+# reach `main`, through every command that lands.
+
+for command in ["main land" "main dispatch" "main publish" "park-after-landing"] {
+    assert (view source $command | str starts-with "def --env ") $"($command) drops park's move out of the removed workspace"
+}
+
+let parked_repo = (mktemp --directory --tmpdir ci-parked-XXXXXX | path expand)
+let parked_remote = (mktemp --directory --tmpdir ci-parked-remote-XXXXXX)
+let parked_config = (mktemp --tmpdir ci-parked-jj-XXXXXX.toml)
+'user.name = "ci"
+user.email = "ci@example.invalid"
+revset-aliases."trunk()" = "latest(present(main@tangled) | root())"
+' | save --force $parked_config
+^git init --quiet --bare $parked_remote
+let start = $env.PWD
+with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $parked_config } {
+    cd $parked_repo
+    ^jj git init --quiet
+    ^jj git remote add tangled $parked_remote
+    "base" | save --force f
+    ^jj commit --quiet -m base
+    ^jj bookmark create --quiet main -r @-
+    ^jj bookmark track --quiet main@tangled
+    ^jj git push --quiet --remote tangled --bookmark main
+    main start landed
+    let workspace = ($parked_repo | path join ".jj-workspaces" "landed")
+    assert (owned-workspace-marker $workspace | path exists) "ci start left no marker"
+    cd $workspace
+    park-after-landing
+    assert not ($workspace | path exists) "the landing did not park its ci start workspace"
+    assert equal $env.PWD $parked_repo "the landing stayed in the workspace it removed"
+    assert equal (^jj log --no-graph -r @ -T 'empty' | str trim) "true"
+}
+cd $start
+rm --recursive --force $parked_repo $parked_remote $parked_config
+print "ok a landing leaves the workspace it parks"
+
 # The topic lock (2026-10-07): a second `ci` moving a topic that a live one is
 # already moving fails at once instead of waiting, and the lock goes with the
 # work however it ends.
