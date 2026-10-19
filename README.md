@@ -277,7 +277,10 @@ that session may not live to see. `ci queue` is for the rest. It dispatches
 the topic, runs the same fast checks, and holds the exact head it pushed in
 `$XDG_STATE_HOME/jj-ci/landing-holds/`, then returns. The drainer, a
 transient systemd user unit (`ci-landing-drain-*`) that `ci queue` starts
-when none runs, lands held topics a flight at a time. The drainer waits its
+when none runs, lands held topics a flight at a time. It serves every
+repository, so it runs from `$HOME`, where `ci park` cannot remove its
+directory, and lands each flight in its topic's workspace with the
+environment of the session that held it. The drainer waits its
 turn on the runway like any landing, reporting the wait as `working` under
 `runway`, since waiting one's turn is progress rather than something for a
 person to unblock. Its landing takes a runway ticket before the hold goes,

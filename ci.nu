@@ -1256,15 +1256,18 @@ def drainer-environment [] {
 }
 
 # Start the drainer as a transient user unit unless a live one runs, and
-# return its pid. It runs through the `ci` launcher from this workspace, so it
-# is the same ci.nu this command runs.
+# return its pid. It runs through this command's `ci` launcher, but from
+# $HOME, not this workspace: it outlives this topic, and `ci park` removing
+# the workspace under it killed it before it recorded the landing
+# (2026-10-19). From there the launcher runs its bundled ci.nu, or CI_SCRIPT
+# when set; each flight still runs in its own topic's workspace.
 def ensure-drainer [launcher: string] {
     let lock = (drainer-lock-path)
     let holder = (try { open --raw $lock | from json } catch { null })
     if $holder != null and (try { lock-holder-alive $holder } catch { false }) { return $holder.pid }
     let unit = $"ci-landing-drain-(date now | format date '%Y%m%d%H%M%S')-(random chars --length 4)"
     let setenv = (drainer-environment | each {|var| $"--setenv=($var.name)=($var.value)" })
-    let started = (^systemd-run --user --collect --quiet $"--unit=($unit)" $"--working-directory=($env.PWD)" ...$setenv -- $launcher queue drain --unit $unit | complete)
+    let started = (^systemd-run --user --collect --quiet $"--unit=($unit)" $"--working-directory=($env.HOME)" ...$setenv -- $launcher queue drain --unit $unit | complete)
     if $started.exit_code != 0 {
         error make { msg: $"starting the drainer failed with exit code ($started.exit_code): ($started.stderr | str trim)" }
     }
