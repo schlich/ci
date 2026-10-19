@@ -143,6 +143,21 @@ def export-to-git [root: any] {
     }
 }
 
+# Run `program` with `args` in `dir`, wait for it from `refuge`, and return
+# its exit status. `ci park` and `ci cancel` delete the workspace a `ci start`
+# made, which is the one they ran in, and Nushell fails as soon as an external
+# command returns into a $env.PWD that no longer exists: a clean park exited 1
+# (2026-10-19). So the launcher moves to `refuge`, which the run cannot
+# remove, and enters `dir` only in the child's own scope.
+def --env run-in [dir: string, refuge: string, program: string, args: list<string>] {
+    cd $refuge
+    # A child that never started leaves no exit code; it still failed.
+    try { do { cd $dir; ^$program ...$args }; 0 } catch {
+        let code = ($env.LAST_EXIT_CODE? | default 0)
+        if $code == 0 { 1 } else { $code }
+    }
+}
+
 def --wrapped main [...args] {
     let bundled = $env.CI_BUNDLED_SCRIPT
     let override = ($env.CI_SCRIPT? | default "")
@@ -203,11 +218,8 @@ def --wrapped main [...args] {
     # Run ci.nu as a child rather than exec it, so the launcher can copy the
     # run's bookmarks to Git afterwards and still exit with its status.
     let home = (repo-home $checkout)
-    # A child that never started leaves no exit code; it still failed.
-    let status = (try { ^$nu.current-exe --no-config-file ...$include $script ...$args; 0 } catch {
-        let code = ($env.LAST_EXIT_CODE? | default 0)
-        if $code == 0 { 1 } else { $code }
-    })
+    let refuge = if ($home | is-empty) { $env.PWD } else { $home }
+    let status = (run-in $env.PWD $refuge $nu.current-exe [--no-config-file ...$include $script ...$args])
     export-to-git (export-root {
         checkout: $checkout
         checkout_exists: (($checkout | is-not-empty) and ($checkout | path join ".jj" | path exists))

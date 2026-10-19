@@ -100,6 +100,25 @@ assert equal (repo-home ($home | path join "elsewhere")) ""
 rm --recursive $home
 print "ok repo home"
 
+# `ci park` removing the workspace it ran in exited 1 (2026-10-19): the
+# launcher still stood in the deleted directory when ci.nu returned. The
+# child's own status comes back, and the launcher can still run commands.
+let start = $env.PWD
+let home = (mktemp --directory)
+for code in [0 3] {
+    let doomed = ($home | path join ".jj-workspaces" "topic")
+    mkdir $doomed
+    cd $doomed
+    let status = (run-in $doomed $home $nu.current-exe [--no-config-file -c $"cd /; rm --recursive '($doomed)'; exit ($code)"])
+    assert equal $status $code
+    assert equal $env.PWD $home
+    assert not ($doomed | path exists)
+    assert equal (^$nu.current-exe --no-config-file -c "print ok" | str trim) "ok"
+}
+cd $start
+rm --recursive $home
+print "ok run from a removed workspace"
+
 # ci-package.nix hashes the agent's files in this order, which must be the
 # order `jj file show` prints them in, so a revision whose agent matches the
 # package's is recognised without a build.
