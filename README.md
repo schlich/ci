@@ -130,7 +130,7 @@ ci land --clearance github  # Take clearance from GitHub Actions (or nixbot) ins
 ci queue                    # With a landing in flight: hold the topic; the drainer lands it in turn.
 ci queue list               # The runway, the line of held topics and why each holds its place, recent outcomes.
 ci queue move first         # Move this topic in the line: first, last, up, down, or a position.
-ci park                     # Confirm the landing and free the workspace.
+ci park                     # Confirm the landing and free the workspace (`land` does it for a `ci start` one).
 # To drop an undispatched or closed topic instead:
 ci cancel
 # After activating the release:
@@ -504,6 +504,14 @@ workspace is left on an empty change on main with its session's ownership
 finished. `--keep`, which once returned a `ci start` workspace to a reusable
 pool, is deprecated: it prints a warning and the workspace is removed anyway.
 Archive the task only after it succeeds.
+
+`ci land`, and `ci dispatch --land`, park a workspace that `ci start` made as
+soon as its topic lands, since that workspace served only the topic; a
+session that ended at its landing used to leave it behind for prune. A park
+that fails there only warns, because the landing stands; run `ci park` again.
+The drainer's landings for `ci queue` do not park, since the session that
+queued the topic may still be open in its workspace. Either way, park's
+message says the agent session can now be archived.
 
 `ci adopt` hands the topic checked out in a workspace to the next agent
 session that edits it. Agents claim only a free default checkout or their

@@ -4422,6 +4422,7 @@ def "main dispatch" [
             }
         }
     }
+    if $land { park-after-landing }
 }
 
 def "main publish" [
@@ -4462,6 +4463,23 @@ def "main land" [
             let run = (publish-with-agent true $attempts)
             drive-topic-agent $run.state $run.published $timeout $cleared_by --held $held
         }
+    }
+    # The drainer lands held topics for sessions that may still be open in
+    # their workspaces; `ci park` there, or the prune timer, removes them.
+    if $held == null { park-after-landing }
+}
+
+# A workspace that `ci start` made served only the topic that just landed, so
+# park it now rather than leave it to a `ci park` that a session ending at
+# its landing never runs: thirteen landed workspaces had piled up in dotfiles
+# by 2026-10-19. Any other workspace stays as it is. Parking runs after the
+# landing's run report, and a failure only warns, since the landing stands.
+def park-after-landing [] {
+    let workspace = (current-workspace)
+    if $workspace.name == "default" or not (owned-workspace-marker $workspace.root | path exists) { return }
+    print $"Parking ($workspace.name), which `ci start` made for this topic."
+    try { main park } catch {|err|
+        print --stderr $"The topic landed, but parking ($workspace.name) failed: (error-summary $err). Run `ci park` there."
     }
 }
 
@@ -5031,7 +5049,7 @@ def --env release-workspace [summary: string, change: string, outcome: string] {
     let marker = (owned-workspace-marker $workspace.root)
     if $workspace.name != "default" and ($marker | path exists) {
         drop-workspace $workspace
-        print $"($summary) Removed workspace ($workspace.name); continue from ($env.PWD)."
+        print $"($summary) Removed workspace ($workspace.name); continue from ($env.PWD). The agent session that worked on it can now be archived."
         return
     }
     if ($marker | path exists) { rm $marker }
@@ -5039,7 +5057,7 @@ def --env release-workspace [summary: string, change: string, outcome: string] {
     if ($owner_path | path exists) and (open $owner_path).change_id? == $change {
         end-ownership $workspace.root $outcome
     }
-    print $"($summary) Workspace is on main; the Codex task can now be archived."
+    print $"($summary) Workspace is on main; the agent session that worked on it can now be archived."
 }
 
 # What `ci unclaim` may do, from the ownership record's status, whether the

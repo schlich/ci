@@ -765,8 +765,9 @@ async def land(
     (every flake check by default), fast-forward main on the trunk remote and
     its mirror, and tag releases. It takes the runway only when it is clear:
     with another landing in flight or a topic held for the drainer it fails
-    at once, naming them; use `queue` then. Only on an explicit user request
-    to deliver the topic. Takes minutes to hours; poll the job."""
+    at once, naming them; use `queue` then. Once the topic lands it parks a
+    workspace that `ci start` made, removing it. Only on an explicit user
+    request to deliver the topic. Takes minutes to hours; poll the job."""
     args = ["land", "--clearance", clearance, "--timeout", timeout]
     if train:
         args += ["--train"]
