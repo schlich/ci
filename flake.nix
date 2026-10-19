@@ -38,6 +38,7 @@
       lib = nixpkgs.lib;
       ci = import ./ci-package.nix { inherit pkgs osc7501-nu; };
       lifecycle = pkgs.callPackage ./lifecycle/package.nix { };
+      context-status = import ./context-status.nix { inherit pkgs; };
       tower = pkgs.callPackage ./tower/package.nix { };
       agent = pkgs.callPackage ./agent/package.nix { inherit pkgs; };
       source =
@@ -54,8 +55,8 @@
         ci-tower = tower;
         ci-agent = agent;
         jj-ci-lifecycle = lifecycle;
-        context-status = import ./context-status.nix { inherit pkgs; };
-        ci-mcp = pkgs.callPackage ./mcp-package.nix { inherit ci; };
+        inherit context-status;
+        ci-mcp = pkgs.callPackage ./mcp-package.nix { inherit ci lifecycle context-status; };
         jj-describe = pkgs.writeNuScriptBin "jj-describe" (builtins.readFile ./describe.nu);
         codex-jj-session = pkgs.writeNuScriptBin "codex-jj-session" (builtins.readFile ./codex-session.nu);
       };

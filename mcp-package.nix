@@ -2,7 +2,8 @@
 # announces jobs on cross.stream through `xs` when one is given or on PATH;
 # without it, watchers fall back to polling. Jobs run in transient systemd
 # user units, which resolve their command on the host, so the job shell is a
-# store path rather than a sandbox's `sh`. The ruff check lints the source;
+# store path rather than a sandbox's `sh`. `state_diagram` asks context-status
+# for the workspace's machine state and the lifecycle for the drawing. The ruff check lints the source;
 # writers.writePython3 would run flake8 instead.
 {
   lib,
@@ -13,6 +14,8 @@
   git,
   gh,
   ci,
+  lifecycle,
+  context-status,
   xs ? null,
 }:
 runCommand "ci-mcp"
@@ -33,5 +36,7 @@ runCommand "ci-mcp"
         )
       } \
       --set CI_MCP_CI ${lib.getExe ci} \
+      --set CI_MCP_LIFECYCLE ${lib.getExe lifecycle} \
+      --set CI_MCP_CONTEXT_STATUS ${context-status}/bin/context-status \
       --set CI_MCP_SH ${runtimeShell}
   ''

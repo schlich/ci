@@ -33,6 +33,7 @@
 //! retries apply only to a lost landing lease. This lifecycle remains the
 //! shared protocol classifier.
 
+pub mod diagram;
 pub mod stage;
 
 use statig::prelude::*;

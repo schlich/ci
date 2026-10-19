@@ -671,6 +671,13 @@ GitHub's verdict on that head, when a GitHub-cleared landing pushed it there,
 as JSON. It reads the last-fetched remote state and the forge APIs only; it
 never fetches, pushes, or rewrites anything.
 
+`jj-ci-lifecycle diagram [STATE]` prints the lifecycle machine as a Mermaid
+`stateDiagram-v2`, with STATE marked; `lifecycle/tests/diagram.rs` drives
+every drawn edge through the machine. `context-status json` reports the
+workspace's state as `machine_state`, and the ci MCP server's
+`state_diagram` tool combines the two, so an agent can show the user where
+the topic stands.
+
 ### The ci log
 
 Every status report `ci` makes, the same ones it sends as OSC 7501 records,

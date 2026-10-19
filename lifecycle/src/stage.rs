@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagram::Node;
 use crate::{apply, Commit, Event, Machine, Publication, State, Topic, Workspace};
 
 /// The working copy that left this workspace's recorded topic.
@@ -58,6 +59,8 @@ pub enum Stage {
 #[derive(Debug, Serialize)]
 pub struct Classification {
     pub stage: Stage,
+    /// The machine's leaf state, as `diagram` names it.
+    pub machine_state: &'static str,
     pub next: String,
     /// The protocol events the machine accepts from here.
     pub allowed: Vec<&'static str>,
@@ -116,6 +119,7 @@ impl Observation {
         let stage = self.stage(&machine);
         Classification {
             stage,
+            machine_state: Node::of(machine.state()).name(),
             next: self.next(stage),
             allowed: allowed(&machine),
         }

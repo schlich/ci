@@ -36,6 +36,8 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 CI = os.environ.get("CI_MCP_CI", "ci")
+LIFECYCLE = os.environ.get("CI_MCP_LIFECYCLE", "jj-ci-lifecycle")
+CONTEXT_STATUS = os.environ.get("CI_MCP_CONTEXT_STATUS", "context-status")
 # The shell that wraps each job; CI_MCP_SH names a store path, since a unit's
 # command resolves on the host, where a sandbox's /usr/bin does not exist.
 SH = os.environ.get("CI_MCP_SH", "sh")
@@ -381,6 +383,55 @@ async def state(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
     JSON in `data`. Never fetches, pushes, or rewrites anything."""
     result = await run(["ci-state"], workspace, wait_seconds, mutating=False)
     return parse_json_output(result)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def state_diagram(
+    highlight: Annotated[
+        bool,
+        Field(description="Mark the workspace's current state in the drawing."),
+    ] = True,
+    workspace: Workspace = None,
+) -> dict:
+    """The topic lifecycle state machine as Mermaid `stateDiagram-v2`
+    source in `mermaid`, drawn from lifecycle/, with the workspace's current
+    state marked. Show it to the user in a ```mermaid block, or render it.
+    `stage`, `next`, and `allowed` are context-status's reading of the
+    workspace. Runs inline; reads only local files."""
+    found: dict = {}
+    if highlight:
+        try:
+            root = workspace_root(workspace)
+            read = subprocess.run(
+                [CONTEXT_STATUS, "json", str(root)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if read.returncode != 0:
+                raise ValueError(read.stderr.strip() or "context-status failed")
+            facts = json.loads(read.stdout)
+            found = {
+                "workspace": str(root),
+                "machine_state": facts["machine_state"],
+                "stage": facts["stage"],
+                "next": facts["next"],
+                "allowed": facts["allowed"],
+            }
+        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+            found = {"highlight_error": str(error)}
+    current = found.get("machine_state")
+    drawn = subprocess.run(
+        [LIFECYCLE, "diagram", *([current] if current else [])],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return {"mermaid": drawn.stdout, **found}
 
 
 @mcp.tool(annotations=READ_ONLY)
