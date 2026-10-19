@@ -3055,21 +3055,24 @@ def plan-topics [published: list] {
         let names = (if $bookmark != null { [$bookmark] } else { [] } | append $workspaces)
         let label = if ($names | is-empty) { $tip.tip | str substring 0..7 } else { $names | str join " " }
         let fork = $"fork_point\(($commit) | ($trunk))"
+        # Author time survives rewrites; committer time moves whenever a
+        # topic is validated or redescribed, which would reorder topics.
+        let authored = (revision-field $"($fork)..($commit)" 'author.timestamp().format("%s") ++ "\n"' | lines | where {|line| $line | is-not-empty })
+        # Another actor rewrote or landed this tip since it was listed, so
+        # its range is empty; the next plan sees the new commit (2026-10-19).
+        if ($authored | is-empty) { return null }
         {
             label: $label
             tip: $tip.tip
             commit: $commit
             bookmark: $bookmark
             description: (revision-field $commit 'description.first_line()')
-            # Author time survives rewrites; committer time moves whenever a
-            # topic is validated or redescribed, which would reorder topics.
-            created: (revision-field $"($fork)..($commit)" 'author.timestamp().format("%s") ++ "\n"'
-                | lines | into int | math min)
+            created: ($authored | into int | math min)
             files: (git-command "listing topic files" { ^jj diff --name-only --from $fork --to $commit } | lines)
             current: (contains-main $commit)
             impact: (revset-impact $"($fork)..($commit)")
         }
-    }
+    } | compact
 }
 
 def plan-main-status [topic: record] {
