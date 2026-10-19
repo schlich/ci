@@ -1302,6 +1302,12 @@ def hold-topic [published: record, clearance: string, timeout: duration, attempt
         attempts: $attempts
         launcher: $launcher
         ci_script: ($env.CI_SCRIPT? | default null)
+        # The drainer lands every repository's holds but inherits the
+        # environment of whichever `ci queue` started it; this topic lands
+        # with its own holder's, so a jj found first on that other PATH,
+        # without this user's configuration, never runs its preflight
+        # (2026-10-19).
+        environment: (drainer-environment | reduce --fold {} {|var, acc| $acc | insert $var.name $var.value })
         held_at: (date now | format date '%+')
         log: $log
     }
@@ -1574,7 +1580,9 @@ def fly [flight: list] {
         try { $"Landing in a train led by ($lead.topic); its log is ($lead.log).\n" | save --append $entry.hold.log }
     }
     let script = if $lead.ci_script == null { {} } else { { CI_SCRIPT: $lead.ci_script } }
-    let code = (with-env ({ PST_FILE: $"($lead.log).status.jsonl" CI_TRAIN_REPORT: $report } | merge $script) {
+    let carried = ($lead.environment? | default {})
+    let carried = if "PATH" in $carried { $carried | update PATH { split row (char esep) } } else { $carried }
+    let code = (with-env ($carried | merge { PST_FILE: $"($lead.log).status.jsonl" CI_TRAIN_REPORT: $report } | merge $script) {
         try {
             cd $lead.workspace
             ^$lead.launcher ...$args o+e>> $lead.log

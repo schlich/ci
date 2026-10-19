@@ -1377,6 +1377,24 @@ with-env { XDG_STATE_HOME: $outcome_dir } {
     assert (release-idle-drainer $lock $claim) "an idle drainer kept its lock"
     assert (not ($lock | path exists))
     assert equal (with-runway 'kxqueue "now"' --alone --busy {|ahead| "refused" } { "landed" }) "landed" "ci land refused a clear runway"
+
+    # One drainer lands every repository's holds, so a flight runs with the
+    # environment its holder had, not the drainer's: a jj first on the
+    # drainer's PATH may lack this user's configuration.
+    let bin = (mktemp --directory --tmpdir ci-holder-bin-XXXXXX)
+    let launcher = ($bin | path join "fake-ci")
+    "#!/bin/sh\necho \"marker=$CI_HOLDER_MARKER path=$PATH\"\n" | save --force $launcher
+    ^chmod +x $launcher
+    let log = ($holds | path join "logs" "g.log")
+    "" | save --force $log
+    let path = ([$bin] | append ($env.PATH | split row (char esep)) | str join (char esep))
+    let record = { topic: 'kg "g"' change: kg head: hg branch: jj-g repo: "/r/one" workspace: $bin clearance: local timeout_sec: 60 attempts: 1 launcher: $launcher ci_script: null environment: { CI_HOLDER_MARKER: holder PATH: $path } held_at: (date now | format date '%+') log: $log }
+    draw-ticket $holds ($record | to json --raw) | ignore
+    with-env { CI_HOLDER_MARKER: drainer } { fly (held-topics) }
+    let flown = (open --raw $log)
+    assert ($flown | str contains "marker=holder") $"a flight ran with the drainer's environment: ($flown)"
+    assert ($flown | str contains $"path=($bin)") $"a flight lost its holder's PATH: ($flown)"
+    rm --recursive --force $bin
     rm --recursive --force $holds
 }
 print "ok holds"
