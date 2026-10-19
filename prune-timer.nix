@@ -1,4 +1,4 @@
-# A Home Manager module for the daily backstop the README describes: topics
+# A Home Manager module for the daily backstop docs/workflow.md describes: topics
 # landed without `ci park` and tasks that ended without it leave workspaces
 # and branches behind, and `ci prune --apply` reclaims them. The timer once
 # lived in one consumer's configuration and was lost when ci moved to its own

@@ -1,6 +1,6 @@
 # Property-based tests for context-status: its reading of ownership records
 # and the audit's findings, which check the ownership rules in
-# README.md against real workspaces. Run with:
+# docs/workflow.md against real workspaces. Run with:
 #
 #   nu --no-config-file -c "source tests/context-status-properties.nu"
 #

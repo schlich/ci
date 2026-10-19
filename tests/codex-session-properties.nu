@@ -1,5 +1,5 @@
 # Property-based tests for the Codex session hook's claim decisions, derived
-# from the ownership rules in README.md. Run with:
+# from the ownership rules in docs/workflow.md. Run with:
 #
 #   nu --no-config-file -c "source tests/codex-session-properties.nu"
 #

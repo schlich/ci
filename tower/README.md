@@ -1,7 +1,8 @@
 # ci tower
 
-The live terminal view behind `ci tower`; see "Control tower" in the
-repository README for what it shows and its keys.
+The live terminal view behind `ci tower`; see
+["Control tower"](../docs/workflow.md#control-tower) for what it shows and
+its keys.
 
 It links `../lifecycle` by path, so the board's stages always come from the
 same machine as `context-status`. Develop it from the repository's dev shell:
