@@ -12,6 +12,7 @@ change to these files (`jj log -- jj/ci.nu` there).
 | --- | --- |
 | `ci.nu`, `ci-launch.nu`, `ci-package.nix` | the workflow, the launcher that picks which `ci.nu` runs, and its package |
 | `JjCi.qnt`, `lifecycle/` | the protocol as a Quint model and as the statig machine checked against it |
+| `ReleaseLoop.qnt`, `docs/release-loop-comparison.md` | a bounded model of the supplied release loop and its comparison with the topic lifecycle |
 | `context-status.nu` | the topic readout for the prompt, the shell, and agent hooks |
 | `codex-session.nu`, `guard.nu` | Codex task ownership, and the interactive `jj new` guard (Claude Code sessions claim through `context-status guard`) |
 | `mcp.py`, `mcp-package.nix` | the workflow as MCP tools, run as jobs agents can follow |
@@ -91,6 +92,12 @@ walk every state of the bounded model, require the machine to
 accept exactly the events whose Quint action is enabled and to reach the same
 variables, and check every invariant, so `checks.x86_64-linux.ci-lifecycle`
 keeps the Rust machine and the specification in step. Change both together.
+
+The `ci-model` check also verifies `ReleaseLoop.qnt`, an independent bounded
+Quint model of the supplied TestFlight release-loop diagram. It captures the
+pictured fixer, human-pause, and manual-promotion paths; it does not describe
+behavior implemented by `ci`. The comparison with `JjCi.qnt` is in
+[`docs/release-loop-comparison.md`](docs/release-loop-comparison.md).
 
 Codex shell commands and OpenCode server shell execution receive a no-op
 `JJ_EDITOR` and an unpaginated `PAGER`. This keeps agent-run JJ commands from
