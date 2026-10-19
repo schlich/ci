@@ -54,8 +54,9 @@ equivalent low-level commands:
 - `ci land` for delivery to `main`;
 - `ci rebase` for updating that topic in place;
 - `ci new` to start a topic as a revision in the current workspace, `ci start`
-  to create a workspace when no free one exists, and `ci park` or
-  `ci cancel` to release a topic.
+  to create a workspace named for one topic when the default checkout is
+  busy, and `ci park` or `ci cancel` to release a topic and remove that
+  workspace.
 
 When the `ci` MCP server is available, call its tools (`status`, `plan`,
 `validate`, `publish`, `land`, `finish`, and so on) instead of running `ci`
@@ -85,10 +86,10 @@ Use the narrowest workflow that matches the request:
 | Update a topic from trunk | `ci rebase` | Checkpoints, fetches, and rebases the same change. |
 | Undo a failed rebase, restack, sync, or cancel | `ci recover [<id>]` | Reverts only the operations of the checkpoint printed as `Recovery point: ci recover ID` (default: this workspace's latest), keeping every other workspace's operations since. Refuses once a commit the rewrite made was edited or resolved. Never `jj op restore` a recovery point: it rewinds every workspace. |
 | Restack dispatched topics after trunk moves | `ci sequence --apply` | Run it by hand only on request. Restacks stacked topics onto their parent's bookmark and conflicting topics onto `trunk()`, parents first. Checked-out topics are rebased from their own workspace only when a trial merge is clean. Pushes only conflict-free stacks. `--all` also rebases topics that are merely behind; `--no-push` stops before any remote change. |
-| Start a topic | `ci new [-m <message>]` | Fetches and starts a topic on `trunk()` in the current workspace. An empty working copy that is unnamed, or that this session claimed, becomes the topic in place, keeping its change ID; otherwise a new change starts and the previous topic stays as a sibling (`jj edit` returns to it). Refuses while an active agent session owns another change here or an unfinished `ci start` topic is checked out. |
-| Start concurrent work | `ci start <name>` | Only when no workspace is free. Creates `.jj-workspaces/<name>` at `trunk()` for an actor that runs alongside the current working copy (another agent task, a build, a dev server), inside the Git worktree it runs from if any (such as a Claude Code worktree); refuses a name already in use. |
+| Start a topic | `ci new [-m <message>]` | Fetches and starts a topic on `trunk()` in the current workspace. An empty working copy that is unnamed, or that this session claimed, becomes the topic in place, keeping its change ID; otherwise a new change starts and the previous topic stays as a sibling (`jj edit` returns to it). Refuses while an active agent session owns another change here, and in a `ci start` workspace for any topic but the one it was made for: start the next topic with `ci start` instead. |
+| Start concurrent work | `ci start <name>` | When the default checkout is busy. Name it for this task: it creates `.jj-workspaces/<name>` at `trunk()` for that one topic, run alongside the current working copy (another agent task, a build, a dev server), inside the Git worktree it runs from if any (such as a Claude Code worktree); refuses a name already in use. `ci park` or `ci cancel` removes it with the topic. |
 | Hand a topic to an agent | `ci adopt` | Only on the user's request. Lets the next agent session that edits the workspace claim the topic checked out there, which agents are otherwise refused. |
-| Finish a landed topic | `ci park` | Verifies the current revision is on `trunk()`, deletes the topic bookmark locally and on the remotes, and removes a workspace that `ci start` created before archiving. `--keep` returns it to the pool instead: it stays on an empty change on main and drops its `ci start` marker, so the next task starts a fresh topic there. Any other workspace also stays. An empty working copy passes when its dispatched branch, if any, landed. |
+| Finish a landed topic | `ci park` | Verifies the current revision is on `trunk()`, deletes the topic bookmark locally and on the remotes, and removes a workspace that `ci start` created before archiving, so its name never outlives the topic. Any other workspace, such as the default checkout, stays on an empty change on main. `--keep` is deprecated and ignored. An empty working copy passes when its dispatched branch, if any, landed. |
 | Drop a topic that will not land | `ci cancel` | Refuses while a Tangled pull request from its branch is open. Checkpoints, deletes the topic bookmark, abandons the revisions above `trunk()`, and releases the workspace like `park`. Requires an explicit user request. |
 | Reclaim leaked workspaces | `ci prune` | Dry run by default. Lists missing workspaces and unowned ones whose work is delivered (only an empty undescribed working copy remains above `trunk()`), plus checkpoints older than `--keep-days`. Reports stale workspaces untouched. `--apply` updates stale ones, decides again, then forgets and deletes the listed ones, which requires an explicit user request. |
 | Capture a review version | `ci review snapshot <label>` | Records the exact base and series tip for a later interdiff. |
@@ -141,16 +142,19 @@ bypass the workflow with direct branch pushes or merges.
 ## Continuous integration and conflict handling
 
 In a repository with topic workspaces, an agent session works only in a
-workspace whose change it owns. Any workspace idle on trunk (nothing above
-`trunk()` but an empty change) is free, the default checkout included:
-the session's first edit there claims it, and `ci new -m MESSAGE` names the
-claimed change in place. A workspace another live session owns, or one holding
-a topic no session owns, refuses the session's edits; the session-start note
-and the refusal name the free workspaces to move to, and only when none is
-free does the session create one with `ci start NAME`. Never take over a topic
-the user started unless they ask; they hand it over with `ci adopt`. In a
-workspace it owns, a session starts its next topic with `ci new` and continues
-in place after `ci park --keep` or `ci park` returns the workspace to trunk.
+workspace whose change it owns. One workspace serves one topic. The default
+checkout is shared: when it is idle on trunk (nothing above `trunk()` but an
+empty change), the session's first edit there claims it, and
+`ci new -m MESSAGE` names the claimed change in place. When it is busy, the
+session creates a workspace named for its own task with `ci start NAME`; that
+workspace belongs to that topic alone and `ci park` or `ci cancel` removes it,
+so its name never outlives the topic. A workspace another live session owns,
+or one holding a topic no session owns, refuses the session's edits; the
+session-start note and the refusal offer only the default checkout, or
+`ci start` when it is busy, never another task's workspace. Never take over a
+topic the user started unless they ask; they hand it over with `ci adopt`. In
+the default checkout, a session starts its next topic with `ci new` after
+`ci park` returns it to trunk.
 From a Claude Code worktree under `.claude/worktrees/`, which is a Git
 worktree rather than a JJ workspace, `ci start` creates the workspace inside
 it so the app lets the session edit there.

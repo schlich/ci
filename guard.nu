@@ -78,7 +78,7 @@ def --wrapped jj [...args: string] {
         if $refusal != null {
             error make {
                 msg: $"Refusing `jj ($args | str join ' ')`: ($refusal)."
-                help: "Keep working here with `jj new` or `jj new --no-edit`, start other work in a free workspace or with `ci start NAME`, end the topic with `ci park` or `ci cancel`, or run `^jj` to leave the topic on purpose."
+                help: "Keep working here with `jj new` or `jj new --no-edit`, start other work with `ci start NAME`, end the topic with `ci park` or `ci cancel`, or run `^jj` to leave the topic on purpose."
             }
         }
     }

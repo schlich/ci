@@ -788,32 +788,24 @@ async def dispatch_stack(
 
 @mcp.tool(annotations=REMOTE)
 async def park(
-    keep: Annotated[
-        bool,
-        Field(description="Keep a `ci start` workspace for the next task."),
-    ] = False,
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
     """`ci park`: verify the topic landed, delete its branch, and free
-    the workspace (removing one `ci start` created unless `keep`)."""
-    args = ["park"] + (["--keep"] if keep else [])
-    return await run(args, workspace, wait_seconds)
+    the workspace, removing one `ci start` created: it served only this
+    topic."""
+    return await run(["park"], workspace, wait_seconds)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def cancel_topic(
-    keep: Annotated[
-        bool,
-        Field(description="Keep a `ci start` workspace for the next task."),
-    ] = False,
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
     """`ci cancel`: delete the topic branch, abandon its revisions, and
-    release the workspace. Only on an explicit user request."""
-    args = ["cancel"] + (["--keep"] if keep else [])
-    return await run(args, workspace, wait_seconds)
+    release the workspace, removing one `ci start` created. Only on an
+    explicit user request."""
+    return await run(["cancel"], workspace, wait_seconds)
 
 
 @mcp.tool(annotations=REMOTE)

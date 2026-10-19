@@ -208,12 +208,12 @@ export extern "ci new" [
 
 # Confirm the current head landed on main and free the workspace
 export extern "ci park" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ]
 
 # Abandon the current topic's revisions and free the workspace
 export extern "ci cancel" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ]
 
 # Vacate a Codex task's claim that its task left behind, without touching the topic

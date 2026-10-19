@@ -4686,19 +4686,18 @@ def end-ownership [root: string, outcome: string] {
 }
 
 # Release the topic onto an empty change on main. A workspace that `ci start`
-# created is then dropped; any other one stays and its Codex owner records
+# created served only this topic, so it is dropped with it and its name never
+# outlives the topic; any other one stays and its Codex owner records
 # `outcome` (delivered or discarded).
-def --env release-workspace [summary: string, change: string, keep: bool, outcome: string] {
+def --env release-workspace [summary: string, change: string, outcome: string] {
     let workspace = (current-workspace)
     run-command "leaving a clean workspace on main" { ^jj new (trunk-revset) } | ignore
     let marker = (owned-workspace-marker $workspace.root)
-    if not $keep and $workspace.name != "default" and ($marker | path exists) {
+    if $workspace.name != "default" and ($marker | path exists) {
         drop-workspace $workspace
         print $"($summary) Removed workspace ($workspace.name); continue from ($env.PWD)."
         return
     }
-    # A kept workspace joins the pool: its next task starts a fresh topic, so
-    # the finished topic's marker must not pin the next session to it.
     if ($marker | path exists) { rm $marker }
     let owner_path = ($workspace.root | path join ".jj" "codex-session.json")
     if ($owner_path | path exists) and (open $owner_path).change_id? == $change {
@@ -4766,7 +4765,7 @@ def "main start" [
         error make { msg: "Use a lowercase name of letters, digits, and hyphens." }
     }
     if $name in (list-workspaces | get name) {
-        error make { msg: $"Workspace ($name) already exists. Park or cancel its topic first, or start a topic there with `ci new`." }
+        error make { msg: $"Workspace ($name) already exists for another topic. Name this one after its own topic." }
     }
     let default_root = (workspace-root "default")
     let root = (start-parent $default_root (enclosing-git-worktree $env.PWD $default_root) | path join $name)
@@ -4788,16 +4787,21 @@ def "main start" [
 }
 
 # Why `ci new` may not start another topic in this workspace, or null. A
-# workspace that an active task or `ci start` dedicated to one topic keeps it
-# until `finish` or `abandon`; any other one holds sibling topics. An empty
-# working copy that is unnamed, or that its owner claimed before naming it,
-# becomes the topic in place (`in_place`), which moves nothing.
+# workspace that an active task owns keeps its change until `park` or
+# `cancel`. One that `ci start` created serves only the topic it was made
+# for (`own_topic`: naming that empty change in place), so its name never
+# outlives the topic; any other one holds sibling topics. An empty working
+# copy that is unnamed, or that its owner claimed before naming it, becomes
+# the topic in place (`in_place`), which moves nothing.
 def new-topic-refusal [facts: record] {
     if $facts.owner == "active" and not $facts.in_place {
-        return "An active agent session owns this workspace's change. Start concurrent work in a free workspace or with `ci start NAME`."
+        return "An active agent session owns this workspace's change. Start concurrent work with `ci start NAME`."
     }
-    if $facts.dedicated and not $facts.topic_done {
-        return "This workspace belongs to one unfinished topic from `ci start`. Finish or abandon it, or start concurrent work with `ci start NAME`."
+    if $facts.dedicated and not $facts.own_topic {
+        if $facts.topic_done {
+            return "This workspace was made by `ci start` for a topic that has ended. Run `ci park` or `ci cancel` to remove it, and start the next topic with `ci start NAME`."
+        }
+        return "This workspace belongs to one unfinished topic from `ci start`. Park or cancel it, or start concurrent work with `ci start NAME`."
     }
     null
 }
@@ -4820,9 +4824,11 @@ def "main new" [
     let unnamed = $empty and (current-change "description") == ""
     let immutable = (current-change "immutable") == "true"
     let in_place = $empty and not $immutable and ($unnamed or ((owner-status $owner) == "active" and $owner.change_id? == $current))
+    let dedicated = ($marker | path exists)
     let refusal = (new-topic-refusal {
         owner: (owner-status $owner)
-        dedicated: ($marker | path exists)
+        dedicated: $dedicated
+        own_topic: ($in_place and $dedicated and (open $marker).change_id? == $current)
         topic_done: ($facts.landed or not $facts.visible or $facts.topic_empty)
         in_place: $in_place
     })
@@ -4837,8 +4843,6 @@ def "main new" [
         if $message != null {
             run-command "naming the topic" { ^jj describe --message $message } | ignore
         }
-        # A marker naming another topic would strand this one.
-        if ($marker | path exists) and (open $marker).change_id? != $current { rm $marker }
         print $"Started topic (current-change 'change_id.short()') on ($at)."
         return
     }
@@ -4846,8 +4850,6 @@ def "main new" [
     let previous = if $immutable { null } else { { id: (current-change "change_id.short()") title: (current-change "description.first_line()") } }
     let args = if $message == null { [] } else { [--message $message] }
     run-command $"starting a topic on ($at)" { ^jj new $trunk ...$args } | ignore
-    # A pool workspace's marker named the landed topic; the new one is not it.
-    if ($marker | path exists) { rm $marker }
     let created = (current-change "change_id.short()")
     if $previous == null {
         print $"Started topic ($created) on ($at)."
@@ -4875,10 +4877,19 @@ def finish-topic-id [] {
     }
 }
 
+# `--keep` once returned a `ci start` workspace to a pool for unrelated
+# topics. A workspace now serves one topic, so the flag only warns.
+def warn-keep [keep: bool] {
+    if $keep {
+        print --stderr "ci: --keep is deprecated and ignored: a workspace from `ci start` serves one topic and is removed with it. Start the next topic with `ci start NAME`."
+    }
+}
+
 # Taxi in and shut down: confirm the topic landed, then free its workspace.
 def --env "main park" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ] {
+    warn-keep $keep
     let change = (finish-topic-id)
     require-owned-change $change
     let branch = (publication-bookmark $change)
@@ -4901,19 +4912,19 @@ def --env "main park" [
     run-command $"advancing ($main)" { ^jj ...(checkpoint-tag) bookmark move $main --to "trunk()" } | ignore
     let summary = if $published { $"Parked ($branch)." } else { "Parked an undispatched topic." }
     # Past the checks above, a published or non-empty topic is on main.
-    release-workspace $summary $change $keep (if $published or not $empty { "delivered" } else { "discarded" })
+    release-workspace $summary $change (if $published or not $empty { "delivered" } else { "discarded" })
     report-status done $summary --id park
 }
 
 def --env "main finish" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ] {
     renamed "finish" "park"
     main park --keep=$keep
 }
 
 def --env "main abandon" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ] {
     renamed "abandon" "cancel"
     main cancel --keep=$keep
@@ -4921,8 +4932,9 @@ def --env "main abandon" [
 
 # Scrub the flight: abandon the topic's revisions and free its workspace.
 def --env "main cancel" [
-    --keep # Keep a workspace that `ci start` created
+    --keep # Deprecated and ignored: a `ci start` workspace is always removed
 ] {
+    warn-keep $keep
     require-owned-change
     let change = (current-change "change_id")
     let branch = (publication-bookmark)
@@ -4943,7 +4955,7 @@ def --env "main cancel" [
         run-command "abandoning the topic" { ^jj ...(checkpoint-tag) abandon ...($revisions | get change_id) } | ignore
         update-moved-workspaces $moved
     }
-    release-workspace $"Cancelled the topic and abandoned ($revisions | length) revision\(s)." $change $keep "discarded"
+    release-workspace $"Cancelled the topic and abandoned ($revisions | length) revision\(s)." $change "discarded"
 }
 
 # Release a Codex task's claim on this workspace when the task left its change

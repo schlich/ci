@@ -43,7 +43,7 @@ pub type Commit = String;
 /// Where a released topic left its workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Workspace {
-    /// Kept, on an empty change on main (`ci park --keep`).
+    /// Kept, on an empty change on main, because `ci start` did not create it.
     Main,
     /// Removed, because `ci start` created it.
     Dropped,

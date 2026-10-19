@@ -308,9 +308,9 @@ module JjCi {
     }
   }
 
-  // Releasing a topic leaves its workspace on main (--keep, or one that
-  // `ci start` did not create) or drops it, so no workspace outlives its
-  // owner.
+  // Releasing a topic leaves its workspace on main (one that `ci start` did
+  // not create) or drops it (one `ci start` made for this topic), so no
+  // workspace outlives its owner.
   action Finish = {
     nondet base = Set("main", "dropped").oneOf()
     all {

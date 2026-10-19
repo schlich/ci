@@ -210,22 +210,25 @@ def occupancy [root: path, facts: record] {
     }
 }
 
-# The workspaces besides `root` that a session could claim now: idle on
-# trunk, or parked on landed work, with no active owner. Reads without
-# snapshotting, so edits not yet recorded can hide from it.
+# The repository's workspaces, by name and root. Reads without snapshotting,
+# so edits not yet recorded can hide from free-workspaces.
 def list-workspace-roots [root: path] {
     let listing = (^jj --ignore-working-copy --repository $root workspace list -T 'name ++ "\t" ++ root ++ "\n"' | complete)
     if $listing.exit_code != 0 { return [] }
     $listing.stdout | lines | where {|line| $line | is-not-empty } | parse "{name}\t{root}"
 }
 
+# The workspace to offer a session that may not edit `root`: only the default
+# checkout, when it is idle on trunk with no active owner. A workspace from
+# `ci start` serves the one topic it was made for and is removed with it, so
+# it is never offered to another task, even while idle.
 def free-workspaces [root: path] {
     let revset = $"working_copies\() & \(\(empty\() & ~conflicts\() & children\(::($TRUNK))) | ::($TRUNK))"
     let idle = (^jj --ignore-working-copy --repository $root log --no-graph -r $revset -T 'working_copies ++ "\n"' | complete)
     if $idle.exit_code != 0 { return [] }
     let names = ($idle.stdout | split row --regex '\s+' | where {|name| $name | is-not-empty } | str replace --regex '@$' '')
     list-workspace-roots $root
-    | where {|workspace| $workspace.name in $names and $workspace.root != $root }
+    | where {|workspace| $workspace.name == "default" and "default" in $names and $workspace.root != $root }
     | where {|workspace| (owner-status (read-json ($workspace.root | path join ".jj" $OWNER_FILE))) != "active" }
 }
 
@@ -233,11 +236,11 @@ def free-workspace-hint [root: path, relative?: string] {
     let free = (free-workspaces $root)
     # `ci start` puts new workspaces beside the default checkout.
     let parent = (list-workspace-roots $root | where name == "default" | get --optional 0.root | default $root)
-    let start = if $relative == null { "`ci start NAME`" } else { $"`ci start NAME` and edit ($parent)/.jj-workspaces/NAME/($relative)" }
+    let start = if $relative == null { "`ci start <name-for-this-task>`" } else { $"`ci start <name-for-this-task>` and edit ($parent)/.jj-workspaces/<name-for-this-task>/($relative)" }
     if ($free | is-empty) {
-        $"No other workspace is free; create one with ($start)."
+        $"Create a workspace for this task with ($start); it is removed when the topic is parked or cancelled."
     } else {
-        $"Free workspaces: ($free | each {|workspace| $'($workspace.name) at ($workspace.root)' } | str join ', '). Use one of them, or create another with ($start)."
+        $"The default checkout at ($free | first | get root) is free: use it, or create a workspace for this task with ($start)."
     }
 }
 
@@ -570,7 +573,7 @@ def "main refresh" [dir?: path] {
 }
 
 # edit-verdict for a tracked file in `root`, for `session`, from facts already
-# collected there, with the free workspaces to suggest when it would deny.
+# collected there, with the workspace to suggest when it would deny.
 def session-access [root: path, facts: record, session: string] {
     let record = (read-json ($root | path join ".jj" $OWNER_FILE))
     let access = ({

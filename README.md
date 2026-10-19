@@ -112,7 +112,7 @@ appropriate change instead of appended as "address review" commits.
 
 ```nu
 ci new -m "Topic title"     # Start a topic on main@tangled in this workspace.
-ci start topic-name         # Or, when no workspace is free: create one for concurrent work.
+ci start topic-name         # Or, when the default checkout is busy: a workspace for this topic.
 ci status
 ci sequence                 # See whether the topic stacks on another in flight.
 ci rebase                   # Fetch trunk and rebase the whole topic stack.
@@ -166,12 +166,11 @@ topic untouched as a sibling. An empty working copy that is unnamed, or that
 an agent session claimed before naming it, becomes the topic in place instead:
 `ci new` moves it onto `main@tangled` and describes it, so its change ID, and
 the session's claim on it, stay. It refuses while an active agent session owns
-another change in the workspace, or while the unfinished topic of a `ci start`
-workspace is checked out; start concurrent work in a free workspace or with
-`ci start` instead.
+another change in the workspace, and in a `ci start` workspace for any topic
+but the one it was made for; start other work with `ci start` instead.
 
-A workspace from `ci start` stays on its topic until `park` or `cancel`
-frees it. `ci start` records the topic's change ID in `.jj/jj-ci-workspace.json`, and
+A workspace from `ci start` serves its one topic until `park` or `cancel`
+removes it, so its name never outlives the topic. `ci start` records the topic's change ID in `.jj/jj-ci-workspace.json`, and
 every command that checks ownership refuses to run when the working copy is an
 empty change beside that unlanded topic, as after a manual `jj new main`; the
 error names the `jj edit` that returns to it. In an interactive Nushell, the
@@ -449,15 +448,15 @@ too.
 `ci park` checks that the current revision is on `main@tangled`. It then
 deletes the topic bookmark locally and on Tangled, advances local main, and
 releases the workspace. A workspace that `ci start` created is forgotten
-and its directory deleted; continue from the default checkout. `--keep`, or
-any other workspace, is left on an empty change on main with its session's
-ownership finished. `--keep` also deletes the `ci start` marker, so the
-workspace joins a reusable pool: it is free again, and the next session there
-starts a fresh topic instead of being refused for the landed one. Archive the
-task only after it succeeds.
+and its directory deleted; continue from the default checkout. Any other
+workspace is left on an empty change on main with its session's ownership
+finished. `--keep`, which once returned a `ci start` workspace to a reusable
+pool, is deprecated: it prints a warning and the workspace is removed anyway.
+Archive the task only after it succeeds.
 
 `ci adopt` hands the topic checked out in a workspace to the next agent
-session that edits it. Agents claim only free workspaces on their own, so a
+session that edits it. Agents claim only a free default checkout or their
+own `ci start` workspace on their own, so a
 topic you started by hand, or one whose session ended, stays yours until you
 run it. It refuses while a live session owns the workspace.
 
@@ -470,7 +469,7 @@ remote branch returns with the next dispatch.
 
 Workspace lifetime follows ownership rather than garbage collection:
 `ci start` creates a workspace for one concurrent actor's topic, and `park`
-or `cancel` frees it, or returns it to the pool with `--keep`. `ci prune` is the backstop for owners that never
+or `cancel` removes it. `ci prune` is the backstop for owners that never
 released theirs, such as a crashed task or a workspace created by hand. It
 lists workspaces that are missing, or that no active task owns and whose
 revisions above `main@tangled` are all delivered: nothing but an empty,
@@ -915,28 +914,28 @@ unit; never squash at delivery.
 
 ## Concurrent tasks
 
-A workspace is a working copy for one actor at a time. An agent session works
-only in a workspace whose change it owns, and takes a new one only when it is
-**free**: idle on trunk, with nothing above `main@tangled` but an empty change,
-and no live session owning it. The default checkout is not special: when it is
-idle on trunk, the next session claims it like any other. A workspace that
-holds a topic no session owns (work someone started by hand, or a session's
-that ended) stays with that topic; agents are refused there until the user
-hands the topic over with `ci adopt`.
+A workspace is a working copy for one actor and one topic at a time. An agent
+session works only in a workspace whose change it owns. The default checkout
+is shared: when it is **free** (idle on trunk, with nothing above
+`main@tangled` but an empty change, and no live session owning it), the next
+session claims it. A workspace that holds a topic no session owns (work
+someone started by hand, or a session's that ended) stays with that topic;
+agents are refused there until the user hands the topic over with `ci adopt`.
 
-So a session opened in a busy checkout moves to a free workspace, and only
-when none is free does it create one:
+So a session opened in a busy checkout creates a workspace named for its own
+task:
 
 ```nu
-ci start agent-1
+ci start fix-login-timeout
 ```
 
-It creates `.jj-workspaces/agent-1` at `main@tangled` and refuses a name
-that is already in use. `ci park` or `ci cancel` removes it; with `--keep`
-it stays for the next task. Workspaces that sessions claimed rather than
-created, the default checkout among them, stay after `ci park`, back on
-trunk and free. A small pool of workspaces, one per agent that runs at the
-same time, avoids creating and deleting one per topic.
+It creates `.jj-workspaces/fix-login-timeout` at `main@tangled` and refuses
+a name that is already in use. The workspace serves that one topic: `ci new`
+there refuses any other, and `ci park` or `ci cancel` removes it, so its name
+never outlives its work. The hooks never offer an idle `ci start` workspace
+to another task; they offer the default checkout when it is free and
+`ci start` otherwise. The default checkout stays after `ci park`, back on
+trunk and free.
 
 A stale claim never holds a workspace forever. The owning session's
 transcript (Claude Code) or rollout (Codex) shows when it last ran: once it
@@ -1011,11 +1010,11 @@ changes, and built systems from half-finished topics (2026-10-07).
   Codex's hook all see it. A claim lock serializes two sessions' first
   edits. The hook refuses an edit to a workspace another live session owns,
   to a topic nobody handed over, or to a Git worktree without its own `.jj`,
-  and names the free workspaces to use instead. It snapshots a workspace only
+  and names the default checkout when it is free, or `ci start` otherwise. It snapshots a workspace only
   when no live session owns it.
 - Its SessionStart handoff says what the session may do in its directory:
   that it owns the workspace, that its first edit will claim it, or why it is
-  refused and which workspaces are free. In a worktree, it lists the JJ
+  refused and where to go instead. In a worktree, it lists the JJ
   workspaces the session already made there.
 
 `tests/context-status-properties.nu` checks the guard's verdicts.

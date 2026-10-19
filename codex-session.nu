@@ -115,7 +115,7 @@ def claim-verdict [facts: record] {
     # when it is free, the canonical checkout included, or dedicated to its
     # topic; a topic no task owns stays with whoever started it.
     if $facts.dedicated and not $facts.free and not $facts.marker {
-        return { action: "skip" reason: "This workspace holds a topic no task owns. Start yours in a free workspace, or with `ci start NAME`, and open that directory as the project." }
+        return { action: "skip" reason: "This workspace holds a topic no task owns. Start yours in the default checkout when it is free, or with `ci start NAME`, and open that directory as the project." }
     }
     if $facts.claim {
         return { action: "refuse" reason: "This workspace has a session claim that no active task holds. Inspect .jj/codex-session.json, then clear it with `ci unclaim`." }
