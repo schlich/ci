@@ -4721,6 +4721,590 @@ def "main impact import" [revset?: string] {
     }
 }
 
+# `ci shape` asks Jev whether each revision of a topic is one deliverable and
+# whether the revisions belong together, then turns its answers into advice:
+# split a revision, squash a fixup into the revision it fixes, or move
+# revisions that need nothing else in the topic into a topic of their own. It
+# prints the jj commands for that advice and runs none of them. Shape a topic
+# while authoring it; once dispatched, its revisions are what review saw.
+#
+# Every question and threshold lives here so they can be reviewed and tuned
+# together. They were chosen for `model`; retune them before moving it.
+const SHAPE = {
+    model: "jev-1.13.0"
+    # Characters of state in one request. Jev 1.13 reads 32k tokens of state
+    # plus the longest question, and 64k plus every question; at about four
+    # characters a token this leaves room for the questions.
+    max_state_chars: 80000
+    # Characters of one unit's diff before it is cut.
+    max_excerpt_chars: 4000
+    # A revision that changes more files than this is judged by directory.
+    max_units: 24
+    # A longer topic compares only neighbouring revisions and separates none.
+    max_pair_revisions: 10
+    # Split a revision at least this likely to bundle deliverables, moving out
+    # the units at most `max_on_topic` likely to serve its description.
+    min_mixed: 0.7
+    max_on_topic: 0.3
+    # Squash or separate revisions only on a relation this confident.
+    min_relation_confidence: 0.7
+    # One part of a split needs the other at or above this probability, and
+    # stands alone below one minus it.
+    min_needs: 0.6
+    # Files whose diffs tell a reviewer nothing.
+    summarized: ["flake.lock" "Cargo.lock" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "go.sum"]
+    # Diff lines that look like they assign a credential are never sent.
+    withhold: '(?i)(api[_-]?key|token|secret|password|passwd|credential|private[_-]?key)\w*\s*[=:]'
+    context: "Revisions of one topic in a Jujutsu repository, oldest first, that will be reviewed and landed on the main branch. A deliverable is a change a reviewer could review, and the project could land, on its own; tests, documentation, and configuration belong to the deliverable they serve. Each unit is one file's diff, or one directory's when a revision changes many files. Diff lines starting with + were added and lines starting with - removed; long diffs are cut short."
+    questions: {
+        mixed: {
+            type: noul
+            instructions: {
+                question: "The revision bundles two or more deliverables that could each be reviewed and landed without the others."
+                inspect: "`revision`"
+            }
+            criteria: {
+                "true": "Its units serve unrelated purposes, such as a feature together with an unrelated fix, refactor, or documentation change"
+                "false": "Its units all serve one purpose, including the tests, documentation, and configuration that purpose needs"
+            }
+        }
+        on_topic: {
+            type: noul
+            instructions: {
+                question: "This unit's change is part of the deliverable that `revision.description` describes. When the description is empty, judge it against the purpose most of `revision.units` share."
+                inspect: ""
+            }
+            criteria: {
+                "true": "The unit implements, tests, documents, or configures that deliverable"
+                "false": "The unit does something a reviewer would expect in a separate change"
+            }
+        }
+        relation: {
+            type: choice
+            instructions: {
+                question: "How does the later revision relate to the earlier one?"
+                earlier: ""
+                later: ""
+            }
+            criteria: {
+                fixup: {
+                    what: "The later revision corrects, finishes, or partly undoes the earlier one, so a reviewer would want the two as one change"
+                    examples: ["fixes a typo, test, or bug the earlier revision introduced" "applies review feedback on the earlier revision"]
+                }
+                builds_on: {
+                    what: "The later revision is a deliverable of its own that needs the earlier one to build, test, or make sense"
+                    examples: ["uses a function, option, or file the earlier revision adds"]
+                }
+                independent: {
+                    what: "The later revision is a deliverable of its own that works without the earlier one"
+                    examples: ["changes an unrelated feature or file"]
+                }
+            }
+        }
+        moved_needs_kept: {
+            type: noul
+            instructions: "The changes in `revision.moved` need the changes in `revision.kept` to build, test, or make sense."
+            criteria: {
+                "true": "Without the kept changes, the moved ones would fail or mean nothing"
+                "false": "The moved changes stand on their own"
+            }
+        }
+        kept_needs_moved: {
+            type: noul
+            instructions: "The changes in `revision.kept` need the changes in `revision.moved` to build, test, or make sense."
+            criteria: {
+                "true": "Without the moved changes, the kept ones would fail or mean nothing"
+                "false": "The kept changes stand on their own"
+            }
+        }
+    }
+}
+
+# Ask Jev `questions` about `state` with `jev ask`, which reads the TypeSafe
+# key and records usage itself; CI_JEV names another command. Returns
+# { answers model usage }, or { error } when Jev could not judge them.
+def jev-ask [state: record, questions: record, model: string] {
+    let jev = ($env.CI_JEV? | default "jev")
+    if (which $jev | is-empty) {
+        return { error: $"`($jev)` is not installed; install Jev's `jev` command or set CI_JEV to one." }
+    }
+    let result = (try {
+        { state: $state questions: $questions } | to json --raw | ^$jev ask --model $model | complete
+    } catch {|err| { exit_code: 1 stdout: "" stderr: $err.msg } })
+    if $result.exit_code != 0 {
+        let detail = ($result.stderr | str trim)
+        return { error: (if ($detail | is-empty) { $"jev ask exited ($result.exit_code)" } else { $detail }) }
+    }
+    let body = (try { $result.stdout | from json } catch { null })
+    if not ($body.answers? | describe | str starts-with "record") {
+        return { error: "jev ask returned no answers" }
+    }
+    { answers: $body.answers model: ($body.model? | default $model) usage: ($body.usage? | default {}) }
+}
+
+# The answer to the Noul `id` in `answers`, or null when Jev gave none.
+def shape-noul [answers: any, id: string] {
+    $answers | get --optional $id | get --optional noul
+}
+
+# The files a Git-format diff changes: each one's path, added and removed
+# line counts, and its hunks.
+def git-diff-files [diff: string] {
+    let lines = ($diff | lines)
+    let starts = ($lines | enumerate | where {|row| $row.item | str starts-with "diff --git " } | get index)
+    $starts | enumerate | each {|start|
+        let end = ($starts | get --optional ($start.index + 1) | default ($lines | length))
+        let chunk = ($lines | skip $start.item | first ($end - $start.item))
+        let hunk = ($chunk | enumerate | where {|row| $row.item | str starts-with "@@" } | get --optional 0.index)
+        let header = if $hunk == null { $chunk } else { $chunk | first $hunk }
+        let body = if $hunk == null { [] } else { $chunk | skip $hunk }
+        let new = ($header | where {|line| $line | str starts-with "+++ b/" } | get --optional 0)
+        let old = ($header | where {|line| $line | str starts-with "--- a/" } | get --optional 0)
+        let named = ($chunk | first | parse --regex '^diff --git a/.+? b/(?P<path>.+)$' | get --optional 0.path)
+        let path = if $new != null { $new | str substring 6.. } else if $old != null { $old | str substring 6.. } else { $named | default "" }
+        let binary = ($header | any {|line| ($line | str starts-with "Binary files ") or $line == "GIT binary patch" })
+        {
+            path: $path
+            added: ($body | where {|line| $line | str starts-with "+" } | length)
+            removed: ($body | where {|line| $line | str starts-with "-" } | length)
+            diff: (if $binary { "(binary file)" } else { $body | str join "\n" })
+        }
+    } | where {|file| $file.path | is-not-empty }
+}
+
+def shape-clip [text: string, chars: int] {
+    if ($text | str length --grapheme-clusters) <= $chars { return $text }
+    $"($text | str substring --grapheme-clusters 0..<$chars)\n… \(cut)"
+}
+
+def shape-withhold [text: string, pattern: string] {
+    $text | lines | each {|line|
+        if $line =~ $pattern { "[line withheld: it may assign a credential]" } else { $line }
+    } | str join "\n"
+}
+
+# The directory `depth` levels deep that holds `path`, or "." for a file at
+# the root.
+def shape-directory [path: string, depth: int] {
+    let parts = ($path | split row "/" | drop 1 | first $depth)
+    if ($parts | is-empty) { "." } else { $parts | str join "/" }
+}
+
+# `files` grouped into the units Jev judges: one per file, or, when there are
+# more than `max_units` files, one per directory two levels deep and then one
+# level deep. More directories than that leave no units, and only the
+# revision as a whole is judged.
+def shape-groups [files: list, max_units: int] {
+    if ($files | length) <= $max_units {
+        return ($files | each {|file| { name: $file.path kind: "file" files: [$file] } })
+    }
+    for depth in [2 1] {
+        let groups = ($files | group-by {|file| shape-directory $file.path $depth } | transpose name files)
+        if ($groups | length) <= $max_units {
+            return ($groups | each {|group| { name: $group.name kind: "directory" files: $group.files } })
+        }
+    }
+    []
+}
+
+# The units Jev judges for one revision's `files`, each with its paths, line
+# counts, and diff, cut so that together they fit `shape.max_state_chars`.
+def shape-units [files: list, shape: record] {
+    let groups = (shape-groups $files $shape.max_units)
+    if ($groups | is-empty) { return [] }
+    let room = ([$shape.max_excerpt_chars ($shape.max_state_chars // ($groups | length))] | math min)
+    $groups | each {|group|
+        let text = ($group.files | each {|file|
+            let body = if ($file.path | path basename) in $shape.summarized {
+                "(lock file)"
+            } else if ($file.diff | is-empty) {
+                "(no content change)"
+            } else {
+                shape-withhold $file.diff $shape.withhold
+            }
+            if $group.kind == "file" { $body } else { $"# ($file.path)\n($body)" }
+        } | str join "\n")
+        {
+            name: $group.name
+            kind: $group.kind
+            paths: ($group.files | get path)
+            added: ($group.files | get added | math sum)
+            removed: ($group.files | get removed | math sum)
+            diff: (shape-clip $text $room)
+        }
+    }
+}
+
+# One revision as Jev reads it.
+def shape-revision-state [revision: record] {
+    {
+        change: $revision.short
+        description: $revision.description
+        files: $revision.files
+        units: ($revision.units | each {|unit| $unit | select name kind added removed diff })
+    }
+}
+
+# The request asking whether `revision` bundles deliverables and whether each
+# of its units serves its description.
+def shape-split-request [revision: record, shape: record] {
+    let units = if ($revision.units | length) < 2 { [] } else { $revision.units | enumerate }
+    let questions = ($units | reduce --fold { mixed: $shape.questions.mixed } {|unit, questions|
+        $questions | insert $"unit_($unit.index)" ($shape.questions.on_topic | update instructions.inspect $"`revision.units[($unit.index)]`")
+    })
+    { state: { context: $shape.context revision: (shape-revision-state $revision) } questions: $questions }
+}
+
+# The pairs of revisions whose relation Jev judges, by index, oldest first:
+# every pair, or only neighbours in a topic longer than `max_revisions`.
+def shape-pairs [count: int, max_revisions: int] {
+    if $count < 2 { return [] }
+    if $count > $max_revisions {
+        return (1..<$count | each {|later| { earlier: ($later - 1) later: $later } })
+    }
+    1..<$count | each {|later| 0..<$later | each {|earlier| { earlier: $earlier later: $later } } } | flatten
+}
+
+# The request asking how each pair of `revisions` relates, with every
+# revision's diffs cut to share `shape.max_state_chars`.
+def shape-pair-request [revisions: list, pairs: list, shape: record] {
+    let room = ($shape.max_state_chars // ($revisions | length))
+    let state = ($revisions | each {|revision|
+        let each_unit = ($room // ([($revision.units | length) 1] | math max))
+        let units = ($revision.units | each {|unit| $unit | merge { diff: (shape-clip $unit.diff $each_unit) } })
+        shape-revision-state ($revision | merge { units: $units })
+    })
+    let questions = ($pairs | reduce --fold {} {|pair, questions|
+        $questions | insert $"pair_($pair.earlier)_($pair.later)" ($shape.questions.relation
+            | update instructions.earlier $"`revisions[($pair.earlier)]`"
+            | update instructions.later $"`revisions[($pair.later)]`")
+    })
+    { state: { context: $shape.context revisions: $state } questions: $questions }
+}
+
+# The state for asking whether the parts of a split need each other.
+def shape-needs-state [revision: record, split: record, shape: record] {
+    {
+        context: $shape.context
+        revision: {
+            change: $revision.short
+            description: $revision.description
+            moved: ($split.moved | each {|unit| $unit | select name kind added removed diff })
+            kept: ($split.kept | each {|unit| $unit | select name kind added removed diff })
+        }
+    }
+}
+
+# What the split answers for one revision call for, as
+# { verdict mixed moved kept }, where `answers` is null when the request
+# failed and the verdict is one of:
+#   split     it bundles deliverables, and the units in `moved` serve another
+#   by-hunk   it bundles deliverables inside its one file
+#   unsure    it may bundle deliverables, but not clearly enough to act on
+#   keep      it is one deliverable
+#   unjudged  Jev gave no answer
+def shape-split-verdict [units: list, answers: any, shape: record] {
+    let mixed = (shape-noul $answers "mixed")
+    if $mixed == null { return { verdict: "unjudged" mixed: null moved: [] kept: [] } }
+    let scored = if ($units | length) < 2 { [] } else {
+        $units | enumerate | each {|unit| $unit.item | insert on_topic (shape-noul $answers $"unit_($unit.index)") }
+    }
+    let moved = ($scored | where {|unit| $unit.on_topic != null and $unit.on_topic <= $shape.max_on_topic })
+    let kept = ($scored | where {|unit| $unit.on_topic == null or $unit.on_topic > $shape.max_on_topic })
+    let verdict = if $mixed < $shape.min_mixed {
+        if $mixed >= 0.5 or ($moved | is-not-empty) { "unsure" } else { "keep" }
+    } else if ($units | length) == 1 {
+        "by-hunk"
+    } else if ($moved | is-not-empty) and ($kept | is-not-empty) {
+        "split"
+    } else {
+        "unsure"
+    }
+    { verdict: $verdict mixed: $mixed moved: $moved kept: $kept }
+}
+
+# Where the moved part of a split goes, from whether each part needs the
+# other: `trunk` for a topic of its own, `before` or `after` the rest of the
+# revision, or null when the parts need each other or Jev could not tell.
+def shape-placement [answers: any, shape: record] {
+    let moved_needs = (shape-noul $answers "moved_needs_kept")
+    let kept_needs = (shape-noul $answers "kept_needs_moved")
+    if $moved_needs == null or $kept_needs == null { return null }
+    let alone = 1 - $shape.min_needs
+    if $moved_needs >= $shape.min_needs and $kept_needs < $alone {
+        "after"
+    } else if $kept_needs >= $shape.min_needs and $moved_needs < $alone {
+        "before"
+    } else if $moved_needs < $alone and $kept_needs < $alone {
+        "trunk"
+    } else {
+        null
+    }
+}
+
+# Jev's relation for each of `pairs`, as { earlier later relation confidence },
+# leaving out the pairs it did not answer.
+def shape-relations [pairs: list, answers: any] {
+    $pairs | each {|pair|
+        let answer = ($answers | get --optional $"pair_($pair.earlier)_($pair.later)")
+        if ($answer.choice? | is-empty) { null } else {
+            $pair | insert relation $answer.choice | insert confidence ($answer.confidence? | default 0.0)
+        }
+    } | compact
+}
+
+# The groups of revision indexes that `ties` connect, each sorted, in order
+# of their first revision.
+def shape-components [count: int, ties: list] {
+    mut groups = []
+    mut seen = []
+    for start in 0..<$count {
+        if $start in $seen { continue }
+        mut group = [$start]
+        loop {
+            let known = $group
+            let next = ($ties | each {|tie|
+                if $tie.earlier in $known and $tie.later not-in $known {
+                    $tie.later
+                } else if $tie.later in $known and $tie.earlier not-in $known {
+                    $tie.earlier
+                } else {
+                    null
+                }
+            } | compact | uniq)
+            if ($next | is-empty) { break }
+            $group = ($group ++ $next)
+        }
+        $seen = ($seen ++ $group)
+        $groups = ($groups ++ [($group | sort)])
+    }
+    $groups
+}
+
+# What the relations call for, as { squashes groups }. A later revision that
+# confidently fixes up earlier ones squashes into the one it fixes most
+# confidently, newest first so a chain of fixups folds down in order.
+# `groups` are the sets of revisions that nothing ties to the first one, so
+# each could become a topic of its own. Every pair ties its revisions unless
+# Jev confidently judged it independent, including pairs it did not answer.
+# Only neighbours are compared in a long topic, which separates nothing.
+def shape-pair-verdicts [count: int, pairs: list, relations: list, shape: record] {
+    let confident = ($relations | where {|relation| $relation.confidence >= $shape.min_relation_confidence })
+    let squashes = ($confident
+        | where relation == "fixup"
+        | group-by {|relation| $relation.later | into string }
+        | values
+        | each {|candidates| $candidates | sort-by confidence --reverse | first }
+        | sort-by later --reverse)
+    if ($pairs | length) != ($count * ($count - 1) // 2) {
+        return { squashes: $squashes groups: [] }
+    }
+    let independent = ($confident | where relation == "independent" | each {|relation| $"($relation.earlier)/($relation.later)" })
+    let ties = ($pairs | where {|pair| $"($pair.earlier)/($pair.later)" not-in $independent })
+    { squashes: $squashes groups: (shape-components $count $ties | where {|group| 0 not-in $group }) }
+}
+
+# A fileset naming exactly `path` from the repository root, so a command
+# works from any directory.
+def shape-fileset [path: string] {
+    $"root-file:($path | to json)"
+}
+
+# `argv` as a command line to paste into Nushell.
+def shape-command [argv: list] {
+    $argv | each {|arg|
+        if $arg =~ '^[A-Za-z0-9_./@:=+-]+$' {
+            $arg
+        } else if not ($arg | str contains "'") {
+            $"'($arg)'"
+        } else {
+            $arg | to json
+        }
+    } | str join " "
+}
+
+def shape-round [value: any] {
+    if $value == null { "?" } else { $value | math round --precision 2 | into string }
+}
+
+# The advice for a judged topic as { advice unsure }, in the order to act on
+# it: squashes newest first, then splits, then separations. Each piece of
+# advice names its revisions by change ID, which the earlier pieces leave
+# alone. `revisions` carry { short description units }, `splits` each
+# revision's split verdict with its `placement`, and `relations` Jev's
+# answers for the compared `pairs`.
+def shape-advice [revisions: list, splits: list, pairs: list, relations: list, shape: record] {
+    let verdicts = (shape-pair-verdicts ($revisions | length) $pairs $relations $shape)
+    let squashed = ($verdicts.squashes | each {|squash| $squash.later })
+    let places = {
+        trunk: { args: ["-o" "trunk()"] text: "into a topic of its own" }
+        before: { args: ["-B"] text: "into a revision before the rest, which needs it" }
+        after: { args: ["-A"] text: "into a revision after the rest, which it needs" }
+    }
+    let squashes = ($verdicts.squashes | each {|squash|
+        let from = ($revisions | get $squash.later | get short)
+        let into = ($revisions | get $squash.earlier | get short)
+        {
+            action: "squash"
+            revisions: [$from]
+            summary: $"($from) finishes or corrects ($into) \(confidence (shape-round $squash.confidence)); squash it in."
+            argv: ["jj" "squash" "--from" $from "--into" $into "--use-destination-message"]
+        }
+    })
+    let judged = ($splits | enumerate | where {|entry| $entry.index not-in $squashed } | each {|entry|
+        let short = ($revisions | get $entry.index | get short)
+        let split = $entry.item
+        let names = ($split.moved | each {|unit| $unit.name } | str join ", ")
+        let odds = $"p=(shape-round $split.mixed)"
+        match $split.verdict {
+            "split" => {
+                let where = ($places | get --optional ($split.placement | default ""))
+                if $where == null {
+                    { unsure: { revisions: [$short] summary: $"($short) bundles deliverables \(($odds)), but Jev could not tell whether ($names) can stand apart from the rest." } }
+                } else {
+                    { advice: {
+                        action: "split"
+                        revisions: [$short]
+                        summary: $"($short) bundles deliverables \(($odds)); move ($names) ($where.text)."
+                        argv: (["jj" "split" "-r" $short] ++ $where.args ++ (if $split.placement == "trunk" { [] } else { [$short] }) ++ ["-m" "MESSAGE"] ++ ($split.moved | each {|unit| $unit.paths } | flatten | each {|path| shape-fileset $path }))
+                    } }
+                }
+            }
+            "by-hunk" => {
+                { advice: {
+                    action: "split-by-hunk"
+                    revisions: [$short]
+                    summary: $"($short) bundles deliverables inside one file \(($odds)); split it by hunk."
+                    argv: null
+                } }
+            }
+            "unsure" => {
+                let detail = if ($split.moved | is-empty) { "" } else { $"; ($names) may belong elsewhere" }
+                { unsure: { revisions: [$short] summary: $"($short) may bundle deliverables \(($odds))($detail)." } }
+            }
+            _ => null
+        }
+    } | compact)
+    let separations = ($verdicts.groups | each {|group|
+        let shorts = ($group | each {|index| $revisions | get $index | get short })
+        {
+            action: "separate"
+            revisions: $shorts
+            summary: (if ($shorts | length) == 1 {
+                $"($shorts.0) needs nothing else in this topic; move it to a topic of its own."
+            } else {
+                $"($shorts | str join ', ') need nothing else in this topic; move them to a topic of their own."
+            })
+            argv: ["jj" "rebase" "-r" ($shorts | str join " | ") "-o" "trunk()"]
+        }
+    })
+    let doubtful = ($relations
+        | where {|relation| $relation.relation == "fixup" and $relation.confidence < $shape.min_relation_confidence and $relation.confidence >= 0.4 }
+        | each {|relation|
+            let from = ($revisions | get $relation.later | get short)
+            let into = ($revisions | get $relation.earlier | get short)
+            { revisions: [$from $into] summary: $"($from) may finish or correct ($into) \(confidence (shape-round $relation.confidence))." }
+        })
+    {
+        advice: ($squashes ++ ($judged | each {|entry| $entry.advice? } | compact) ++ $separations)
+        unsure: (($judged | each {|entry| $entry.unsure? } | compact) ++ $doubtful)
+    }
+}
+
+# Judge the changed revisions in `revset` and return the advice, with every
+# request Jev could not answer in `unjudged`. Fails only when Jev answered
+# none of them.
+def shape-report [revset: string, shape: record] {
+    let revisions = (revisions-in $revset | each {|revision|
+        let diff = (git-command $"reading the diff of ($revision.short)" { ^jj diff -r $revision.change_id --git })
+        let files = (git-diff-files $diff)
+        $revision | insert files ($files | length) | insert units (shape-units $files $shape)
+    } | where files > 0)
+    if ($revisions | is-empty) {
+        error make { msg: $"`($revset)` has no changed revisions to judge." }
+    }
+    let pairs = (shape-pairs ($revisions | length) $shape.max_pair_revisions)
+    let requests = ($revisions | enumerate | each {|entry|
+        { kind: "split" index: $entry.index request: (shape-split-request $entry.item $shape) }
+    } | append (if ($pairs | is-empty) { [] } else {
+        [{ kind: "pairs" index: null request: (shape-pair-request $revisions $pairs $shape) }]
+    }))
+    let first = ($requests | par-each --keep-order {|entry|
+        $entry | insert result (jev-ask $entry.request.state $entry.request.questions $shape.model)
+    })
+    let verdicts = ($first | where kind == "split" | each {|entry|
+        shape-split-verdict ($revisions | get $entry.index | get units) $entry.result.answers? $shape
+    })
+    let needs_questions = ($shape.questions | select moved_needs_kept kept_needs_moved)
+    let needs = ($verdicts | enumerate | where {|entry| $entry.item.verdict == "split" } | par-each --keep-order {|entry|
+        let state = (shape-needs-state ($revisions | get $entry.index) $entry.item $shape)
+        { index: $entry.index result: (jev-ask $state $needs_questions $shape.model) }
+    })
+    let splits = ($verdicts | enumerate | each {|entry|
+        let answered = ($needs | where index == $entry.index | get --optional 0.result)
+        $entry.item | insert placement (if $answered == null { null } else { shape-placement $answered.answers? $shape })
+    })
+    let relations = (shape-relations $pairs ($first | where kind == "pairs" | get --optional 0.result.answers))
+    let results = ($first | get result | append ($needs | get result))
+    let unjudged = ($first | where {|entry| $entry.result.error? != null } | each {|entry|
+        let request = if $entry.kind == "pairs" { "how the revisions relate" } else { $"whether ($revisions | get $entry.index | get short) bundles deliverables" }
+        { request: $request error: $entry.result.error }
+    } | append ($needs | where {|entry| $entry.result.error? != null } | each {|entry|
+        { request: $"where the split of ($revisions | get $entry.index | get short) belongs" error: $entry.result.error }
+    }))
+    if ($results | all {|result| $result.error? != null }) {
+        error make { msg: $"Jev could not judge the topic: ($unjudged | first | get error)" }
+    }
+    let advice = (shape-advice $revisions $splits $pairs $relations $shape)
+    {
+        model: ($results | where {|result| $result.error? == null } | get --optional 0.model | default $shape.model)
+        input_tokens: ($results | each {|result| $result.usage?.input_tokens? | default 0 } | math sum)
+        revisions: ($revisions | enumerate | each {|entry|
+            let split = ($splits | get $entry.index)
+            {
+                change: $entry.item.short
+                title: ($entry.item.description | lines | get --optional 0 | default "")
+                files: $entry.item.files
+                verdict: $split.verdict
+                mixed: $split.mixed
+            }
+        })
+        advice: $advice.advice
+        unsure: $advice.unsure
+        unjudged: $unjudged
+    }
+}
+
+# Ask Jev whether each revision of the topic is one deliverable and whether
+# the revisions belong together, and print the jj commands that would split,
+# squash, or separate them. Runs none of them. Sends the topic's diffs to
+# TypeSafe through the `jev` command, or the one CI_JEV names, withholding
+# lines that look like they assign a credential.
+def "main shape" [
+    revset?: string # Revisions to judge (default: the current topic)
+    --json # Print the advice as JSON
+] {
+    let report = (shape-report ($revset | default $"(trunk-revset)..@") $SHAPE)
+    if $json {
+        print ($report | to json)
+        return
+    }
+    let count = ($report.revisions | length)
+    print $"Judged ($count) (if $count == 1 { 'revision' } else { 'revisions' }) with ($report.model), ($report.input_tokens) input tokens."
+    if ($report.advice | is-empty) and ($report.unsure | is-empty) and ($report.unjudged | is-empty) {
+        print "Each revision is one deliverable, and the revisions belong together."
+    }
+    for item in $report.advice {
+        print $"($item.action): ($item.summary)"
+        if $item.argv != null { print $"  (shape-command $item.argv)" }
+    }
+    for item in $report.unsure { print $"unsure: ($item.summary)" }
+    for item in $report.unjudged { print $"not judged: ($item.request): ($item.error)" }
+    if ($report.advice | any {|item| "MESSAGE" in ($item.argv | default []) }) {
+        print "Replace MESSAGE with a description of the part each split moves out."
+    }
+}
+
 const RELEASE_TAG_GLOB = "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].*"
 
 # Tag a CalVer release on every user-facing revision in `range`, oldest first,

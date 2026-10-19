@@ -23,7 +23,8 @@ is the only path to `main`.
 - Inspect conflicts and emptiness before choosing a workflow.
 - Before a synchronization that rebases history, create a checkpoint with
   `.agents/skills/jj/scripts/jj-checkpoint`.
-- Before validation or dispatch, inspect the diff for mixed deliverables.
+- Before validation or dispatch, inspect the diff for mixed deliverables;
+  `ci shape` gives a second opinion and the commands to act on it.
   Split independent deliverables into separate changes. Choose parent/child
   only when the later change depends on the earlier one to build, test, or
   make sense; choose siblings when both can be reviewed and landed
@@ -77,6 +78,7 @@ Use the narrowest workflow that matches the request:
 | --- | --- | --- |
 | Inspect local and dispatched state | `ci status` | Read-only. Lists each dispatched topic with its stack parent and open Tangled pull request. |
 | Align an empty working copy with trunk | `ci sync` | Fetches the trunk remote, advances `main`, and rebases onto `trunk()`. |
+| Decide whether to split or squash revisions | `ci shape` | Read-only. Asks Jev whether each revision of the topic is one deliverable and whether the revisions belong together, then prints the `jj split`, `jj squash`, or `jj rebase` command for each piece of advice; replace `MESSAGE` before running a split. Advice under `unsure` needs your own look at the diff. Run it before dispatch, never after. Sends the diffs to TypeSafe, withholding lines that look like credentials. `--json` for structured output. |
 | Check readiness and run preflight checks | `ci preflight` | Describes an undescribed change, runs `jj fix -s @`, then Prek on the JJ file list; a repository with no Prek configuration skips Prek. |
 | Dispatch the current change | `ci dispatch` | Refuses unclassified or mixed-impact topics, then rebases, validates, and pushes a stable `jj-*` bookmark to the trunk remote. Keeps editing the same change. A topic built on another dispatched topic, or reported by `ci sequence` as conflicting with one, is restacked onto that topic's branch; conflicts must be resolved locally first. Open a pull request from the branch on the trunk's forge for review; never merge it there. |
 | Land a topic on `main` | `ci land` | Requires an explicit user request. Dispatches, refuses a stacked topic until its parent lands, and proves a refactor is closure-neutral. It then takes this machine's runway only if it is clear: with another landing in flight or a topic held for the drainer, it fails at once naming them; use `ci queue` then. On the runway, it rebases only if `main` moved, builds every flake check at the exact head on this machine (skipping cached outputs), fast-forwards `main` to it on the trunk remote (setting a `ci land` commit status first where that is GitHub) and on the mirror, and tags releases. No other landing moves `main` meanwhile, so landings never restart one another. `--clearance github` or `--clearance nixbot` waits for that CI on the exact head instead (`--timeout`, default 2hr); in a repository with `nixbot.toml` every dispatch already mirrors the topic for nixbot to build. Only if something outside the queue moves `main` during clearance does it rebase, redispatch, and clear the new head again (`--attempts`, default 5). `ci dispatch --land` does the same. Never merge a GitHub pull request; squash and rebase merges rewrite the tested commit. |

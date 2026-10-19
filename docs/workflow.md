@@ -984,6 +984,57 @@ fast-forwards `main`. Squash only while authoring, with `jj squash` or
 `jj absorb` before dispatching, so each dispatched change is already one logical
 unit; never squash at delivery.
 
+### Shaping a topic before dispatch
+
+`ci shape` gives a second opinion on that shape. It asks
+[Jev](https://docs.typesafe.ai/introduction) two kinds of question about the
+changed revisions in `trunk()..@` (or the revset it is given):
+
+- For each revision: does it bundle two or more deliverables that could each
+  be reviewed and landed alone, and does each changed file serve the
+  deliverable its description names? A revision that changes more than 24
+  files is judged by directory instead.
+- For each pair of revisions: does the later one fix up the earlier one,
+  build on it, or stand alone? A topic of more than ten revisions compares
+  only neighbours.
+
+The answers are probabilities and confidences, and code applies the
+thresholds in the `SHAPE` record in `ci.nu`:
+
+- **split**: the revision is at least 0.7 likely to be mixed, and some files
+  are at most 0.3 likely to serve its description while others serve it. A
+  second request asks whether the two parts need each other. If the
+  split-out files stand alone, they go into a topic of their own on
+  `trunk()`; if the rest needs them, into a revision before it; if they need
+  the rest, into one after it. When the parts need each other, or Jev cannot
+  tell, the revision is reported as unsure instead.
+- **split-by-hunk**: a mixed revision that changes a single file. There is
+  no command; split it by hunk.
+- **squash**: the later revision fixes up an earlier one with at least 0.7
+  confidence. It squashes into the one it fixes most confidently, keeping
+  that revision's description, newest fixup first.
+- **separate**: revisions that no fixup or dependency ties to the topic's
+  first revision move together to a topic of their own. A pair Jev did not
+  answer, or answered without confidence, counts as tied.
+
+```nu
+ci shape          # advice and the jj command for each piece of it
+ci shape --json   # the same as a record, with each command as `argv`
+```
+
+Each piece of advice names revisions by change ID, so the commands can run in
+the order printed. A split's command carries `-m MESSAGE`; replace it with a
+description of the part being moved out. `ci shape` runs none of the
+commands, and advice listed as `unsure` is a prompt to read the diff, not a
+verdict.
+
+It talks to Jev through the `jev` command's `jev ask` (`CI_JEV` names
+another), which holds the TypeSafe key. It sends each revision's description
+and diff, cut to fit Jev's context, with lock files summarized and lines that
+look like they assign a credential withheld. A request that fails is listed
+under `not judged` and its advice is left out; the command fails only when
+Jev answered nothing.
+
 ## Concurrent tasks
 
 A workspace is a working copy for one actor and one topic at a time. An agent

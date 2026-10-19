@@ -49,6 +49,7 @@ flowchart LR
 | Command | What it does |
 | --- | --- |
 | `ci new -m MSG` | Start a topic on trunk in the current workspace. |
+| `ci shape` | Ask Jev whether the topic's revisions should be split or squashed, and print the `jj` commands that would do it. |
 | `ci preflight` | Run formatting and lint hooks on the current change. |
 | `ci dispatch` | Rebase the topic onto trunk and push its branch for review. |
 | `ci land` | Build every check on the exact head, fast-forward `main` to it, and tag a release for user-facing changes. |
@@ -146,3 +147,16 @@ deploy_reverts: {
   }
 }
 ```
+
+Inside `ci` itself, `ci shape` uses Jev to decide whether a topic should be
+split or squashed before it is dispatched. For each revision it asks whether
+the revision bundles more than one deliverable, and whether each changed file
+serves what the revision's description says it does. For each pair of
+revisions it asks whether the later one fixes up the earlier one, builds on
+it, or stands alone. Code turns those answers into advice. It splits out the
+files that serve something else, and a second request asks whether the two
+parts need each other, which decides whether the split-out part goes before
+the rest, after it, or into a topic of its own. It squashes each fixup into
+the revision it fixes, and moves revisions that nothing else in the topic
+depends on into their own topic. It prints the `jj split`, `jj squash`, or
+`jj rebase` command for each piece of advice and runs none of them.

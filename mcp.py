@@ -450,6 +450,25 @@ async def conflicts(workspace: Workspace = None, wait_seconds: Wait = None) -> d
 
 
 @mcp.tool(annotations=READ_ONLY)
+async def shape(
+    revset: Annotated[
+        str | None,
+        Field(description="Revisions to judge (default: the current topic)."),
+    ] = None,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci shape --json`: ask Jev whether each revision of the topic is one
+    deliverable and whether the revisions belong together. `data.advice`
+    lists splits, squashes, and separations with the jj command for each
+    (`argv`, MESSAGE to replace); `data.unsure` and `data.unjudged` need a
+    look. Runs none of the commands. Sends the diffs to TypeSafe."""
+    args = ["shape", "--json"] + ([] if revset is None else [revset])
+    result = await run(args, workspace, wait_seconds, mutating=False)
+    return parse_json_output(result)
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def worktree_status(
     workspace: Workspace = None, wait_seconds: Wait = None
 ) -> dict:

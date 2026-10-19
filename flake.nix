@@ -146,7 +146,7 @@
               export NU_LIB_DIRS=${osc7501-nu}
               mkdir -p "$HOME"
               cd ${src}/tests
-              for suite in ci-properties ci-launch-properties codex-session-properties context-status-properties; do
+              for suite in ci-properties ci-launch-properties codex-session-properties context-status-properties shape-properties; do
                 nu --no-config-file -c "source $suite.nu"
               done
               touch "$out"

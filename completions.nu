@@ -112,6 +112,12 @@ export extern "ci sim" [
 # List conflicted revisions and files in the current topic
 export extern "ci conflicts" []
 
+# Ask Jev whether the topic's revisions should be split, squashed, or separated
+export extern "ci shape" [
+    revset?: string # Revisions to judge (default: the current topic)
+    --json # Print the advice as JSON
+]
+
 # Rebase, run preflight, and push the current topic to the trunk remote to await landing
 export extern "ci dispatch" [
     --land # Land the topic once it has clearance
