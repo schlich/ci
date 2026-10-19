@@ -666,9 +666,15 @@ def git-context [] {
 # on its only remote.
 const TRUNK_REMOTES = ["tangled" "origin"]
 const TRUNK_KEY = 'revset-aliases."trunk()"'
-# GitHub mirrors main, and its Actions can gate a landing in the spindle's
-# place with `ci land --clearance github`. Its rules accept only fast-forwards.
+# Whichever of the trunk remotes is not trunk mirrors it: `ci land` pushes
+# main and each release there after landing. GitHub's Actions can gate a
+# landing with `ci land --clearance github`. Its rules accept only
+# fast-forwards.
 const GITHUB_REMOTE = "origin"
+# Where GitHub is trunk, `ci land` sets this commit status on the head it
+# cleared just before fast-forwarding main, so a ruleset that requires it
+# admits only commits that `ci land` cleared, and needs no pull request.
+const LANDING_STATUS = "ci land"
 # Impact declarations live in this machine's ci log, which GitHub cannot read,
 # so `ci land` classifies the topic itself and GitHub only builds it.
 const GITHUB_REQUIRED_CHECKS = ["nix flake checks"]
@@ -797,6 +803,12 @@ def trunk-remote [] {
     (trunk).remote
 }
 
+# The remotes among `names` that mirror a trunk on `trunk_remote`: every
+# other trunk remote the repository has, in preference order.
+def mirror-remotes [trunk_remote: string, names: list<string>] {
+    $TRUNK_REMOTES | where {|name| $name != $trunk_remote and $name in $names }
+}
+
 # The trunk's revset, once `trunk()` is known to name it.
 def trunk-revset [] {
     trunk | ignore
@@ -870,13 +882,32 @@ def pipeline-state [repo: record, commit: string] {
     { state: $state workflows: $workflows }
 }
 
-# The GitHub repository behind the mirror remote, as `owner/name`.
+# The GitHub repository a remote URL names, as `owner/name`, or null for a
+# URL elsewhere.
+def github-location [url: string] {
+    let location = ($url | parse --regex 'github\.com[:/](?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$' | get --optional 0)
+    if $location == null { null } else { $"($location.owner)/($location.name)" }
+}
+
+# The GitHub repository behind the `origin` remote, as `owner/name`.
 def github-repo [] {
     let url = (remotes | where name == $GITHUB_REMOTE | get --optional 0.url)
     if $url == null { error make { msg: $"This repository has no ($GITHUB_REMOTE) remote." } }
-    let location = ($url | parse --regex 'github\.com[:/](?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$' | get --optional 0)
+    let location = (github-location $url)
     if $location == null { error make { msg: $"($url) is not a GitHub repository." } }
-    $"($location.owner)/($location.name)"
+    $location
+}
+
+# Mark `head` as cleared on a GitHub trunk, naming the clearance that passed
+# it, before main moves there. A trunk elsewhere has nothing to mark. The
+# commit is already on GitHub: dispatch pushed its branch.
+def post-landing-status [remote: string, head: string, clearance: string] {
+    let url = (remotes | where name == $remote | get --optional 0.url)
+    let repo = if $url == null { null } else { github-location $url }
+    if $repo == null { return }
+    git-command $"marking ($head | str substring 0..11) cleared on ($repo)" {
+        ^gh api --method POST $"repos/($repo)/statuses/($head)" -f state=success -f $"context=($LANDING_STATUS)" -f $"description=Cleared by ci land --clearance ($clearance)"
+    } | ignore
 }
 
 # GitHub's verdict on one commit, in the spindle's shape: the newest run of
@@ -1643,13 +1674,14 @@ def remote-bookmark-revset [bookmark: string, remote?: string] {
     $"remote_bookmarks\(exact:'($bookmark)', exact:'($name)')"
 }
 
-# Delete a delivered topic's bookmark locally, on the trunk remote, and on the
-# GitHub mirror if a GitHub-gated landing pushed it there.
+# Delete a delivered topic's bookmark locally, on the trunk remote, and on
+# any mirror that holds it: GitHub's when a GitHub-gated landing pushed it
+# there, or the former trunk's after the trunk moved.
 def delete-topic-bookmark [bookmark: string] {
     if (revset-change-ids (bookmark-revset $bookmark) | is-not-empty) {
         run-command $"deleting ($bookmark)" { ^jj ...(checkpoint-tag) bookmark delete $bookmark } | ignore
     }
-    for remote in ([(trunk-remote) $GITHUB_REMOTE] | uniq) {
+    for remote in ([(trunk-remote)] | append $TRUNK_REMOTES | uniq) {
         if (revset-change-ids (remote-bookmark-revset $bookmark $remote) | is-not-empty) {
             run-remote $"deleting ($bookmark) from ($remote)" {
                 ^jj git push --remote $remote --bookmark $bookmark
@@ -3234,13 +3266,13 @@ def publish-topic [] {
     { branch: $branch parent: $parent impact: $impact head: (current-change "commit_id") }
 }
 
-# Fast-forward main on the trunk remote to `head`, which clearance passed,
+# Fast-forward main on the trunk remote to `head`, which `clearance` passed,
 # then mirror it and tag a release for each user-facing revision in
 # `base..head`. `label` names what landed. If main moved since `head` was
 # rebased onto it, landing would not be a fast-forward of what was tested, so
 # this returns false without touching main. Delivery is never a squash,
-# rebase, or merge on a forge: both remotes receive the same commits.
-def advance-main [head: string, base: string, label: string] {
+# rebase, or merge on a forge: every remote receives the same commits.
+def advance-main [head: string, base: string, label: string, clearance: string] {
     let trunk = (trunk)
     let remote = $trunk.remote
     let main = $trunk.bookmark
@@ -3248,6 +3280,7 @@ def advance-main [head: string, base: string, label: string] {
     # but another machine, or a push by hand, still may.
     fetch-trunk
     if not (contains-main $head) { return false }
+    post-landing-status $remote $head $clearance
     run-command $"advancing ($main)" { ^jj bookmark set $main -r $head } | ignore
     # The first landing creates the bookmark on the trunk remote, which jj
     # pushes only once the bookmark is tracked there.
@@ -3366,7 +3399,7 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
                 { type: CLEARED head: $current.head }
             }
             "advancing" => {
-                { type: ADVANCED head: $current.head landed: (advance-main $current.head $base $current.branch) }
+                { type: ADVANCED head: $current.head landed: (advance-main $current.head $base $current.branch $gate) }
             }
             _ => { error make { msg: $"Unknown CI agent state: ($active.state)" } }
         } } catch {|err|
@@ -3568,7 +3601,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 if $landed > 0 {
                     let last = ($chain | get ($landed - 1))
                     for entry in ($chain | first $landed) { push-topic-bookmark $entry.name }
-                    if not (advance-main $last.head $base $"a train of ($landed) topics") {
+                    if not (advance-main $last.head $base $"a train of ($landed) topics" $gate) {
                         print --stderr "main moved outside the landing queue while the train cleared; nothing landed."
                         $landed = 0
                     }
@@ -3623,24 +3656,43 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
     }
 }
 
-# Fast-forward GitHub's main to the trunk's. The trunk is authoritative, so a
-# rejected mirror push leaves the landing in place and reports how to retry,
-# as an error under `mirror` that does not fail the run. A repository without
-# a separate mirror has nothing to do.
+# Fast-forward main on every mirror to the trunk's. The trunk is
+# authoritative, so a rejected mirror push leaves the landing in place and
+# reports how to retry, as an error under `mirror` that does not fail the run.
+# A repository without a mirror has nothing to do.
 def mirror-main [] {
     let trunk = (trunk)
     let main = $trunk.bookmark
-    if $trunk.remote == $GITHUB_REMOTE or $GITHUB_REMOTE not-in (remotes | get name) { return }
-    let fetched = (do { ^jj git fetch --remote $GITHUB_REMOTE --branch $main } | complete)
-    let pushed = if $fetched.exit_code == 0 {
-        do { ^jj git push --remote $GITHUB_REMOTE --bookmark $main } | complete
-    } else { $fetched }
-    if $pushed.exit_code != 0 {
-        let failure = $"Landed on ($trunk.remote), but mirroring ($main) to ($GITHUB_REMOTE) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($GITHUB_REMOTE) --bookmark ($main)`."
-        print --stderr $failure
-        report-status error $failure --id mirror
-    } else {
-        report-status done $"Mirrored ($main) to ($GITHUB_REMOTE)" --id mirror
+    for mirror in (mirror-remotes $trunk.remote (remotes | get name)) {
+        let fetched = (remote-complete $"fetching ($main) from ($mirror)" { ^jj git fetch --remote $mirror --branch $main })
+        # jj refuses to create a new bookmark on a remote it does not track.
+        do { ^jj bookmark track $"($main)@($mirror)" } | complete | ignore
+        let pushed = if $fetched.exit_code == 0 {
+            remote-complete $"mirroring ($main) to ($mirror)" { ^jj git push --remote $mirror --bookmark $main }
+        } else { $fetched }
+        if $pushed.exit_code != 0 {
+            let failure = $"Landed on ($trunk.remote), but mirroring ($main) to ($mirror) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($mirror) --bookmark ($main)`."
+            print --stderr $failure
+            report-status error $failure --id mirror
+        } else {
+            report-status done $"Mirrored ($main) to ($mirror)" --id mirror
+        }
+    }
+}
+
+# Push the release tag `version` to every mirror. Like main's mirror push, a
+# rejected one is reported under `mirror` and does not fail the landing.
+def mirror-tag [version: string] {
+    let remote = (trunk-remote)
+    for mirror in (mirror-remotes $remote (remotes | get name)) {
+        # jj refuses to create a new tag on a remote it does not track.
+        do { ^jj tag track $"($version)@($mirror)" } | complete | ignore
+        let pushed = (remote-complete $"mirroring ($version) to ($mirror)" { ^jj git push --remote $mirror --tag $version })
+        if $pushed.exit_code != 0 {
+            let failure = $"Released ($version) on ($remote), but mirroring it to ($mirror) failed: ($pushed.stderr | str trim). Retry with `jj git push --remote ($mirror) --tag ($version)`."
+            print --stderr $failure
+            report-status error $failure --id mirror
+        }
     }
 }
 
@@ -3899,6 +3951,7 @@ def cut-releases [range: string, dry_run: bool] {
             run-command $"tagging ($version)" { ^jj tag set $version -r $revision.commit } | ignore
             let remote = (trunk-remote)
             run-remote $"pushing ($version) to ($remote)" { ^jj git push --remote $remote --tag $version } | ignore
+            mirror-tag $version
             print $"released ($title)"
             for step in $revision.steps { print $"  manual step: ($step)" }
             log-event "ci.release" $title {

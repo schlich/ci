@@ -1344,6 +1344,53 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
 rm --recursive --force $train_repo $train_remote $train_config
 print "ok land train"
 
+# Mirrors: every other trunk remote the repository has mirrors the trunk,
+# and never the trunk itself or a remote outside the trunk remotes.
+for-all "mirrors are the other trunk remotes the repository has" {|key|
+    let names = (["tangled" "origin" "homelab" "upstream"] | where {|name| flag $"($key)/has/($name)" })
+    let trunk = (pick-from $"($key)/trunk" ($names | append "origin"))
+    let mirrors = (mirror-remotes $trunk $names)
+    assert ($trunk not-in $mirrors) "the trunk mirrors itself"
+    assert ($mirrors | all {|name| $name in $names and $name in $TRUNK_REMOTES }) $"($mirrors) are not all trunk remotes the repository has"
+    assert equal ($mirrors | length) ($TRUNK_REMOTES | where {|name| $name != $trunk and $name in $names } | length)
+}
+
+# A landing on an `origin` trunk mirrors main and its release to Tangled.
+# Neither remote is on GitHub, so no landing status is set.
+let mirror_repo = (mktemp --directory --tmpdir ci-mirror-XXXXXX)
+let mirror_trunk = (mktemp --directory --tmpdir ci-mirror-origin-XXXXXX)
+let mirror_copy = (mktemp --directory --tmpdir ci-mirror-tangled-XXXXXX)
+let mirror_config = (mktemp --tmpdir ci-mirror-jj-XXXXXX.toml)
+'user.name = "ci"
+user.email = "ci@example.invalid"
+revset-aliases."trunk()" = "latest(present(main@origin) | root())"
+' | save --force $mirror_config
+^git init --quiet --bare $mirror_trunk
+^git init --quiet --bare $mirror_copy
+with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $mirror_config } {
+    cd $mirror_repo
+    ^jj git init --quiet
+    ^jj git remote add origin $mirror_trunk
+    ^jj git remote add tangled $mirror_copy
+    "base" | save --force base
+    ^jj commit --quiet -m base
+    ^jj bookmark create --quiet main -r @-
+    ^jj bookmark track --quiet main@origin
+    ^jj git push --quiet --remote origin --bookmark main
+    let base = (revision-id "main")
+    "topic" | save --force topic
+    ^jj commit --quiet -m "mirrored topic"
+    declare-impact (revisions-in "@-") behavior [] | ignore
+    let head = (revision-id "@-")
+    assert (advance-main $head $base "the mirrored topic" local) "the landing did not advance main"
+    assert equal (revision-id "main@origin") $head "main did not land on the trunk"
+    assert equal (^git -C $mirror_copy rev-parse refs/heads/main | str trim) $head "main was not mirrored"
+    let tag = (^jj tag list -T 'name ++ "\n"' | lines | first)
+    assert equal (^git -C $mirror_copy rev-parse $"refs/tags/($tag)^{commit}" | str trim) $head "the release was not mirrored"
+}
+rm --recursive --force $mirror_repo $mirror_trunk $mirror_copy $mirror_config
+print "ok mirror"
+
 rm --recursive $outcome_dir
 
 # Plan tips: every tip has its own name, and only a divergent change's copies

@@ -16,7 +16,10 @@
 # request state comes from `ci ci-state`, cached in .jj/context-status.json
 # and refreshed in the background, so the prompt never waits on the network.
 
-const TRUNK = 'coalesce(remote_bookmarks(exact:"main", exact:"tangled"), trunk())'
+# `ci` defines `trunk()` in every repository it runs in, so the alias names
+# the trunk whichever forge holds it.
+const TRUNK = 'trunk()'
+# Where a `trunk()` that names no BOOKMARK@REMOTE leaves dispatched topics.
 const TRUNK_REMOTE = "tangled"
 const CACHE_FILE = "context-status.json"
 const LOCK_FILE = "context-status.lock"
@@ -284,8 +287,18 @@ def jj-lines [root: path, args: list<string>] {
     $result.stdout | lines | where {|line| $line | is-not-empty }
 }
 
+# The remote `trunk()` names, which also holds every dispatched topic.
+def trunk-remote [root: path] {
+    let definition = (^jj --ignore-working-copy --repository $root config get 'revset-aliases."trunk()"' | complete)
+    if $definition.exit_code != 0 { return $TRUNK_REMOTE }
+    $definition.stdout
+    | parse --regex '(?:^|[^\w./@-])\w[\w./-]*@(?P<remote>\w[\w.-]*)'
+    | get --optional 0.remote
+    | default $TRUNK_REMOTE
+}
+
 def remote-head [root: path, branch: string] {
-    let revset = $"remote_bookmarks\(exact:'($branch)', exact:'($TRUNK_REMOTE)')"
+    let revset = $"remote_bookmarks\(exact:'($branch)', exact:'(trunk-remote $root)')"
     let result = (^jj --repository $root log --no-graph -r $revset -T 'commit_id' | complete)
     let commit = ($result.stdout | str trim)
     if $result.exit_code != 0 or ($commit | is-empty) { null } else { $commit }
@@ -641,7 +654,7 @@ def worktree-handoff-text [worktree: path, root: path] {
     [
         $"JJ workspace context \(context-status, (date now | format date '%Y-%m-%d %H:%M %Z')):"
         $"- This session's directory, ($worktree), is a Git worktree, not a JJ workspace. `jj` and `ci` run here act on the shared checkout at ($root), and JJ never records files edited in the worktree itself, so agent edits there are refused."
-        $"- Start a topic with `ci start NAME` from this directory: it creates ($worktree)/.jj-workspaces/NAME on main@tangled. Edit only inside that workspace, and run `jj` and `ci` there."
+        $"- Start a topic with `ci start NAME` from this directory: it creates ($worktree)/.jj-workspaces/NAME on trunk. Edit only inside that workspace, and run `jj` and `ci` there."
         (if ($workspaces | is-not-empty) { ["- JJ workspaces already in this worktree:"] | append $workspaces | str join "\n" })
     ] | compact | str join "\n"
 }

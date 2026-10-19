@@ -207,9 +207,18 @@ only JJ's default defines it, `ci` defines it in the repository's config as
 `latest(present(main@REMOTE) | root())` so that topics start from the root
 until main is first pushed there. Change it with
 `jj config set --repo 'revset-aliases."trunk()"' main@REMOTE`.
-GitHub (`origin`) is a mirror of the trunk bookmark that `ci land`
-fast-forwards after each landing when it is not the trunk itself, and an
-optional landing clearance; `ci dispatch` never pushes there.
+Whichever of `tangled` and `origin` is not the trunk's remote is a mirror:
+after each landing `ci land` fast-forwards its trunk bookmark and pushes each
+new release tag there. A rejected mirror push is reported under `mirror` and
+does not undo the landing. `ci dispatch` pushes topics only to the trunk
+remote. GitHub is also an optional landing clearance.
+
+Where GitHub is the trunk, `ci land` sets a `ci land` commit status on the
+head it cleared, naming the clearance, just before it fast-forwards `main`.
+A ruleset on `main` that requires that status check, blocks non-fast-forward
+pushes, and asks for no pull request then admits only commits `ci land`
+cleared. Setting the status needs `gh` signed in with access to the
+repository's statuses; if it fails, `main` does not move.
 `ci dispatch` rebases,
 validates, and pushes the stable `jj-<slug>-<change-id>` bookmark to the trunk
 remote. It does not create a follow-up change, so further edits to the series
@@ -220,7 +229,7 @@ the repository by owner and name or by its repository DID; a trunk remote
 that is not on Tangled skips the pull request link.
 
 `ci land` is the only way a change reaches `main`. It dispatches the topic,
-which rebases it onto `main@tangled`. Then it runs the checks that fail fast:
+which rebases it onto `trunk()`. Then it runs the checks that fail fast:
 a stacked topic must wait for its parent to land, and a declared refactor
 must leave every NixOS closure as it was at that base. The proof compares the head with the
 commit it forks from, found once the proof holds the local checks lock, so a

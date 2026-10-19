@@ -68,8 +68,8 @@ mcp = FastMCP(
     "ci",
     instructions=(
         "Tools for this repository's `ci` trunk workflow over Jujutsu and "
-        "Tangled; the `ci` skill describes when to use each command. Every "
-        "tool runs in `workspace` (default: the server's working directory) "
+        "its trunk forge, Tangled or GitHub; the `ci` skill describes when "
+        "to use each command. Every tool runs in `workspace` (default: the server's working directory) "
         "and returns a job record. When `state` is `running`, poll it with "
         "`job`. Run `land`, `dispatch` with `land`, and `cancel_topic` only when "
         "the user explicitly asks to deliver or drop the topic."
@@ -379,7 +379,7 @@ async def state(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
 
 @mcp.tool(annotations=READ_ONLY)
 async def sequence(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
-    """`ci sequence --json`: trial-merge in-flight topics against main@tangled
+    """`ci sequence --json`: trial-merge in-flight topics against trunk()
     and each other, and propose independent topics or stacks (in `data`).
     Fetches, but moves no working copy."""
     result = await run(["sequence", "--json"], workspace, wait_seconds, mutating=False)
@@ -497,7 +497,7 @@ async def new(
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
-    """`ci new`: start a topic as a new change on main@tangled in this
+    """`ci new`: start a topic as a new change on trunk() in this
     workspace; the current topic stays as a sibling."""
     args = ["new"] + ([] if message is None else ["--message", message])
     return await run(args, workspace, wait_seconds)
@@ -538,7 +538,7 @@ async def start(
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
-    """`ci start NAME`: create .jj-workspaces/NAME on main@tangled for an
+    """`ci start NAME`: create .jj-workspaces/NAME on trunk() for an
     actor that runs alongside the current working copy, inside the Git
     worktree `workspace` names if it is one (a Claude Code worktree). Run
     later tools with `workspace` set to the new directory."""
@@ -547,15 +547,15 @@ async def start(
 
 @mcp.tool(annotations=LOCAL)
 async def sync(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
-    """`ci sync`: fetch Tangled, advance main, and rebase an empty working
-    copy onto main@tangled. Refuses a nonempty change."""
+    """`ci sync`: fetch the trunk remote, advance main, and rebase an empty
+    working copy onto trunk(). Refuses a nonempty change."""
     return await run(["sync"], workspace, wait_seconds)
 
 
 @mcp.tool(annotations=LOCAL)
 async def rebase(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
     """`ci rebase`: checkpoint, fetch, and rebase the current topic onto
-    main@tangled in place. Check `conflicts` afterwards."""
+    trunk() in place. Check `conflicts` afterwards."""
     return await run(["rebase"], workspace, wait_seconds)
 
 
@@ -619,7 +619,7 @@ async def dispatch(
     wait_seconds: Wait = None,
 ) -> dict:
     """`ci dispatch`: rebase, validate, and push the topic's stable jj-*
-    branch to Tangled, keeping the same change."""
+    branch to the trunk remote, keeping the same change."""
     args = ["dispatch"]
     if land:
         args += ["--land", "--clearance", clearance, "--timeout", timeout]
@@ -646,8 +646,8 @@ async def land(
     wait_seconds: Wait = None,
 ) -> dict:
     """`ci land`: dispatch, wait in the machine's landing queue, clear the
-    exact head (every flake check by default), fast-forward main on Tangled
-    and GitHub, and tag releases. Concurrent landings take turns instead of
+    exact head (every flake check by default), fast-forward main on the
+    trunk remote and its mirror, and tag releases. Concurrent landings take turns instead of
     restarting one another. Only on an explicit user request to deliver the
     topic. Takes minutes to hours; poll the job."""
     args = ["land", "--clearance", clearance, "--timeout", timeout]

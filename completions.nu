@@ -65,7 +65,7 @@ export extern "ci tower" [
 # Print the current topic's published head, pipeline verdicts, and pull request as JSON
 export extern "ci ci-state" []
 
-# Fetch Tangled, advance main, and rebase the empty working copy onto it
+# Fetch the trunk remote, advance main, and rebase the empty working copy onto it
 export extern "ci sync" []
 
 # Report Git worktrees and how far they are from tangled/main
@@ -113,7 +113,7 @@ export extern "ci sim" [
 # List conflicted revisions and files in the current topic
 export extern "ci conflicts" []
 
-# Rebase, run preflight, and push the current topic to Tangled to await landing
+# Rebase, run preflight, and push the current topic to the trunk remote to await landing
 export extern "ci dispatch" [
     --land # Land the topic once it has clearance
     --clearance: string@"nu-complete ci clearances" # What must pass the head before --land (default local)
@@ -182,12 +182,12 @@ export extern "ci verify list" [
 # Resend verifications that have not reached homelab yet
 export extern "ci verify flush" []
 
-# Create a workspace at main@tangled for a concurrent actor's topic
+# Create a workspace at trunk() for a concurrent actor's topic
 export extern "ci start" [
     name: string # Workspace and topic name
 ]
 
-# Start a topic as a new change on main@tangled in this workspace
+# Start a topic as a new change on trunk() in this workspace
 export extern "ci new" [
     --message (-m): string # Description for the new topic
 ]
