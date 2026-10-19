@@ -540,6 +540,9 @@ workspaces, deletes their directories, and deletes the old checkpoints. Prune
 always keeps the default and current workspaces, Git and Codex worktrees, and
 anything with undelivered changes; a kept workspace untouched for more than
 a day says for how long, since such work needs someone to land or cancel it.
+A Git worktree is a `.git` directory, or a `gitdir:` pointer whose target
+still exists. A pointer left dangling, after Git forgot the worktree or the
+repository stopped being colocated, no longer shields a workspace.
 
 A Codex task archived without `park` leaves its ownership record active.
 Prune treats that claim as ended once the task's rollout under

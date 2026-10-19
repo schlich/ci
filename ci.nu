@@ -5418,6 +5418,27 @@ def workspace-last-used [root: string] {
     if ($times | is-empty) { null } else { $times | math max }
 }
 
+# Whether `root` is the checkout of a Git worktree that still exists: its
+# `.git` is a directory, or a `gitdir:` pointer whose target is there. Git
+# forgets a worktree without deleting the pointer file, and a repository
+# that drops colocation loses every `.git/worktrees` entry at once; six
+# `ci start` workspaces in dotfiles kept dangling pointers that way, and
+# prune refused them as Git worktrees (2026-10-19).
+def live-git-worktree [root: string] {
+    let dot_git = ($root | path join ".git")
+    match ($dot_git | path type) {
+        "dir" => true
+        "file" => {
+            let target = (try { open --raw $dot_git | parse --regex '^gitdir:\s*(?<dir>.+?)\s*$' } catch { [] })
+            if ($target | is-empty) { return false }
+            let dir = ($target | first | get dir)
+            let resolved = if ($dir | str starts-with "/") { $dir } else { $root | path join $dir }
+            ($resolved | path type) == "dir"
+        }
+        _ => false
+    }
+}
+
 # The facts prune decides from. Running JJ inside a workspace snapshots any
 # unrecorded edits first, so a workspace used within `idle` is kept before
 # any JJ call reaches it. A stale workspace is updated only when `refresh` is
@@ -5435,7 +5456,7 @@ def workspace-facts [workspace: record, current: string, refresh: bool, idle: du
         name: $workspace.name
         current: ($workspace.root == $current)
         exists: $exists
-        git_worktree: ($workspace.root | path join ".git" | path exists)
+        git_worktree: (live-git-worktree $workspace.root)
         codex_worktree: ($workspace.root | str starts-with ($env.CODEX_HOME? | default ($env.HOME | path join ".codex") | path join "worktrees"))
         owner: $owner
         owner_ended: ($liveness == "ended")

@@ -617,6 +617,26 @@ for-all "prune reclaims every released, delivered workspace" {|key|
     assert equal ((prune-verdict ($facts | upsert owner $owner)) == null) $delivered
 }
 
+for-all "only a .git directory or a pointer to an existing one is a Git worktree" {|key|
+    let base = (mktemp --directory --tmpdir ci-git-worktree-XXXXXX | path expand)
+    let root = ($base | path join "workspace")
+    let target = ($base | path join "repo" ".git" "worktrees" "workspace")
+    mkdir $root
+    let kind = (pick-from $"($key)/kind" ["none" "dir" "relative" "absolute"])
+    let target_exists = (flag $"($key)/target")
+    if $target_exists { mkdir $target }
+    match $kind {
+        "dir" => { mkdir ($root | path join ".git") }
+        "relative" => { "gitdir: ../repo/.git/worktrees/workspace\n" | save ($root | path join ".git") }
+        "absolute" => { $"gitdir: ($target)\n" | save ($root | path join ".git") }
+        _ => {}
+    }
+    let expected = ($kind == "dir") or ($kind in ["relative" "absolute"] and $target_exists)
+    let actual = (live-git-worktree $root)
+    rm --recursive $base
+    assert equal $actual $expected $kind
+}
+
 # Topic guard: the working copy must not wander off the topic that
 # `ci start` recorded, and the interactive `jj new` guard only inspects
 # invocations that would move the working copy.
