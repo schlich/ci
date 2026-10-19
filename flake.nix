@@ -103,6 +103,10 @@
                 --invariant=TypeOK,NoPublishWhileUnsafe,PublishedFromFreshBase,PublishedHeadWasValidated,NoFinishWithConflict,FinishLeavesMain,NoDropWhilePending,MainOnlyHoldsPassedHeads,DeliveryIsPublishedHead,DeliveredHeadIsLocal,LandsAfterParent,LandingIsFastForward,QueuedOnlyWhileLanding \
                 --temporal=QueuedTopicStaysOnTrunk,LandsFromQueue \
                 JjCi.qnt
+              cp ${./ReleaseLoop.qnt} ReleaseLoop.qnt
+              quint verify --backend=tlc \
+                --invariant=TypeOK,GateSetType,ReleaseWasGated,ProductionWasGated,VerificationWasGated,GateChecksCurrentMain,PersonPauseIsExplicit \
+                ReleaseLoop.qnt
               touch "$out"
             '';
         # Its tests check the state machine against every action and
