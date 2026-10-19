@@ -828,16 +828,14 @@ def tangled-location [url: string] {
 
 # The Tangled repository behind the trunk remote. Its URL names the owner's
 # handle and the repository, or the repository's own DID; the repository record
-# carries the repo DID that the index and spindle APIs key on, and the spindle
-# that runs its pipelines. A remote addressed by its DID has no record to read,
-# so its spindle is unknown.
+# carries the repo DID that the index APIs key on.
 def tangled-repo [] {
     let remote = (trunk-remote)
     let url = (remotes | where name == $remote | get 0.url)
     let location = (tangled-location $url)
     if $location == null { error make { msg: $"Cannot read a Tangled repository from ($url)." } }
     if $location.did? != null {
-        return { did: $location.did spindle: "" web: $"($TANGLED_WEB)/($location.did)" }
+        return { did: $location.did web: $"($TANGLED_WEB)/($location.did)" }
     }
     let owner = $location.owner
     let did = if ($owner | str starts-with "did:") {
@@ -848,7 +846,6 @@ def tangled-repo [] {
     let record = (xrpc $TANGLED_INDEX "sh.tangled.repo.getRepo" { repo: $"at://($did)/sh.tangled.repo/($location.name)" })
     {
         did: $record.value.repoDid
-        spindle: ($record.value.spindle? | default "")
         web: $"($TANGLED_WEB)/($owner)/($location.name)"
     }
 }
@@ -857,29 +854,6 @@ def tangled-repo [] {
 def open-pulls [repo: record] {
     (xrpc $TANGLED_INDEX "sh.tangled.repo.listPulls" { subject: $repo.did status: "open" limit: 100 }).items
     | each {|item| { title: $item.value.title branch: ($item.value.source?.branch? | default "") uri: $item.uri } }
-}
-
-# The spindle's verdict on one commit: success once every workflow passed,
-# failed as soon as one failed, timed out, or was cancelled, missing before any
-# pipeline started, and running otherwise.
-def pipeline-state [repo: record, commit: string] {
-    if ($repo.spindle | is-empty) {
-        error make { msg: "The Tangled repository has no spindle, so no pipeline can gate landing. Select one in its settings." }
-    }
-    # A spindle that has not recorded the push yet omits `pipelines`.
-    let pipelines = ((xrpc $"https://($repo.spindle)" "sh.tangled.ci.queryPipelines" { repo: $repo.did commits: $commit }).pipelines? | default [])
-    let pipeline = ($pipelines | where commit == $commit | get --optional 0)
-    let workflows = if $pipeline == null { [] } else { $pipeline.workflows }
-    let state = if ($workflows | is-empty) {
-        "missing"
-    } else if ($workflows | any {|workflow| $workflow.status in ["failed" "timeout" "cancelled"] }) {
-        "failed"
-    } else if ($workflows | all {|workflow| $workflow.status == "success" }) {
-        "success"
-    } else {
-        "running"
-    }
-    { state: $state workflows: $workflows }
 }
 
 # The GitHub repository a remote URL names, as `owner/name`, or null for a
@@ -910,7 +884,7 @@ def post-landing-status [remote: string, head: string, clearance: string] {
     } | ignore
 }
 
-# GitHub's verdict on one commit, in the spindle's shape: the newest run of
+# GitHub's verdict on one commit, as `{state workflows}`: the newest run of
 # each required check decides, and a check that has not reported is missing.
 # A skipped run proves nothing, so it counts as not having reported.
 def github-checks-state [repo: string, commit: string, required: list<string> = $GITHUB_REQUIRED_CHECKS] {
@@ -1394,8 +1368,8 @@ def checks-killed [error: string, progress: record] {
     }
 }
 
-# Build every flake check at `commit` on this machine with the command the
-# spindle workflow runs, streaming the build log. Outputs already in the local
+# Build every flake check at `commit` on this machine with nix-fast-build,
+# streaming the build log. Outputs already in the local
 # store or a binary cache are skipped, so a topic that leaves the system
 # closures alone builds only the cheap checks. Evaluation uses one worker:
 # two workers beside open agent sessions exhausted this 16 GiB machine and
@@ -1477,9 +1451,8 @@ def local-checks-state [commit: string] {
     { state: $state workflows: [{ name: "flake checks" status: $outcome.status error: ($outcome.error? | default "") }] }
 }
 
-# The check that gates a landing: the flake checks built on this machine, the
-# repository's spindle, GitHub Actions on the mirror, or nixbot's check runs
-# on the mirror.
+# The check that gates a landing: the flake checks built on this machine,
+# GitHub Actions on the mirror, or nixbot's check runs on the mirror.
 def landing-gate [gate: string] {
     match $gate {
         "local" => {
@@ -1487,19 +1460,6 @@ def landing-gate [gate: string] {
                 name: $"local flake checks on (sys host | get hostname)"
                 probe: {|commit| local-checks-state $commit }
                 hint: ""
-                started_by_hand: false
-            }
-        }
-        "spindle" => {
-            let repo = (tangled-repo)
-            if ($repo.spindle | is-empty) {
-                error make { msg: "The Tangled repository has no spindle, so no pipeline can gate landing. Select one in its settings, and name the repository by owner and name in the trunk remote's URL." }
-            }
-            {
-                name: $repo.spindle
-                probe: {|commit| pipeline-state $repo $commit }
-                hint: "Pushes do not trigger the spindle; start flake-checks.yml on this branch by hand on Tangled."
-                started_by_hand: true
             }
         }
         "github" => {
@@ -1508,7 +1468,6 @@ def landing-gate [gate: string] {
                 name: $"GitHub Actions on ($github)"
                 probe: {|commit| github-checks-state $github $commit }
                 hint: "If none started, check that .github/workflows/nix-ci.yml runs on pushes to jj-* branches."
-                started_by_hand: false
             }
         }
         "nixbot" => {
@@ -1517,16 +1476,14 @@ def landing-gate [gate: string] {
                 name: $"nixbot on ($github)"
                 probe: {|commit| github-checks-state $github $commit $NIXBOT_REQUIRED_CHECKS }
                 hint: $"If none started, check that ($NIXBOT_CONFIG) on main lists jj-* in build_branches, the project is enabled in nixbot, and the GitHub App's webhook deliveries succeed."
-                started_by_hand: false
             }
         }
-        _ => { error make { msg: $"Unknown clearance ($gate); use local, spindle, github, or nixbot." } }
+        _ => { error make { msg: $"Unknown clearance ($gate); use local, github, or nixbot." } }
     }
 }
 
 # Poll the gate until it passes `commit`. Stop at the first failure; never
-# rebase or push. A gate that must be started by hand reports blocked on a
-# person while it has not started.
+# rebase or push.
 def wait-for-pipeline [gate: record, commit: string, timeout: duration] {
     let deadline = (date now) + $timeout
     mut last = ""
@@ -1552,11 +1509,7 @@ def wait-for-pipeline [gate: record, commit: string, timeout: duration] {
         }
         if $status != $last {
             print $"(date now | format date '%H:%M:%S') ($status)"
-            if $pipeline.state == "missing" and $gate.started_by_hand {
-                report-status blocked $gate.hint --id clearance --kind permission
-            } else {
-                report-status working $"($gate.name): ($status)" --id clearance
-            }
+            report-status working $"($gate.name): ($status)" --id clearance
             $last = $status
         }
         if (date now) > $deadline {
@@ -2797,19 +2750,8 @@ def remote-bookmark-commit [bookmark: string, remote: string] {
 }
 
 # One probe's verdict, or `unknown` with the reason when it could not be read.
-# A run that only timed out reports `timeout`: the gate treats it as a failure,
-# but it says nothing about the topic, and the homelab spindle's 30 minute
-# limit ends every cold run that way.
 def probe-state [probe: closure] {
-    try {
-        let result = (do $probe)
-        let statuses = ($result.workflows? | default [] | get --optional status | default [])
-        if $result.state == "failed" and "timeout" in $statuses and "failed" not-in $statuses {
-            { state: "timeout" }
-        } else {
-            $result | select state
-        }
-    } catch {|err| { state: "unknown" error: $err.msg } }
+    try { do $probe | select state } catch {|err| { state: "unknown" error: $err.msg } }
 }
 
 # A topic's trip to main uses flight words: `new`, `sequence`, `preflight`
@@ -2838,14 +2780,13 @@ def renamed [old: string, new: string] {
 
 def "main status" [] {
     ^jj status
-    # A trunk remote that is not on Tangled has no pull requests or spindle.
+    # A trunk remote that is not on Tangled has no pull requests.
     let repo = (try { tangled-repo } catch { null })
     let pulls = if $repo == null { [] } else { open-pulls $repo }
     topic-bookmarks | each {|topic|
         {
             topic: $topic.name
             stacked_on: $topic.parent
-            pipeline: (if ($repo.spindle? | is-empty) { null } else { (pipeline-state $repo $topic.commit).state })
             pull: ($pulls | where branch == $topic.name | get --optional 0.title)
         }
     }
@@ -2866,7 +2807,6 @@ def "main ci-state" [] {
         published_head: $head
         landed: false
         pull: null
-        spindle: null
         github: null
     }
     if $head == null { return ($base | to json) }
@@ -2878,9 +2818,6 @@ def "main ci-state" [] {
         landed: (topic-landed $branch)
         pull: (if $repo == null { null } else {
             try { open-pulls $repo | where branch == $branch | get --optional 0.title } catch { null }
-        })
-        spindle: (if $repo == null { { state: "unknown" error: "Could not read the Tangled repository." } } else {
-            probe-state { pipeline-state $repo $head }
         })
         github: $github
     } | to json
@@ -3466,11 +3403,9 @@ def bisect-train [count: int, failure: any, clear: closure] {
 }
 
 # Run clearance on the train's `entry`, the tip of a prefix, and report
-# whether it passed. Remote clearance needs the head pushed: GitHub's to the
-# mirror, the spindle's to the trunk remote, where it is started by hand.
+# whether it passed. Remote clearance needs the head pushed to the mirror.
 def train-clearance [checker: record, gate: string, entry: record, timeout: duration] {
     if $gate in $GITHUB_CLEARANCES { push-bookmark $GITHUB_REMOTE $entry.name }
-    if $gate == "spindle" { push-topic-bookmark $entry.name }
     print $"Waiting for ($checker.name) to pass ($entry.name) at ($entry.head | str substring 0..11)."
     try {
         wait-for-pipeline $checker $entry.head $timeout
@@ -3723,7 +3658,7 @@ def mirror-topic [branch: string] {
 # stacked review on Tangled instead.
 def "main dispatch" [
     --land # Land the topic once it has clearance
-    --clearance: string = "local" # What must pass the head before --land: local, spindle, github, or nixbot
+    --clearance: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
     --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
     --stack # Push one branch per revision for Tangled's stacked pull requests
@@ -3767,7 +3702,7 @@ def "main dispatch" [
 
 def "main publish" [
     --land # Land the topic once it has clearance
-    --gate: string = "local" # What must pass the head before --land: local, spindle, github, or nixbot
+    --gate: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
     --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
 ] {
@@ -3776,7 +3711,7 @@ def "main publish" [
 }
 
 def "main land" [
-    --clearance: string = "local" # What must pass the head: local, spindle, github, or nixbot
+    --clearance: string = "local" # What must pass the head: local, github, or nixbot
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
     --attempts: int = 5 # How many times to start over when something outside the landing queue moves main

@@ -122,7 +122,7 @@ ci review snapshot v2
 ci interdiff v1 v2
 # At topic closeout:
 ci land                     # Build the flake checks locally, then fast-forward main.
-ci land --clearance spindle # Take clearance from the spindle (or github, or nixbot) instead.
+ci land --clearance github  # Take clearance from GitHub Actions (or nixbot) instead.
 ci park                     # Confirm the landing and free the workspace.
 # To drop an undispatched or closed topic instead:
 ci cancel
@@ -317,8 +317,7 @@ corresponding stack layer and review round.
 
 The default clearance, `--clearance local`, exports the exact commit's tree with
 `git archive` and builds its `checks.x86_64-linux` on this machine with the
-same `nix-fast-build --skip-cached` command the spindle workflow runs,
-streaming the build log. It evaluates with one worker and a 6 GiB budget:
+`nix-fast-build --skip-cached`, streaming the build log. It evaluates with one worker and a 6 GiB budget:
 past the budget, nix-eval-jobs kills the worker and retries the check alone,
 so the largest single check, not the whole set, has to fit. Anything already
 in the local store or a binary
@@ -378,15 +377,12 @@ command that loses the race to read the operation heads while another
 process replaces them ("Failed to read operation heads") fails before it
 changes anything, and `ci` retries it twice.
 
-`ci land --clearance spindle` takes clearance from the repository's spindle instead. Pushes
-do not trigger it, so start `flake-checks.yml` on the topic branch by hand. It
-polls every 30 seconds (default timeout `--timeout 2hr`) and stops at the
-first failed, timed-out, or cancelled workflow without landing anything.
-
-`ci land --clearance github` takes clearance from GitHub Actions. It pushes the topic branch to `origin`, where
+`ci land --clearance github` takes clearance from GitHub Actions instead. It pushes the topic branch to `origin`, where
 `nix-ci.yml` runs on every `jj-*` push, waits for the `nix flake checks` run
 on the exact head, and then fast-forwards `main`
-on Tangled and GitHub exactly as a spindle-cleared landing does. Never merge a
+on Tangled and GitHub exactly as a locally cleared landing does. It polls
+every 30 seconds (default timeout `--timeout 2hr`) and stops at the first
+failed check without landing anything. Never merge a
 GitHub pull request instead: GitHub's squash and rebase merges rewrite
 commits, so `main` would hold a commit no check ran on, change IDs and the
 impact declarations keyed by them would be lost, and `park` and `prune` could no longer
@@ -547,9 +543,7 @@ The integration points are deliberately automatic:
 - `ci land` performs the same final rebase, so the commit the landing clearance
   tests is the commit `main` receives.
 
-The spindle runs `.tangled/workflows` only when started by hand on `main` or a
-`jj-*` branch; pushes do not trigger it. Landing requires clearance to pass the
-rebased head, so two topics that
+Landing requires clearance to pass the rebased head, so two topics that
 break only in combination cannot both land: the second is rebased onto the
 first and tested again. A topic that merely fell behind `main` needs no
 attention until it lands.
@@ -582,11 +576,10 @@ hooks to run: preflight says so and records the commit as passed, and the
 flake checks remain the landing gate.
 
 `ci ci-state` prints the current topic's dispatch branch, the head
-Tangled holds for it, whether it landed, its open pull request, and the
-spindle's verdict on that head (and GitHub's, when a GitHub-cleared landing
-pushed it there) as JSON. A run that only timed out reports `timeout` rather
-than `failed`, since it says nothing about the topic. It reads the last-fetched remote state and the forge
-APIs only; it never fetches, pushes, or rewrites anything.
+Tangled holds for it, whether it landed, its open pull request, and
+GitHub's verdict on that head, when a GitHub-cleared landing pushed it there,
+as JSON. It reads the last-fetched remote state and the forge APIs only; it
+never fetches, pushes, or rewrites anything.
 
 ### The ci log
 
@@ -836,8 +829,8 @@ fast-forwards `main` to it after the landing clearance passes it. `main` stays l
 without squashing, and every revision keeps its change ID and so its impact
 declaration. Branches
 from older sessions may retain their descriptive names, but new topics must use
-the `jj-` prefix: the spindle accepts manual runs only on `jj-*` branches and
-`main`, and `ci` treats only `jj-*` bookmarks as dispatched topics.
+the `jj-` prefix: `ci` treats only `jj-*` bookmarks as dispatched topics, and
+the GitHub and nixbot clearances expect CI to build `jj-*` pushes.
 
 Use a stack only when every layer is independently reviewable and the layers
 must land in dependency order. Ordinary one-branch topics are preferred because

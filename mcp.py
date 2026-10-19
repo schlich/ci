@@ -365,7 +365,7 @@ def parse_json_output(result: dict) -> dict:
 @mcp.tool(annotations=READ_ONLY)
 async def status(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
     """`ci status`: JJ status plus each published topic with its stack
-    parent, spindle pipeline state, and open Tangled pull request."""
+    parent and open Tangled pull request."""
     return await run(["status"], workspace, wait_seconds, mutating=False)
 
 
@@ -610,7 +610,7 @@ async def dispatch(
             "explicit user request to deliver."
         ),
     ] = False,
-    clearance: Literal["local", "spindle", "github", "nixbot"] = "local",
+    clearance: Literal["local", "github", "nixbot"] = "local",
     timeout: Annotated[
         str, Field(description="Nushell duration --land waits, e.g. 2hr.")
     ] = "2hr",
@@ -629,7 +629,7 @@ async def dispatch(
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def land(
-    clearance: Literal["local", "spindle", "github", "nixbot"] = "local",
+    clearance: Literal["local", "github", "nixbot"] = "local",
     timeout: Annotated[
         str, Field(description="Nushell duration to wait, e.g. 2hr.")
     ] = "2hr",

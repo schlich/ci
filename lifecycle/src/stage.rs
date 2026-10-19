@@ -33,8 +33,8 @@ pub struct Observation {
     pub behind: u64,
     /// The head Tangled holds for the topic's dispatch branch.
     pub published_head: Option<Commit>,
-    /// The spindle's verdict on the published head.
-    pub spindle: Option<String>,
+    /// GitHub's verdict on the published head, when the mirror holds it.
+    pub github: Option<String>,
     /// Whether preflight passed on the current head.
     pub lint_passed: bool,
     pub conflicts: Vec<String>,
@@ -76,7 +76,7 @@ impl Observation {
             conflict_free: true,
             fresh: true,
         });
-        let passed = match self.spindle.as_deref() {
+        let passed = match self.github.as_deref() {
             Some("success") => self.published_head.clone(),
             _ => None,
         };
@@ -133,7 +133,7 @@ impl Observation {
                 Stage::Republish
             } else if topic.passed.as_ref() == Some(&topic.head) {
                 Stage::Passed
-            } else if self.spindle.as_deref() == Some("failed") {
+            } else if self.github.as_deref() == Some("failed") {
                 Stage::Failed
             } else {
                 Stage::Published

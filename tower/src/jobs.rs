@@ -34,7 +34,7 @@ pub enum PhaseState {
     Error,
     /// Waiting on another session, such as the local checks lock.
     Blocked,
-    /// Waiting on a person, such as a spindle run to start by hand.
+    /// Waiting on a person, such as an approval.
     Permission,
 }
 
@@ -634,9 +634,9 @@ mod tests {
     }
 
     #[test]
-    fn a_spindle_waiting_on_a_person_is_permission() {
+    fn a_phase_waiting_on_a_person_is_permission() {
         let (phases, _, _) = parse_phases(
-            r#"{"state":"blocked","id":"clearance","kind":"permission","msg":"Start flake-checks.yml"}"#,
+            r#"{"state":"blocked","id":"approval","kind":"permission","msg":"Approve the step"}"#,
         );
         assert_eq!(phases[0].state, PhaseState::Permission);
     }

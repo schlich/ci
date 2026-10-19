@@ -124,7 +124,6 @@ pub enum Lint {
 /// The pipeline facts `context-status` caches for the dispatched head.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CiCache {
-    pub spindle: Option<String>,
     pub github: Option<String>,
     pub pull: Option<String>,
     pub checked_ms: Option<i64>,
@@ -564,7 +563,6 @@ fn classify(graph: &Graph, facts: TopicFacts) -> Option<Topic> {
                 .map(str::to_string)
         };
         Some(CiCache {
-            spindle: verdict("spindle"),
             github: verdict("github"),
             pull: str_field(state, "pull"),
             checked_ms: str_field(cache, "checked_at").and_then(|at| time::parse(&at)),
@@ -605,7 +603,7 @@ fn classify(graph: &Graph, facts: TopicFacts) -> Option<Topic> {
         described: head.described,
         behind: behind.unwrap_or(0) as u64,
         published_head: published_head.clone(),
-        spindle: ci.as_ref().and_then(|ci| ci.spindle.clone()),
+        github: ci.as_ref().and_then(|ci| ci.github.clone()),
         lint_passed: matches!(lint, Lint::Passed { .. }),
         conflicts: conflicts.clone(),
     };

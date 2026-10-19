@@ -106,7 +106,7 @@ impl Action {
             Action::Land => "clear the head locally, fast-forward main",
             Action::Park => "confirm the landing, free the workspace",
             Action::Cancel => "delete the branch, abandon the topic",
-            Action::RefreshCi => "re-read spindle, GitHub, and the PR",
+            Action::RefreshCi => "re-read GitHub and the PR",
             Action::Dashboard => "open the workspace in the JJ dashboard",
             Action::StopRun => "SIGTERM the selected run",
         }

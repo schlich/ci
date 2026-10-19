@@ -9,7 +9,7 @@
 // current trunk.
 //
 // Landing is a fast-forward of main to the exact head a gate (the flake
-// checks built locally by default, the spindle, GitHub Actions, or nixbot)
+// checks built locally by default, GitHub Actions, or nixbot)
 // passed, pushed with a lease on the trunk the topic is based on. No forge
 // merges: a squash, rebase, or merge commit would put a commit on main that
 // no gate ran on.

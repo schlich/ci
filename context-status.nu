@@ -317,9 +317,9 @@ def ago [when: any] {
 }
 
 def ttl [ci: record] {
-    # The spindle runs only when started by hand, so a head with no pipeline
-    # is not waiting for one.
-    if ($ci.spindle?.state? | default "") in ["success" "failed" "timeout" "missing"] { $SETTLED_TTL } else { $PENDING_TTL }
+    # GitHub checks only a head pushed to the mirror, so a head that is not
+    # there is not waiting for a verdict.
+    if $ci.github? == null or $ci.github.state? in ["success" "failed"] { $SETTLED_TTL } else { $PENDING_TTL }
 }
 
 # Where the topic stands in the `ci` lifecycle, its next step, and the
@@ -335,7 +335,7 @@ def classify [facts: record] {
         described: $facts.head.described
         behind: $facts.behind
         published_head: $facts.published_head
-        spindle: ($facts.ci?.spindle?.state? | default null)
+        github: ($facts.ci?.github?.state? | default null)
         lint_passed: ($facts.lint == "passed")
         conflicts: $facts.conflicts
     } | to json | ^jj-ci-lifecycle classify | from json
@@ -478,7 +478,6 @@ def ci-glyph [state: any] {
     match $state {
         "success" => $"(ansi green)✔(ansi reset)"
         "failed" => $"(ansi red)✗(ansi reset)"
-        "timeout" => $"(ansi dark_gray)⌛(ansi reset)"
         "running" | "in_progress" | "queued" => $"(ansi yellow)⧗(ansi reset)"
         "missing" => $"(ansi yellow)…(ansi reset)"
         _ => $"(ansi dark_gray)?(ansi reset)"
@@ -504,11 +503,6 @@ def ci-summary [facts: record] {
     if $facts.published_head == null { return "not published" }
     if $facts.ci == null { return $"published ($facts.published_head | str substring 0..7), pipeline not checked yet" }
     let parts = [
-        (match ($facts.ci.spindle?.state? | default "unknown") {
-            "missing" => null
-            "timeout" => "spindle timed out (not the landing gate)"
-            $state => $"spindle ($state)"
-        })
         (if $facts.ci.github? != null { $"GitHub ($facts.ci.github.state)" })
         (if $facts.ci.pull? != null { $"PR \"($facts.ci.pull)\"" })
     ] | compact
@@ -546,7 +540,7 @@ def "main prompt" [] {
     let parts = [
         (if ($facts.conflicts | is-not-empty) { $"(ansi red)⚠ conflict(ansi reset)" })
         (if $facts.stage != "idle" { stage-label $facts.stage })
-        (if $facts.stage in ["published" "passed" "failed" "republish"] and $facts.ci != null { ci-glyph $facts.ci.spindle?.state? })
+        (if $facts.stage in ["published" "passed" "failed" "republish"] and $facts.ci?.github? != null { ci-glyph $facts.ci.github.state? })
         (if $facts.behind > 0 and $facts.stage != "idle" { $"(ansi dark_gray)↓($facts.behind)(ansi reset)" })
         (if $facts.owner == "active" { $"(ansi dark_gray)◆(ansi reset)" })
     ] | compact

@@ -14,7 +14,7 @@ fn observe(overrides: Value) -> Observation {
         "described": true,
         "behind": 0,
         "published_head": null,
-        "spindle": null,
+        "github": null,
         "lint_passed": false,
         "conflicts": [],
     });
@@ -35,15 +35,15 @@ fn stages_follow_the_lifecycle() {
     assert_eq!(stage(json!({ "published_head": "c1" })), Stage::Published);
     assert_eq!(stage(json!({ "published_head": "c0" })), Stage::Republish);
     assert_eq!(
-        stage(json!({ "published_head": "c1", "spindle": "success" })),
+        stage(json!({ "published_head": "c1", "github":"success" })),
         Stage::Passed
     );
     assert_eq!(
-        stage(json!({ "published_head": "c1", "spindle": "failed" })),
+        stage(json!({ "published_head": "c1", "github":"failed" })),
         Stage::Failed
     );
     assert_eq!(
-        stage(json!({ "published_head": "c0", "spindle": "success" })),
+        stage(json!({ "published_head": "c0", "github":"success" })),
         Stage::Republish
     );
     assert_eq!(
@@ -98,7 +98,7 @@ fn allowed_steps_come_from_the_machine() {
         ["rebase", "validate", "finish", "abandon"]
     );
     assert_eq!(
-        allowed(json!({ "published_head": "c1", "spindle": "success" })),
+        allowed(json!({ "published_head": "c1", "github":"success" })),
         ["rebase", "validate", "land"]
     );
     assert_eq!(

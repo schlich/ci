@@ -1038,16 +1038,13 @@ fn draw_topic_detail(frame: &mut Frame, area: Rect, app: &App) {
             };
             Span::styled(format!("{name} {state}"), style)
         };
-        if let Some(spindle) = &ci.spindle {
-            spans.push(verdict("spindle", spindle));
-        }
         if let Some(github) = &ci.github {
-            spans.push(sep(theme));
             spans.push(verdict("GitHub", github));
         }
         if let Some(checked) = ci.checked_ms {
+            let lead = if spans.is_empty() { "" } else { " · " };
             spans.push(Span::styled(
-                format!(" · checked {}", time::since(checked, now)),
+                format!("{lead}checked {}", time::since(checked, now)),
                 theme.faint(),
             ));
         }

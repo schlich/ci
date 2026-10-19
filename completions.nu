@@ -21,7 +21,6 @@ def "nu-complete ci topics" [] {
 def "nu-complete ci clearances" [] {
     [
         { value: "local", description: "The flake checks built on this machine" }
-        { value: "spindle", description: "The Tangled repository's spindle" }
         { value: "github", description: "GitHub Actions on the origin mirror" }
         { value: "nixbot", description: "nixbot's check runs on the origin mirror" }
     ]
