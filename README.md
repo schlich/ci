@@ -10,8 +10,10 @@ and which release it shipped in.
 I usually let the MCP server manage it hands-off, but every step is also an
 ordinary terminal command.
 
-It is built around my own repositories and machines, so it is not meant to be
-adopted elsewhere as-is, but parts of it may spark ideas for your own custom workflows.
+It developed through trial and error, not from any particular framework or
+methodology. It is built around my own repositories and machines, so it is not
+meant to be adopted elsewhere as-is, but parts of it may spark ideas for your
+own custom workflows.
 
 ## How it works
 
@@ -68,6 +70,11 @@ nix run github:schlich/ci -- status
 
 ## Design choices
 
+The project deliberately uses the newest versions of common tools. Working
+with them gave me a tighter handle on the underlying concepts. The same
+workflow could be built with traditional tools such as Git and Bash, but less
+elegantly.
+
 ### VCS
 
 > **Why Jujutsu?** Git identifies work only by commit hash, and amending or
@@ -88,3 +95,54 @@ nix run github:schlich/ci -- status
 > `jj`, `gh`, `nix`, `systemd`, and JSON state files. Nushell parses their
 > output into structured records and tables, so the scripts work with named
 > fields instead of parsing text.
+
+### Judgment calls
+
+A few steps around the workflow need judgment rather than a fixed rule, such
+as deciding why a deployment rolled back. For those I use
+[Jev](https://docs.typesafe.ai/introduction), TypeSafe's "System One" model.
+A Jev request is not a chat prompt. It carries _state_, a JSON record of the
+evidence such as a revert report, and a set of typed _questions_ about that
+state. Jev answers each question with numbers rather than prose:
+
+- A **choice** picks one of several named options and says how confident it
+  is.
+- A **noul** gives the probability that a statement about the state is true.
+- A **score** places the state on a scale of ordered, described levels.
+
+Ordinary code makes the final decision by comparing those numbers with
+thresholds I set. An answer that falls short of its threshold counts as
+unsure, and the code handles that case explicitly instead of acting on a
+guess; a failed request is treated the same way. The questions and thresholds
+are declared as data beside the code that reads them, so they are reviewed
+like code and retuned when the model version changes.
+
+For example, a deployment of my machines is staged and reverts itself when
+health checks fail. `deploy-reverts causes`, in my
+[dotfiles](https://tangled.org/schlich.tngl.sh/dotfiles), asks Jev the
+following about each revert report. It then ranks causes by how many reverts a
+check before deployment could have caught, which tells me what check to add
+to the landing gate next.
+
+```nu
+deploy_reverts: {
+  min_confidence: 0.6
+  min_catchable: 0.6
+  questions: {
+    cause: {
+      type: choice
+      instructions: "What caused the staged NixOS switch in `revert` to revert or be rejected? ..."
+      criteria: {
+        evaluation_or_build: "The configuration failed to evaluate or build, so nothing was activated"
+        service_failure: "A system service failed to start or crashed after activation ..."
+        flaky_probe: "The health probe itself misfired or timed out while the system was healthy"
+        # ...five more classes
+      }
+    }
+    precheck_catchable: {
+      type: noul  # a probability that the statement is true
+      instructions: "A check run before deployment, such as a flake check, an evaluation assertion, or a NixOS VM test, could have caught what made the switch in `revert` fail."
+    }
+  }
+}
+```
