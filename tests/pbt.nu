@@ -57,13 +57,17 @@ def gen-owner-record [key: string] {
     }
 }
 
+# Each property prints one result line as it finishes, `ok NAME (N cases)` or
+# `FAIL NAME: MESSAGE`, which `ci test` streams as status reports.
 def for-all [name: string, property: closure] {
     for case in 0..<$CASES {
         let key = $"(seed)/($name)/($case)"
         try {
             do $property $key
         } catch {|error|
-            error make { msg: $"property `($name)` failed at PBT_SEED=(seed) case ($case): ($error.msg)" }
+            let msg = $"property `($name)` failed at PBT_SEED=(seed) case ($case): ($error.msg)"
+            print $"FAIL ($name): ($msg | lines | str join ' ')"
+            error make { msg: $msg }
         }
     }
     print $"ok ($name) \(($CASES) cases)"

@@ -2853,6 +2853,65 @@ def "main preflight" [] {
     validate-change
 }
 
+# Run this repository's property suites (tests/*-properties.nu), each in its
+# own Nushell, and report every property as it finishes, so `watch-job` and
+# the MCP `property_tests` tool stream the results. A failing suite stops at
+# its first failed property; the other suites still run.
+def "main test" [
+    --seed: string  # PBT_SEED to replay (default: the suites' own)
+    ...suites: string  # Suites to run, such as ci-properties (default: all)
+] {
+    let root = (run-command "locating the workspace" { ^jj root } | str trim)
+    let tests = ($root | path join "tests")
+    if not ($tests | path join "pbt.nu" | path exists) {
+        error make { msg: $"($root) has no property suites \(tests/pbt.nu\)." }
+    }
+    let names = if ($suites | is-not-empty) { $suites } else {
+        glob ($tests | path join "*-properties.nu") | sort | each { path basename | str replace --regex '\.nu$' '' }
+    }
+    # Set here rather than with `with-env`, whose block drops the suite's exit
+    # status, so a failing suite would read as passed.
+    if $seed != null { $env.PBT_SEED = $seed }
+    # A child nu does not take the parsed NU_LIB_DIRS list as its module path,
+    # where ci.nu, which ci-properties sources, finds `pst`.
+    let lib_dirs = ($env.NU_LIB_DIRS? | default [] | each {|dirs| $dirs | split row (char esep) } | flatten | where {|dir| $dir | is-not-empty })
+    let include = if ($lib_dirs | is-empty) { [] } else { ["--include-path" ($lib_dirs | str join (char record_sep))] }
+    cd $tests
+    let failed = ($names | each {|suite|
+        report-status working $"Running ($suite)" --id $suite
+        let passed = try {
+            ^$nu.current-exe --no-config-file ...$include --commands $"source ($suite).nu"
+            | lines
+            | each {|line|
+                print $line
+                if ($line | str starts-with "ok ") {
+                    report-status done ($line | str substring 3..) --id $"($suite)/(property-name $line)"
+                } else if ($line | str starts-with "FAIL ") {
+                    report-status error ($line | str substring 5..) --id $"($suite)/(property-name $line)"
+                }
+            }
+            | ignore
+            true
+        } catch { false }
+        if $passed { report-status done $"($suite) passed" --id $suite } else { report-status error $"($suite) failed" --id $suite }
+        if $passed { null } else { $suite }
+    } | compact)
+    if ($failed | is-not-empty) {
+        error make { msg: $"Property suites failed: ($failed | str join ', ')" }
+    }
+    print $"All ($names | length) property suites passed."
+}
+
+# A status id segment for the property a result line from tests/pbt.nu's
+# for-all names. pst takes at most 32 of `[A-Za-z0-9_.+-]` per segment, so a
+# long name is cut and keeps a hash of the whole to stay distinct.
+def property-name [line: string] {
+    let name = ($line | parse --regex '^(?:ok|FAIL) (?<name>.*?)(?: \(\d+ cases\)|: .*)?$' | get --optional 0.name | default $line)
+    let slug = ($name | str lowercase |str replace --all --regex '[^a-z0-9]+' '-' | str trim --char '-')
+    if ($slug | str length) <= 32 { return $slug }
+    $"($slug | str substring 0..<25 | str trim --char '-')-($name | hash sha256 | str substring 0..<6)"
+}
+
 def "main validate" [] {
     renamed "validate" "preflight"
     main preflight

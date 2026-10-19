@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -56,6 +56,12 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 # quick commands to answer inline, short enough not to hold a client's call.
 DEFAULT_WAIT = 60
 TAIL = 12_000
+# One result line from tests/pbt.nu's for-all: `ok NAME (N cases)` or
+# `FAIL NAME: MESSAGE`.
+PROPERTY_RESULT = re.compile(
+    r"^(?P<outcome>ok|FAIL) (?P<name>.*?)"
+    r"(?: \((?P<cases>\d+) cases\)|: (?P<message>.*))?$"
+)
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 LOCAL = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
@@ -599,6 +605,65 @@ async def preflight(workspace: Workspace = None, wait_seconds: Wait = None) -> d
     """`ci preflight`: run formatting and Prek gates on the current change.
     Usually outlasts the default wait; poll the job."""
     return await run(["preflight"], workspace, wait_seconds, default_wait=20)
+
+
+def property_results(log: str) -> list[dict]:
+    results = []
+    for line in log.splitlines():
+        if match := PROPERTY_RESULT.match(line):
+            result = {"name": match["name"], "passed": match["outcome"] == "ok"}
+            if match["cases"]:
+                result["cases"] = int(match["cases"])
+            if match["message"]:
+                result["message"] = match["message"]
+            results.append(result)
+    return results
+
+
+@mcp.tool(annotations=LOCAL)
+async def property_tests(
+    ctx: Context,
+    suites: Annotated[
+        list[str] | None,
+        Field(description="Suites to run, such as ci-properties (default: all)."),
+    ] = None,
+    seed: Annotated[
+        str | None, Field(description="PBT_SEED to replay a reported failure.")
+    ] = None,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci test`: run the repository's property suites (tests/*-properties.nu)
+    and stream each property's result as a progress notification as it
+    finishes. `results` lists every property reported so far; a failing
+    suite stops at its first failed property while the others still run."""
+    args = ["test"] + ([] if seed is None else ["--seed", seed]) + (suites or [])
+    job_id = start_job(args, workspace, mutating=False)
+    path = job_dir(job_id)
+    meta = read_meta(path)
+    deadline = time.monotonic() + (120 if wait_seconds is None else wait_seconds)
+    sent = 0
+    while True:
+        running = job_state(path, meta)[0] == "running"
+        results = property_results(
+            ANSI.sub("", (path / "log").read_text(errors="replace"))
+        )
+        for result in results[sent:]:
+            mark = "ok" if result["passed"] else "FAIL"
+            detail = result.get("message") or (
+                f"{result['cases']} cases" if "cases" in result else "passed"
+            )
+            await ctx.report_progress(
+                len(results), message=f"{mark} {result['name']}: {detail}"
+            )
+        sent = len(results)
+        if not running or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.5)
+    rendered = render(job_id)
+    rendered["results"] = results
+    rendered["failed"] = [result["name"] for result in results if not result["passed"]]
+    return rendered
 
 
 @mcp.tool(annotations=REMOTE)

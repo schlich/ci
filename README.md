@@ -115,6 +115,7 @@ ci sequence                 # See whether the topic stacks on another in flight.
 ci rebase                   # Fetch trunk and rebase the whole topic stack.
 ci conflicts                # Show conflicted revisions and files after a rebase.
 ci preflight                # Run every pre-activation check when requested.
+ci test                     # Run tests/*-properties.nu, reporting each property as it finishes.
 ci review snapshot v1       # Capture the current series for interdiff review.
 ci dispatch                 # Push the same topic branch to Tangled.
 # After editing or absorbing review fixes:
@@ -132,6 +133,15 @@ ci verify -m "how you tested it"
 ci prune                    # List leaked workspaces and landed branches; --apply removes them.
 ci sim --shell              # Try trunk plus dispatched user-facing topics, unactivated.
 ```
+
+`ci test [--seed SEED] [SUITE...]` runs a repository's property suites,
+`tests/*-properties.nu`, each in its own Nushell. Every property prints
+`ok NAME (N cases)` or `FAIL NAME: MESSAGE` as it finishes, and `ci test`
+reports each as an OSC 7501 status under `SUITE/NAME`, so `watch-job` shows
+results as they arrive. A failing suite stops at its first failed property;
+the other suites still run. The ci MCP server's `property_tests` tool runs it
+as a job and relays each result line as a progress notification while it
+waits, returning the parsed `results` and the `failed` property names.
 
 ### Naming
 
