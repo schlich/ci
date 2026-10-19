@@ -69,12 +69,16 @@ then run this in a Jujutsu repository:
 nix run github:schlich/ci -- status
 ```
 
-## Design choices
+## Design choices: modern alternatives
 
-The project deliberately uses the newest versions of common tools. Working
-with them gave me a tighter handle on the underlying concepts. The same
-workflow could be built with traditional tools such as Git and Bash, but less
-elegantly.
+Version control and shell scripting are foundational ideas in software, and
+Git and Bash are their best-known implementations. `ci` builds on newer, in
+places experimental, implementations of the same ideas: Jujutsu and Nushell.
+Seeing where a newer tool departs from an established one, and what problem
+the departure solves, makes the underlying concept easier to tell apart from
+any one tool's habits. That helped me decide which operations the workflow
+should offer, and keeping that set deliberate is much of what keeps it
+simple.
 
 ### VCS
 
