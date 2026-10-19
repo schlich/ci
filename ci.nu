@@ -1920,13 +1920,16 @@ def require-topic-checked-out [] {
     error make { msg: $"The working copy \(($stray)) has left this workspace's topic ($short) \"($title)\", as after `jj new main`. Return with `jj edit ($short)` and `jj abandon ($stray)`, or run `jj abandon ($short)` if the topic is meant to be dropped." }
 }
 
-def require-ready-change [] {
+# With --allow-empty, an empty change passes undescribed: there is nothing
+# to describe, and the checks that follow run on the tree it inherits.
+def require-ready-change [--allow-empty] {
     require-owned-change
     if (current-change "conflict") == "true" {
         error make { msg: "Resolve JJ conflicts before publishing." }
     }
     if (current-change "empty") == "true" {
-        error make { msg: "The current JJ change is empty." }
+        if not $allow_empty { error make { msg: "The current JJ change is empty." } }
+        return
     }
     if ((current-change "description.first_line()") | is-empty) {
         print "Describing the current JJ change."
@@ -2847,9 +2850,15 @@ def "main worktree-status" [] {
     }
 }
 
-# Every check that runs before activation, on the current change.
+# Every check that runs before activation, on the current change. A fresh,
+# empty change has no edits of its own, so preflight checks the tree it
+# inherits from its parent instead of failing.
 def "main preflight" [] {
-    require-ready-change
+    require-ready-change --allow-empty
+    if (current-change "empty") == "true" {
+        let parents = (current-change 'parents.map(|p| p.change_id().short()).join(", ")')
+        print $"The current JJ change is empty; checking the tree it inherits from ($parents)."
+    }
     validate-change
 }
 
