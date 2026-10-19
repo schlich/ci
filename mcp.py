@@ -710,17 +710,53 @@ async def land(
     workspace: Workspace = None,
     wait_seconds: Wait = None,
 ) -> dict:
-    """`ci land`: dispatch, wait in the machine's landing queue, clear the
-    exact head (every flake check by default), fast-forward main on the
-    trunk remote and its mirror, and tag releases. Concurrent landings take turns instead of
-    restarting one another. Only on an explicit user request to deliver the
-    topic. Takes minutes to hours; poll the job."""
+    """`ci land`: dispatch, take the machine's runway, clear the exact head
+    (every flake check by default), fast-forward main on the trunk remote and
+    its mirror, and tag releases. It takes the runway only when it is clear:
+    with another landing in flight or a topic held for the drainer it fails
+    at once, naming them; use `queue` then. Only on an explicit user request
+    to deliver the topic. Takes minutes to hours; poll the job."""
     args = ["land", "--clearance", clearance, "--timeout", timeout]
     if train:
         args += ["--train"]
     else:
         args += ["--attempts", str(attempts)]
     return await run(args, workspace, wait_seconds, default_wait=20)
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def queue(
+    clearance: Literal["local", "github", "nixbot"] = "local",
+    timeout: Annotated[
+        str, Field(description="Nushell duration to wait once on the runway, e.g. 2hr.")
+    ] = "2hr",
+    attempts: Annotated[int, Field(ge=1, le=20)] = 5,
+    workspace: Workspace = None,
+    wait_seconds: Wait = None,
+) -> dict:
+    """`ci queue`: dispatch and run the fast checks, then hold the exact head
+    for the drainer, a transient systemd unit that lands held topics in turn
+    (as one train when several share a repository and clearance) and waits
+    its turn on the runway. Returns in seconds; the output names the hold's
+    log, which `watch-job` follows to the landing's DONE. An edit afterwards
+    drops the hold. Only on an explicit user request to deliver the topic."""
+    args = ["queue", "--clearance", clearance, "--timeout", timeout]
+    args += ["--attempts", str(attempts)]
+    return await run(args, workspace, wait_seconds, default_wait=60)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def queue_list(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
+    """`ci queue list --json`: the runway, the topics held for it in landing
+    order, the drainer, and how the latest held topics ended."""
+    return await run(["queue", "list", "--json"], workspace, wait_seconds)
+
+
+@mcp.tool(annotations=LOCAL)
+async def queue_drop(workspace: Workspace = None, wait_seconds: Wait = None) -> dict:
+    """`ci queue drop`: take this workspace's topic out of the line; its hold
+    ends without landing."""
+    return await run(["queue", "drop"], workspace, wait_seconds)
 
 
 @mcp.tool(annotations=REMOTE)

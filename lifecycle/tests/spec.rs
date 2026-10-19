@@ -35,7 +35,10 @@ struct Vars {
     landed_onto: Option<Commit>,
     delivered: bool,
     workspace_base: &'static str,
-    queued: bool,
+    on_runway: bool,
+    holding: bool,
+    held_head: Option<Commit>,
+    others_ahead: bool,
 }
 
 fn workspace_base(workspace: Workspace) -> &'static str {
@@ -81,7 +84,10 @@ fn project(machine: &Machine) -> Vars {
             State::Released { workspace, .. } => workspace_base(*workspace),
             _ => "topic",
         },
-        queued: topic.queued,
+        on_runway: topic.on_runway,
+        holding: topic.held.is_some(),
+        held_head: topic.held.clone(),
+        others_ahead: topic.others_ahead,
     }
 }
 
@@ -163,29 +169,68 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.parent_landed = true;
         }
         Event::TrunkAdvances { main } => {
-            if v.delivered || v.queued || *main == v.main_head {
+            if v.delivered || v.on_runway || *main == v.main_head {
                 return None;
             }
             n.main_head = main.clone();
         }
-        Event::Queue => {
-            if !(owned && v.published && !v.delivered && !v.queued) {
+        Event::OthersArrive => {
+            if v.delivered || v.on_runway || v.holding || v.others_ahead {
                 return None;
             }
-            n.queued = true;
+            n.others_ahead = true;
         }
-        Event::Dequeue => {
-            if !(v.queued && !v.delivered) {
+        Event::OthersLeave => {
+            if !v.others_ahead {
                 return None;
             }
-            n.queued = false;
+            n.others_ahead = false;
+        }
+        Event::Hold => {
+            if !(owned
+                && v.published
+                && v.published_head.as_ref() == Some(&v.head)
+                && !v.delivered
+                && !v.holding
+                && !v.on_runway)
+            {
+                return None;
+            }
+            n.holding = true;
+            n.held_head = Some(v.head.clone());
+        }
+        Event::DropHold => {
+            if !v.holding {
+                return None;
+            }
+            n.holding = false;
+            n.held_head = None;
+        }
+        Event::TakeRunway => {
+            let turn = if v.holding {
+                v.held_head.as_ref() == Some(&v.head)
+            } else {
+                owned
+            };
+            if !(v.published && !v.delivered && !v.on_runway && !v.others_ahead && turn) {
+                return None;
+            }
+            n.on_runway = true;
+            n.holding = false;
+            n.held_head = None;
+        }
+        Event::LeaveRunway => {
+            if !(v.on_runway && !v.delivered) {
+                return None;
+            }
+            n.on_runway = false;
         }
         Event::Land => {
             if !(owned
                 && v.published
                 && !v.conflict
                 && !v.delivered
-                && v.queued
+                && v.on_runway
                 && v.parent_landed
                 && v.published_head.as_ref() == Some(&v.head)
                 && v.passed_head.as_ref() == Some(&v.head)
@@ -196,7 +241,7 @@ fn step(v: &Vars, event: &Event) -> Option<Vars> {
             n.landed_onto = Some(v.main_head.clone());
             n.main_head = v.head.clone();
             n.delivered = true;
-            n.queued = false;
+            n.on_runway = false;
         }
         Event::Finish { workspace } => {
             if !(owned && !v.conflict && (v.delivered || !v.published)) {
@@ -261,8 +306,17 @@ fn invariants(v: &Vars) -> Vec<&'static str> {
             !v.delivered || v.landed_onto.as_ref() == Some(&v.base),
         ),
         (
-            "QueuedOnlyWhileLanding",
-            !v.queued || (v.owner && v.active && v.published && !v.delivered),
+            "RunwayOnlyWhileLanding",
+            !v.on_runway || (v.owner && v.active && v.published && !v.delivered),
+        ),
+        (
+            "HeldOnlyWhileWaiting",
+            !v.holding
+                || (v.owner
+                    && v.published
+                    && !v.delivered
+                    && !v.on_runway
+                    && v.held_head.as_ref().is_some_and(is_head)),
         ),
     ];
     checks
@@ -276,10 +330,18 @@ fn invariants(v: &Vars) -> Vec<&'static str> {
 fn action_properties(v: &Vars, n: &Vars) -> Vec<&'static str> {
     let checks = [
         (
-            "QueuedTopicStaysOnTrunk",
-            !(v.queued && n.queued && v.base == v.main_head) || n.base == n.main_head,
+            "RunwayTopicStaysOnTrunk",
+            !(v.on_runway && n.on_runway && v.base == v.main_head) || n.base == n.main_head,
         ),
-        ("LandsFromQueue", !(!v.delivered && n.delivered) || v.queued),
+        ("LandsFromRunway", !(!v.delivered && n.delivered) || v.on_runway),
+        (
+            "RunwayTakenInTurn",
+            !(!v.on_runway && n.on_runway) || !v.others_ahead,
+        ),
+        (
+            "HoldLandsHeldHead",
+            !(v.holding && n.on_runway) || v.held_head.as_ref() == Some(&v.head),
+        ),
     ];
     checks
         .into_iter()
@@ -295,8 +357,12 @@ fn events() -> Vec<Event> {
         Event::Publish,
         Event::GatePasses,
         Event::ParentLands,
-        Event::Queue,
-        Event::Dequeue,
+        Event::OthersArrive,
+        Event::OthersLeave,
+        Event::Hold,
+        Event::DropHold,
+        Event::TakeRunway,
+        Event::LeaveRunway,
         Event::Land,
     ];
     for head in HEADS {
@@ -387,11 +453,11 @@ fn a_topic_lands_only_through_validation_publication_and_a_gate() {
     assert!(apply(&mut machine, &Event::Publish));
     assert!(!apply(&mut machine, &Event::Land));
     assert!(apply(&mut machine, &Event::GatePasses));
-    assert!(!apply(&mut machine, &Event::Land), "landed outside the queue");
-    assert!(apply(&mut machine, &Event::Queue));
+    assert!(!apply(&mut machine, &Event::Land), "landed off the runway");
+    assert!(apply(&mut machine, &Event::TakeRunway));
     assert!(apply(&mut machine, &Event::Land));
     assert!(matches!(machine.state(), State::Delivered { .. }));
-    assert!(!machine.inner().queued);
+    assert!(!machine.inner().on_runway);
     assert_eq!(machine.inner().main, "h0");
     assert_eq!(machine.inner().landed_onto.as_deref(), Some("m0"));
 }
@@ -406,7 +472,7 @@ fn trunk_moving_after_publication_blocks_landing_until_republished() {
         &mut machine,
         &Event::TrunkAdvances { main: "m1".into() }
     ));
-    assert!(apply(&mut machine, &Event::Queue));
+    assert!(apply(&mut machine, &Event::TakeRunway));
     assert!(!apply(&mut machine, &Event::Land));
     for event in [
         Event::Rebase {
@@ -423,12 +489,17 @@ fn trunk_moving_after_publication_blocks_landing_until_republished() {
     assert_eq!(machine.inner().landed_onto.as_deref(), Some("m1"));
 }
 
-/// Concurrent landings restarted one another (2026-10-16). At the front of
-/// the queue, no other landing moves trunk, so clearance taken there holds.
+/// Concurrent landings restarted one another (2026-10-16). On the runway, no
+/// other landing moves trunk, so clearance taken there holds.
 #[test]
-fn clearance_taken_at_the_front_of_the_queue_is_never_thrown_away() {
+fn clearance_taken_on_the_runway_is_never_thrown_away() {
     let mut machine = Topic::new("h0", "m0", true).machine();
-    for event in [Event::Validate, Event::Publish, Event::Queue, Event::GatePasses] {
+    for event in [
+        Event::Validate,
+        Event::Publish,
+        Event::TakeRunway,
+        Event::GatePasses,
+    ] {
         assert!(apply(&mut machine, &event), "{event:?}");
     }
     assert!(!apply(
@@ -438,13 +509,59 @@ fn clearance_taken_at_the_front_of_the_queue_is_never_thrown_away() {
     assert!(apply(&mut machine, &Event::Land));
     assert_eq!(machine.inner().landed_onto.as_deref(), Some("m0"));
 
-    // Leaving the queue without landing lets trunk move again.
+    // Leaving the runway without landing lets trunk move again.
     let mut machine = Topic::new("h0", "m0", true).machine();
-    for event in [Event::Validate, Event::Publish, Event::Queue, Event::Dequeue] {
+    for event in [
+        Event::Validate,
+        Event::Publish,
+        Event::TakeRunway,
+        Event::LeaveRunway,
+    ] {
         assert!(apply(&mut machine, &event), "{event:?}");
     }
     assert!(apply(
         &mut machine,
         &Event::TrunkAdvances { main: "m1".into() }
     ));
+}
+
+/// `ci land` takes the runway only when it is clear; with another landing in
+/// flight or a topic held ahead, it refuses, and `ci queue` holds the topic
+/// behind them instead.
+#[test]
+fn land_takes_only_a_clear_runway_and_queue_waits_its_turn() {
+    let mut machine = Topic::new("h0", "m0", true).machine();
+    for event in [
+        Event::Validate,
+        Event::Publish,
+        Event::GatePasses,
+        Event::OthersArrive,
+    ] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert!(!apply(&mut machine, &Event::TakeRunway), "landed out of turn");
+    assert!(apply(&mut machine, &Event::Hold));
+    assert!(!apply(&mut machine, &Event::TakeRunway), "held topic jumped ahead");
+    assert!(apply(&mut machine, &Event::OthersLeave));
+    // Topics arriving now line up behind the held one.
+    assert!(!apply(&mut machine, &Event::OthersArrive));
+    assert!(apply(&mut machine, &Event::TakeRunway));
+    assert_eq!(machine.inner().held, None);
+    assert!(apply(&mut machine, &Event::Land));
+    assert_eq!(machine.inner().main, "h0");
+}
+
+/// The drainer lands only the head `ci queue` held: an edit since then ends
+/// the hold rather than landing a head nobody queued.
+#[test]
+fn a_held_topic_edited_since_its_hold_never_takes_the_runway() {
+    let mut machine = Topic::new("h0", "m0", true).machine();
+    for event in [Event::Validate, Event::Publish, Event::Hold] {
+        assert!(apply(&mut machine, &event), "{event:?}");
+    }
+    assert_eq!(machine.inner().held.as_deref(), Some("h0"));
+    assert!(apply(&mut machine, &Event::Edit { head: "h1".into() }));
+    assert!(!apply(&mut machine, &Event::TakeRunway));
+    assert!(apply(&mut machine, &Event::DropHold));
+    assert!(!apply(&mut machine, &Event::Hold), "held a head never dispatched");
 }

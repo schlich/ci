@@ -93,7 +93,9 @@ impl Observation {
             passed,
             parent_landed: true,
             landed_onto: None,
-            queued: false,
+            on_runway: false,
+            held: None,
+            others_ahead: false,
         };
         let state = if matches!(self.owner.as_str(), "delivered" | "discarded") {
             State::released(Workspace::Main, self.owner == "delivered")
@@ -173,10 +175,13 @@ impl Observation {
                 "the head moved since dispatch; run `ci dispatch` to update the branch".into()
             }
             Stage::Published => {
-                "run `ci land` when the topic is ready to deliver; it builds the checks locally"
+                "run `ci land` when the topic is ready to deliver; it builds the checks locally, or `ci queue` holds it while another landing is in flight"
                     .into()
             }
-            Stage::Passed => "run `ci land` when the topic is ready to deliver".into(),
+            Stage::Passed => {
+                "run `ci land` when the topic is ready to deliver, or `ci queue` while another landing is in flight"
+                    .into()
+            }
             Stage::Failed => {
                 "inspect the failed pipeline, fix the topic, and `ci dispatch` again".into()
             }
@@ -185,7 +190,9 @@ impl Observation {
 }
 
 /// The protocol steps the machine accepts, tried on a copy of it. `ci land`
-/// joins the landing queue and lands from its front, so its step is both.
+/// takes the runway and lands from it, so its step is both; `ci queue` holds
+/// the topic for the drainer. Other landings are not observed, so the runway
+/// counts as clear.
 fn allowed(machine: &Machine) -> Vec<&'static str> {
     let steps = [
         (
@@ -198,7 +205,8 @@ fn allowed(machine: &Machine) -> Vec<&'static str> {
         ("resolve", vec![Event::Resolve]),
         ("validate", vec![Event::Validate]),
         ("publish", vec![Event::Publish]),
-        ("land", vec![Event::Queue, Event::Land]),
+        ("land", vec![Event::TakeRunway, Event::Land]),
+        ("queue", vec![Event::Hold]),
         (
             "finish",
             vec![Event::Finish {

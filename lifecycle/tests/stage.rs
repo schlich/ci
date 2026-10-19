@@ -99,7 +99,7 @@ fn allowed_steps_come_from_the_machine() {
     );
     assert_eq!(
         allowed(json!({ "published_head": "c1", "github":"success" })),
-        ["rebase", "validate", "land"]
+        ["rebase", "validate", "land", "queue"]
     );
     assert_eq!(
         allowed(json!({ "landed": true, "published_head": "c1" })),

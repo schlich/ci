@@ -1817,7 +1817,7 @@ fn draw_trunk_side(frame: &mut Frame, area: Rect, app: &App) {
         let (label, color) = if place == 0 {
             ("LANDING", theme.warn)
         } else {
-            ("QUEUED", theme.accent)
+            ("WAITING", theme.accent)
         };
         lines.push(field(
             theme,
@@ -1833,6 +1833,23 @@ fn draw_trunk_side(frame: &mut Frame, area: Rect, app: &App) {
                     text_w,
                 ),
                 theme.fg(color),
+            )],
+        ));
+    }
+    for held in &app.locks.held {
+        let since = held
+            .since_ms
+            .map(|s| format!(" · {}", time::duration(now - s)))
+            .unwrap_or_default();
+        lines.push(field(
+            theme,
+            "HELD",
+            vec![Span::styled(
+                truncate(
+                    &format!("{} \"{}\"{since}", held.change(), held.title()),
+                    text_w,
+                ),
+                theme.fg(theme.accent),
             )],
         ));
     }
@@ -1944,6 +1961,7 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("p", "preflight"),
             ("d", "dispatch"),
             ("l", "land"),
+            ("Q", "queue"),
             ("P", "park"),
             ("r", "rebase"),
             ("c", "conflicts"),
@@ -2158,7 +2176,8 @@ fn draw_confirm(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(""));
     let about = match pending.action {
         Action::Dispatch => "Rebases onto main@tangled, runs preflight, and pushes the topic branch to Tangled.",
-        Action::Land => "Dispatches, builds every flake check on this machine (holding the local checks lock), then fast-forwards main on Tangled and GitHub and tags any release.",
+        Action::Land => "Takes the runway only if it is clear, then dispatches, builds every flake check on this machine (holding the local checks lock), fast-forwards main on Tangled and GitHub, and tags any release. With a landing in flight or a topic held, it refuses; queue instead.",
+        Action::Queue => "Dispatches and runs the fast checks, then holds this exact head for the drainer, which lands held topics in turn (together as a train when they share a repository) without this run waiting. An edit afterwards drops the hold.",
         Action::Park => "Checks that the topic landed, deletes its branch, and frees the workspace.",
         Action::Cancel => "Deletes the topic branch and abandons its revisions above trunk. `ci recover` with the printed checkpoint recovers it.",
         Action::StopRun => "Sends SIGTERM to the run's process group. ci checkpoints before history surgery; inspect the workspace afterwards.",

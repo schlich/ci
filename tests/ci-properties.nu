@@ -1224,45 +1224,106 @@ for-all "error-summary keeps the message's first line and adds only a label it l
     assert (not ($summary | str contains "second")) $summary
 }
 
-# The landing queue (2026-10-16): landings that ran at once threw away one
-# another's clearance and restarted, up to five times each. Tickets are drawn
-# in arrival order and never twice, a landing runs only at the front, a dead
+# The runway (2026-10-16): landings that ran at once threw away one another's
+# clearance and restarted, up to five times each. Tickets are drawn in
+# arrival order and never twice, a landing runs only from the runway, a dead
 # landing's ticket gives way, and a ticket leaves however its landing ends.
 
 with-env { XDG_STATE_HOME: $outcome_dir } {
-    let queue = (landing-queue-path)
-    assert equal (with-landing-queue 'kxqueue "alone"' { 9 }) 9
-    assert equal (landing-queue $queue) [] "the ticket outlived the landing"
+    let queue = (runway-path)
+    assert equal (with-runway 'kxqueue "alone"' { 9 }) 9
+    assert equal (runway-tickets $queue) [] "the ticket outlived the landing"
 
     let live = ({ topic: 'klive "live"' pid: $nu.pid start: (process-start $nu.pid) workspace: "/w/a" } | to json --raw)
     let dead = ({ topic: 'kdead "dead"' pid: 99999999 start: "1" workspace: "/w/b" } | to json --raw)
-    let drawn = (0..7 | par-each {|_| enqueue-landing $queue $live } | each {|path| landing-ticket-number $path } | sort)
+    let drawn = (0..7 | par-each {|_| draw-ticket $queue $live } | each {|path| landing-ticket-number $path } | sort)
     assert equal ($drawn | uniq | length) 8 $"concurrent landings drew the same ticket: ($drawn)"
-    assert equal (landing-queue $queue | get number) $drawn
+    assert equal (runway-tickets $queue | get number) $drawn
     ls $queue | get name | each {|path| rm $path } | ignore
 
-    let gone = (enqueue-landing $queue $dead)
-    let front = (enqueue-landing $queue $live)
-    let next = (enqueue-landing $queue $live)
+    let gone = (draw-ticket $queue $dead)
+    let front = (draw-ticket $queue $live)
+    let next = (draw-ticket $queue $live)
     assert ((landing-ticket-number $front) < (landing-ticket-number $next)) "a later landing drew a lower ticket"
-    assert equal (landing-queue $queue | get path) [$front $next] "a dead landing kept its place"
+    assert equal (runway-tickets $queue | get path) [$front $next] "a dead landing kept its place"
     assert (not ($gone | path exists)) "a dead landing's ticket was not removed"
-    assert equal (landing-queue-wait (landing-queue $queue)) $"Waiting to land behind klive \"live\" \(pid ($nu.pid)) and 1 more."
-    assert equal (landing-queue-wait (landing-queue $queue | first 1)) $"Waiting to land behind klive \"live\" \(pid ($nu.pid))."
+    assert equal (runway-wait (runway-tickets $queue)) $"Waiting for the runway behind klive \"live\" \(pid ($nu.pid)) and 1 more."
+    assert equal (runway-wait (runway-tickets $queue | first 1)) $"Waiting for the runway behind klive \"live\" \(pid ($nu.pid))."
 
-    # A landing behind live tickets runs only once every one of them leaves.
+    # `ci land` refuses a busy runway at once and gives its ticket back.
+    let refused = (with-runway 'kxqueue "now"' --alone --busy {|ahead| $"busy: ($ahead)" } { "landed" })
+    assert equal $refused $"busy: klive \"live\" \(pid ($nu.pid)) is landing, with 1 more behind it"
+    assert equal (runway-tickets $queue | get path) [$front $next] "a refused landing kept its ticket"
+
+    # A drainer's landing waits behind live tickets, and runs only once every
+    # one of them leaves.
     job spawn { sleep 1sec; rm $front; sleep 1sec; rm $next } | ignore
-    let waited = (with-landing-queue 'kxqueue "behind"' {
+    let waited = (with-runway 'kxqueue "behind"' {
         [$front $next] | all {|path| not ($path | path exists) }
     })
-    assert $waited "a landing ran before the ones ahead of it left the queue"
-    assert equal (landing-queue $queue) [] "the waiting landing's ticket outlived it"
+    assert $waited "a landing ran before the ones ahead of it left the runway"
+    assert equal (runway-tickets $queue) [] "the waiting landing's ticket outlived it"
 
-    let raised = (try { with-landing-queue 'kxqueue "fails"' { error make { msg: "boom" } }; null } catch {|err| $err.msg })
+    let raised = (try { with-runway 'kxqueue "fails"' { error make { msg: "boom" } }; null } catch {|err| $err.msg })
     assert equal $raised "boom"
-    assert equal (landing-queue $queue) [] "a failed landing kept its ticket"
+    assert equal (runway-tickets $queue) [] "a failed landing kept its ticket"
 }
-print "ok landing queue"
+print "ok runway"
+
+# Holds (`ci queue`): a held topic keeps `ci land` off a clear runway, so no
+# session lands ahead of it. A landing the drainer flies for a hold takes its
+# place on the runway before the hold goes, held topics come back oldest
+# first, a flight groups holds of one repository and clearance, a finished
+# hold leaves the outcome `watch-job` reads, and the drainer leaves only
+# once no hold waits.
+
+with-env { XDG_STATE_HOME: $outcome_dir } {
+    let holds = (holds-path)
+    mkdir ($holds | path join "logs")
+    let hold = {|name, repo, clearance|
+        let log = ($holds | path join "logs" $"($name).log")
+        "" | save --force $log
+        let record = { topic: $"k($name) \"($name)\"" change: $"k($name)" head: $"h($name)" branch: $"jj-($name)" repo: $repo workspace: "/w/none" clearance: $clearance timeout_sec: 60 attempts: 1 launcher: "ci" ci_script: null held_at: (date now | format date '%+') log: $log }
+        draw-ticket $holds ($record | to json --raw)
+    }
+    let first = (do $hold "a" "/r/one" "local")
+    let second = (do $hold "b" "/r/two" "local")
+    let third = (do $hold "c" "/r/one" "local")
+    let fourth = (do $hold "d" "/r/one" "github")
+    assert equal (held-topics | get path) [$first $second $third $fourth] "holds came back out of order"
+    assert equal (next-flight (held-topics) | get hold.change) [ka kc] "a flight mixed repositories or clearances"
+
+    let refused = (with-runway 'kxqueue "now"' --alone --busy {|ahead| $ahead } { "landed" })
+    assert equal $refused "4 topics are held for the drainer, first ka \"a\", but no drainer is running: `ci queue drain` lands them, or `ci queue drop` in their workspace takes one out" "ci land landed ahead of a held topic"
+    assert equal (runway-tickets (runway-path)) [] "a refused landing kept its ticket"
+
+    # The drainer's landing for a hold drops it once its ticket is drawn.
+    let flown = (with-runway 'ka "a"' --hold $"($first):($third)" {
+        [$first $third] | all {|path| not ($path | path exists) }
+    })
+    assert $flown "a flown hold outlived its landing's ticket"
+
+    let lock = (drainer-lock-path)
+    let claim = ({ topic: 'drainer "test"' pid: $nu.pid start: (process-start $nu.pid) } | to json --raw)
+    $claim | save --force $lock
+    assert (not (release-idle-drainer $lock $claim)) "the drainer left while holds waited"
+    assert ($lock | path exists)
+
+    let waiting = (held-topics)
+    finish-hold ($waiting | first) { exit_code: 0 }
+    finish-hold ($waiting | last) { exit_code: 1 error: "dropped: by test" }
+    assert equal (open ($holds | path join "logs" "b.log.done.nuon")) { exit_code: 0 }
+    assert equal (open ($holds | path join "logs" "d.log.done.nuon") | get error) "dropped: by test"
+    assert ((open --raw ($holds | path join "logs" "d.log")) | str contains "dropped: by test") "the log does not say how the hold ended"
+    let outcomes = (open --raw ($holds | path join "outcomes.jsonl") | lines | each {|line| $line | from json })
+    assert equal ($outcomes | get topic) ['kb "b"' 'kd "d"']
+    assert equal (held-topics) [] "a finished hold stayed held"
+    assert (release-idle-drainer $lock $claim) "an idle drainer kept its lock"
+    assert (not ($lock | path exists))
+    assert equal (with-runway 'kxqueue "now"' --alone --busy {|ahead| "refused" } { "landed" }) "landed" "ci land refused a clear runway"
+    rm --recursive --force $holds
+}
+print "ok holds"
 
 # A train (`ci land --train`): dispatched topics rebase into one chain and
 # take clearance once. A refactor that changes a closure stays out, a failing
@@ -1330,7 +1391,7 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
     assert equal (revision-id "jj-c") (revision-id "jj-c@tangled") "a returned topic was not pushed"
     assert equal (revision-id "jj-r") $refactor "a refactor that changes a closure was moved"
     assert ((^jj tag list | lines | length) == 1) "the landed behavior change was not released"
-    assert equal (landing-queue (landing-queue-path)) [] "the train kept its ticket"
+    assert equal (runway-tickets (runway-path)) [] "the train kept its ticket"
     let kept = (glob ($outcome_dir | path join "jj-ci" "topics" "*.lock") | where {|lock| (open --raw $lock) =~ 'topic [rabc]' })
     assert ($kept | is-empty) $"the train kept topic locks: ($kept)"
 
@@ -1340,6 +1401,14 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
     assert equal (revision-id "main@tangled") (revision-id "jj-c") "the train did not land its tip"
     assert (revset-change-ids "jj-b & ::main@tangled" | is-not-empty) "the train left a topic behind"
     assert equal (revision-id "jj-r") $refactor
+
+    # The drainer lands a hold only while its workspace still has the held
+    # change checked out at the held head.
+    let held = { workspace: $train_repo change: (current-topic-id) head: (current-change 'commit_id') }
+    assert equal (hold-problem $held) null
+    assert ((hold-problem ($held | update head "0000")) | str contains "changed since it was queued")
+    assert ((hold-problem ($held | update change "kother")) | str contains "no longer has the held change")
+    assert ((hold-problem ($held | update workspace "/nonexistent")) | str contains "is gone")
 }
 rm --recursive --force $train_repo $train_remote $train_config
 print "ok land train"

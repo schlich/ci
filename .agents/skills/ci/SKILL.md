@@ -78,8 +78,9 @@ Use the narrowest workflow that matches the request:
 | Align an empty working copy with trunk | `ci sync` | Fetches the trunk remote, advances `main`, and rebases onto `trunk()`. |
 | Check readiness and run preflight checks | `ci preflight` | Describes an undescribed change, runs `jj fix -s @`, then Prek on the JJ file list; a repository with no Prek configuration skips Prek. |
 | Dispatch the current change | `ci dispatch` | Refuses unclassified or mixed-impact topics, then rebases, validates, and pushes a stable `jj-*` bookmark to the trunk remote. Keeps editing the same change. A topic built on another dispatched topic, or reported by `ci sequence` as conflicting with one, is restacked onto that topic's branch; conflicts must be resolved locally first. Open a pull request from the branch on the trunk's forge for review; never merge it there. |
-| Land a topic on `main` | `ci land` | Requires an explicit user request. Dispatches, refuses a stacked topic until its parent lands, and proves a refactor is closure-neutral before it waits. It then waits in this machine's landing queue (a `blocked` `landing-queue` record names the landing ahead). From the front, it rebases only if `main` moved, builds every flake check at the exact head on this machine (skipping cached outputs), fast-forwards `main` to it on the trunk remote (setting a `ci land` commit status first where that is GitHub) and on the mirror, and tags releases. No other landing moves `main` meanwhile, so concurrent landings never restart one another; start them at once rather than one after another. `--clearance github` or `--clearance nixbot` waits for that CI on the exact head instead (`--timeout`, default 2hr); in a repository with `nixbot.toml` every dispatch already mirrors the topic for nixbot to build. Only if something outside the queue moves `main` during clearance does it rebase, redispatch, and clear the new head again (`--attempts`, default 5). `ci dispatch --land` does the same. Never merge a GitHub pull request; squash and rebase merges rewrite the tested commit. |
-| Land every dispatched topic at once | `ci land --train` | Requires an explicit user request to land them all. Waits in the landing queue, rebases the dispatched, conflict-free topics into one chain in `ci sequence` order, proves each refactor against the chain below it, clears the tip once, fast-forwards `main`, and tags a release per user-facing revision. On a failed clearance it bisects, lands the passing prefix, names the culprit, and returns the rest to `main`. Skips topics with undispatched edits, conflicts, mixed or missing impact, or a held topic lock, and lists why. |
+| Land a topic on `main` | `ci land` | Requires an explicit user request. Dispatches, refuses a stacked topic until its parent lands, and proves a refactor is closure-neutral. It then takes this machine's runway only if it is clear: with another landing in flight or a topic held for the drainer, it fails at once naming them; use `ci queue` then. On the runway, it rebases only if `main` moved, builds every flake check at the exact head on this machine (skipping cached outputs), fast-forwards `main` to it on the trunk remote (setting a `ci land` commit status first where that is GitHub) and on the mirror, and tags releases. No other landing moves `main` meanwhile, so landings never restart one another. `--clearance github` or `--clearance nixbot` waits for that CI on the exact head instead (`--timeout`, default 2hr); in a repository with `nixbot.toml` every dispatch already mirrors the topic for nixbot to build. Only if something outside the queue moves `main` during clearance does it rebase, redispatch, and clear the new head again (`--attempts`, default 5). `ci dispatch --land` does the same. Never merge a GitHub pull request; squash and rebase merges rewrite the tested commit. |
+| Land a topic while another is in flight | `ci queue` | Requires the same explicit user request as `ci land`. Dispatches, runs the same fast checks, and holds the exact head for the drainer, a transient systemd unit that lands held topics in turn, as one train when several share a repository and clearance. Returns in seconds and prints the hold's log; follow it with a Monitor running `watch-job LOG` to the landing's DONE line rather than polling. An edit to the topic after queueing drops the hold; queue again to land the new head. `ci queue list` shows the line and recent outcomes; `ci queue drop` takes the topic out. |
+| Land every dispatched topic at once | `ci land --train` | Requires an explicit user request to land them all. Takes only a clear runway, rebases the dispatched, conflict-free topics into one chain in `ci sequence` order, proves each refactor against the chain below it, clears the tip once, fast-forwards `main`, and tags a release per user-facing revision. On a failed clearance it bisects, lands the passing prefix, names the culprit, and returns the rest to `main`. Skips topics with undispatched edits, conflicts, mixed or missing impact, or a held topic lock, and lists why. |
 | Decide whether a topic ships alone or stacked | `ci sequence` | Read-only apart from a fetch. Trial-merges in-flight topics (dispatched `jj-*` bookmarks and workspace changes) against `trunk()` and each other, then proposes independent topics or stacks. `--json` for structured output. |
 | Update a topic from trunk | `ci rebase` | Checkpoints, fetches, and rebases the same change. |
 | Undo a failed rebase, restack, sync, or cancel | `ci recover [<id>]` | Reverts only the operations of the checkpoint printed as `Recovery point: ci recover ID` (default: this workspace's latest), keeping every other workspace's operations since. Refuses once a commit the rewrite made was edited or resolved. Never `jj op restore` a recovery point: it rewinds every workspace. |
@@ -103,8 +104,9 @@ Use the narrowest workflow that matches the request:
   Use `ci rebase` to update an active topic without creating another change.
 - Do not dispatch an empty or conflicted change. `ci dispatch` enforces this,
   but inspect the state first so the user understands the blocker.
-- Do not run `ci land` or `ci dispatch --land` unless the user explicitly
-  asks to deliver the topic.
+- Do not run `ci land`, `ci dispatch --land`, or `ci queue` unless the user
+  explicitly asks to deliver the topic. A request to land covers `ci queue`
+  when `ci land` refuses a busy runway; say that it was queued.
 - Do not activate NixOS or Home Manager configuration as part of validation.
   If configuration changes are ready, report the appropriate activation command
   and request approval separately.
@@ -125,9 +127,11 @@ dispatching; `ci land` takes clearance locally. It does not start
 an unrelated follow-up change. Report the branch and existing change IDs.
 
 Land only at requested topic closeout. Once `ci land` has fast-forwarded
-`main`, `ci park` verifies the landing and prepares a clean workspace.
-Then archive through the app tool. Leave the task open if clearance failed,
-landing is pending, or there are later local edits. SessionEnd also fires on
+`main`, or a queued topic's hold log reports a DONE with exit 0, `ci park`
+verifies the landing and prepares a clean workspace. Then archive through
+the app tool. Leave the task open if clearance failed, landing is pending,
+the topic is still held, or there are later local edits; do not edit a held
+topic unless the user wants it requeued. SessionEnd also fires on
 exit and idle timeout, so it must never trigger dispatch or landing. A
 direct archive button click does not run this workflow.
 

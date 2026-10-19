@@ -1058,17 +1058,26 @@ def with-topic-lock [change: string, body: closure] {
 # clearance, and fast-forwarded main outside any lock, so a topic that landed
 # while another's clearance ran threw that clearance away. Landings that ran
 # alone took about 4 minutes; five at once took 30 to 77 minutes each, and two
-# never landed. So landing is a queue shared by every workspace and session
-# on this machine: each waiting landing holds a ticket, numbered in arrival
-# order, and only the lowest live ticket may rebase onto main, take
-# clearance, fast-forward main, and tag releases. A landing rebases once it
-# reaches the front, onto a main that no other landing here moves until it
-# is done, so N landings cost about N clearances.
+# never landed. So landings share one runway on this machine: each landing
+# holds a ticket, numbered in arrival order, and only the lowest live ticket
+# may rebase onto main, take clearance, fast-forward main, and tag releases. A
+# landing rebases once it reaches the runway, onto a main that no other
+# landing here moves until it is done, so N landings cost about N clearances.
+#
+# One topic is in flight at a time, and only one lands from a session: `ci
+# land` takes the runway only when it is clear, with no live ticket ahead of
+# its own and no topic held for the drainer. Otherwise it gives its ticket
+# back and refuses, naming what is in flight, rather than keep a session
+# waiting for a turn it may not live to see. `ci queue` holds the topic
+# instead, and the drainer, which lands held topics a flight at a time, waits
+# its turn on the runway like any landing. The tickets stay in
+# `landing-queue`, where earlier copies of ci keep them, so every copy on
+# this machine shares one runway.
 #
 # Locks are taken in one order, so no two processes ever wait on each other:
-# a topic lock (never waited for), then the landing queue, then the local
-# checks lock. Nothing that holds the local checks lock waits for the queue.
-def landing-queue-path [] {
+# a topic lock (never waited for), then the runway, then the local checks
+# lock. Nothing that holds the local checks lock waits for the runway.
+def runway-path [] {
     $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "landing-queue"
 }
 
@@ -1079,26 +1088,26 @@ def landing-ticket-number [path: string] {
     try { $parsed.stem | into int } catch { null }
 }
 
-# Take a ticket behind every landing already waiting: one more than the
-# highest ticket in `queue`, drawn under flock(1) on a guard file, so two
-# landings that arrive together never draw the same number and a later
+# Draw a ticket behind every one already in `dir`, a runway or the holds:
+# one more than the highest ticket there, drawn under flock(1) on a guard
+# file, so two that arrive together never draw the same number and a later
 # arrival never draws a lower one. The ticket is renamed into place whole, so
 # no reader sees half of one. Returns its path.
-def enqueue-landing [queue: string, claim: string] {
+def draw-ticket [dir: string, claim: string] {
     let take = 'let numbers = (ls $env.QUEUE | get name | each {|path| let parsed = ($path | path parse); if $parsed.extension == "json" { try { $parsed.stem | into int } catch { null } } } | compact); let next = ($numbers | append 0 | math max) + 1; let path = ($env.QUEUE | path join $"($next | fill --alignment right --character "0" --width 12).json"); $env.CLAIM | save --force $"($path).tmp"; mv --force $"($path).tmp" $path; print --no-newline $path'
-    let result = (with-env { QUEUE: $queue CLAIM: $claim } {
-        ^flock ($queue | path join ".guard") $nu.current-exe --no-config-file --commands $take | complete
+    let result = (with-env { QUEUE: $dir CLAIM: $claim } {
+        ^flock ($dir | path join ".guard") $nu.current-exe --no-config-file --commands $take | complete
     })
     if $result.exit_code != 0 {
-        error make { msg: $"joining the landing queue in ($queue) failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
+        error make { msg: $"drawing a ticket in ($dir) failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
     }
     $result.stdout | str trim
 }
 
-# The live tickets in `queue`, oldest first, as { number, path, holder }. A
-# ticket whose landing has exited, or that cannot be read, is removed, so a
-# landing that was killed never holds up the ones behind it.
-def landing-queue [queue: string] {
+# The live tickets on the runway `queue`, oldest first, as { number, path,
+# holder }. A ticket whose landing has exited, or that cannot be read, is
+# removed, so a landing that was killed never holds up the ones behind it.
+def runway-tickets [queue: string] {
     ls $queue | get name | each {|path|
         let number = (landing-ticket-number $path)
         if $number == null { return null }
@@ -1113,21 +1122,53 @@ def landing-queue [queue: string] {
 }
 
 # What a landing waiting behind the live tickets `ahead` reports: the landing
-# at the front, and how many more wait between it and this one.
-def landing-queue-wait [ahead: list] {
+# on the runway, and how many more wait between it and this one.
+def runway-wait [ahead: list] {
     let front = ($ahead | first | get holder)
     let more = ($ahead | length) - 1
     let others = if $more > 0 { $" and ($more) more" } else { "" }
-    $"Waiting to land behind ($front.topic? | default 'another topic') \(pid ($front.pid? | default '?'))($others)."
+    $"Waiting for the runway behind ($front.topic? | default 'another topic') \(pid ($front.pid? | default '?'))($others)."
 }
 
-# Run `body` once this landing, named `topic`, reaches the front of the
-# landing queue. While landings are ahead of it, it reports blocked under
-# `landing-queue` whenever the front or the count changes, so `watch-job`
-# shows the wait. The ticket leaves the queue however `body` ends; if this
-# process is killed instead, the next landing finds it dead and drops it.
-def with-landing-queue [topic: string, body: closure] {
-    let queue = (landing-queue-path)
+# Why the runway is not clear for `ci land`: the live tickets `ahead` and the
+# topics `held` for the drainer, as one sentence.
+def runway-busy [ahead: list, held: list] {
+    let landing = if ($ahead | is-empty) { null } else {
+        let front = ($ahead | first | get holder)
+        let more = ($ahead | length) - 1
+        let others = if $more > 0 { $", with ($more) more behind it" } else { "" }
+        $"($front.topic? | default 'another topic') \(pid ($front.pid? | default '?')) is landing($others)"
+    }
+    let holding = if ($held | is-empty) { null } else {
+        let count = ($held | length)
+        let topics = if $count == 1 { "1 topic is" } else { $"($count) topics are" }
+        let idle = if (drainer-alive) { "" } else { ", but no drainer is running: `ci queue drain` lands them, or `ci queue drop` in their workspace takes one out" }
+        $"($topics) held for the drainer, first ($held | first | get hold.topic)($idle)"
+    }
+    [$landing $holding] | compact | str join "; "
+}
+
+# Whether a drainer is running. A drainer that was stopped leaves its holds
+# behind, and they keep `ci land` off the runway until one lands them.
+def drainer-alive [] {
+    let holder = (try { open --raw (drainer-lock-path) | from json } catch { null })
+    $holder != null and (try { lock-holder-alive $holder } catch { false })
+}
+
+# Run `body` once this landing, named `topic`, holds the runway. While
+# landings are ahead of it, it reports working under `runway` whenever the
+# front or the count changes, so `watch-job` shows the wait: waiting one's
+# turn is progress, not something for a person to unblock. The ticket leaves
+# the runway however `body` ends; if this process is killed instead, the next
+# landing finds it dead and drops it.
+#
+# `--alone` is `ci land`: unless the runway is clear, the ticket goes back at
+# once and `busy` runs instead of `body`, given why. `--hold` names the hold
+# files of the topics this landing flies for the drainer (several, joined by
+# ":", for a train). They go once the ticket is drawn, which keeps their
+# place: no `ci land` finds the runway clear between the two.
+def with-runway [topic: string, body: closure, --alone, --busy: closure, --hold: string] {
+    let queue = (runway-path)
     mkdir $queue
     let claim = ({
         topic: $topic
@@ -1135,28 +1176,285 @@ def with-landing-queue [topic: string, body: closure] {
         start: (process-start $nu.pid)
         workspace: $env.PWD
     } | to json --raw)
-    let ticket = (enqueue-landing $queue $claim)
+    let ticket = (draw-ticket $queue $claim)
     let number = (landing-ticket-number $ticket)
+    if $hold != null {
+        for path in ($hold | split row ":" | where {|path| $path | is-not-empty }) { rm --force $path }
+    }
+    if $alone {
+        let ahead = (runway-tickets $queue | where number < $number)
+        let held = (held-topics)
+        if ($ahead | is-not-empty) or ($held | is-not-empty) {
+            rm --force $ticket
+            return (do $busy (runway-busy $ahead $held))
+        }
+    }
     let outcome = try {
         mut announced = ""
         loop {
-            let ahead = (landing-queue $queue | where number < $number)
+            let ahead = (runway-tickets $queue | where number < $number)
             if ($ahead | is-empty) { break }
-            let waiting = (landing-queue-wait $ahead)
+            let waiting = (runway-wait $ahead)
             if $waiting != $announced {
                 print $waiting
-                # Blocked on other landings, not a person, so no --kind.
-                report-status blocked $waiting --id landing-queue
+                report-status working $waiting --id runway
                 $announced = $waiting
             }
             sleep 5sec
         }
-        if $announced != "" { report-status clear --id landing-queue }
+        if $announced != "" { report-status done "On the runway" --id runway }
         { value: (do $body) error: null }
     } catch {|err| { value: null error: $err } }
     rm --force $ticket
     if $outcome.error != null { error make $outcome.error.raw }
     $outcome.value
+}
+
+# `ci queue` holds a dispatched topic for the drainer instead of taking the
+# runway. A hold is a ticket in `landing-holds`, drawn like a runway ticket,
+# that names the exact head it holds, where its topic lives, how to land it,
+# and the log its owner can follow with `watch-job`. Holds outlive the
+# session that made them, which may end at once: the drainer, a transient
+# systemd unit, lands them in turn and leaves each one's outcome in its log's
+# `.done.nuon`, as job-log does, and in `outcomes.jsonl`.
+def holds-path [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "landing-holds"
+}
+
+# Who drains the holds, claimed like the local checks lock: one drainer runs
+# at a time, and a second one exits as soon as it finds the first alive.
+def drainer-lock-path [] {
+    $env.XDG_STATE_HOME? | default ($env.HOME | path join ".local" "state") | path join "jj-ci" "landing-drainer.lock"
+}
+
+# The topics held for the drainer, oldest first, as { number, path, hold }. A
+# hold that cannot be read is dropped. Holds have no process behind them, so
+# unlike runway tickets they never lapse.
+def held-topics [] {
+    let dir = (holds-path)
+    if not ($dir | path exists) { return [] }
+    ls $dir | get name | each {|path|
+        let number = (landing-ticket-number $path)
+        if $number == null { return null }
+        let hold = (try { open --raw $path | from json } catch { null })
+        if $hold == null { rm --force $path; return null }
+        { number: $number path: $path hold: $hold }
+    } | compact | sort-by number
+}
+
+# The settings a child `ci` started for the drainer must keep: systemd starts
+# a user unit with almost none of the caller's environment.
+def drainer-environment [] {
+    const KEEP = [PATH HOME USER LOGNAME SHELL LANG XDG_STATE_HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_RUNTIME_DIR NU_LIB_DIRS SSH_AUTH_SOCK NIX_PATH NIX_SSL_CERT_FILE SSL_CERT_FILE GIT_SSH_COMMAND JJ_CONFIG XS_ADDR]
+    $env | transpose name value | where {|var|
+        $var.name in $KEEP or ($var.name | str starts-with "CI_") or ($var.name | str starts-with "OTEL_")
+    } | each {|var|
+        let kind = ($var.value | describe)
+        let value = if ($kind | str starts-with "list") { $var.value | str join (char esep) } else if $kind == "string" { $var.value } else { null }
+        if $value == null { null } else { { name: $var.name value: $value } }
+    } | compact
+}
+
+# Start the drainer as a transient user unit unless a live one runs, and
+# return its pid. It runs through the `ci` launcher from this workspace, so it
+# is the same ci.nu this command runs.
+def ensure-drainer [launcher: string] {
+    let lock = (drainer-lock-path)
+    let holder = (try { open --raw $lock | from json } catch { null })
+    if $holder != null and (try { lock-holder-alive $holder } catch { false }) { return $holder.pid }
+    let unit = $"ci-landing-drain-(date now | format date '%Y%m%d%H%M%S')-(random chars --length 4)"
+    let setenv = (drainer-environment | each {|var| $"--setenv=($var.name)=($var.value)" })
+    let started = (^systemd-run --user --collect --quiet $"--unit=($unit)" $"--working-directory=($env.PWD)" ...$setenv -- $launcher queue drain --unit $unit | complete)
+    if $started.exit_code != 0 {
+        error make { msg: $"starting the drainer failed with exit code ($started.exit_code): ($started.stderr | str trim)" }
+    }
+    let pid = (^systemctl --user show --property MainPID --value $unit | complete | get stdout | str trim)
+    try { $pid | into int } catch { null }
+}
+
+# Hold the dispatched topic `published` for the drainer, to land with
+# `clearance`, `timeout`, and `attempts`, and start the drainer. Returns the
+# hold, its path, and how many holds wait ahead of it.
+def hold-topic [published: record, clearance: string, timeout: duration, attempts: int] {
+    let launcher = (which ci | get --optional 0.path)
+    if $launcher == null {
+        error make { msg: "`ci queue` needs the `ci` launcher on PATH: the drainer runs it to land the topic." }
+    }
+    let dir = (holds-path)
+    let logs = ($dir | path join "logs")
+    mkdir $logs
+    let change = (current-topic-id)
+    let log = ($logs | path join $"(date now | format date '%Y%m%dT%H%M%S')-($change | str substring 0..<8).log")
+    let hold = {
+        topic: (lock-topic $published.head)
+        change: $change
+        head: $published.head
+        branch: $published.branch
+        repo: (git-command "locating the repository" { ^jj git root })
+        workspace: (git-command "locating the workspace" { ^jj root })
+        clearance: $clearance
+        timeout_sec: ($timeout / 1sec | into int)
+        attempts: $attempts
+        launcher: $launcher
+        ci_script: ($env.CI_SCRIPT? | default null)
+        held_at: (date now | format date '%+')
+        log: $log
+    }
+    $"Held ($hold.topic) at ($hold.head | str substring 0..11) for the drainer.\n" | save --force $log
+    let path = (draw-ticket $dir ($hold | to json --raw))
+    let number = (landing-ticket-number $path)
+    let pid = (ensure-drainer $launcher)
+    hold-job-record $hold ($pid | default $nu.pid)
+    { hold: $hold path: $path ahead: (held-topics | where number < $number | length) }
+}
+
+# Write the `.job.nuon` that `watch-job` reads for a hold's log, naming the
+# drainer `pid` as its owner: once that process exits without a result, the
+# watcher reports the landing lost.
+def hold-job-record [hold: record, pid: int] {
+    {
+        pid: $pid
+        task: $"ci land ($hold.topic)"
+        cwd: $hold.workspace
+        started: ($hold.held_at | into datetime)
+    } | save --force $"($hold.log).job.nuon"
+}
+
+# End `held`, a { path, hold } record, with `outcome`, as job-log ends a job:
+# its `.done.nuon` and a line in `outcomes.jsonl`. The hold file goes too,
+# if a landing has not taken it already.
+def finish-hold [held: record, outcome: record] {
+    rm --force $held.path
+    let reason = if ($outcome.error? | is-empty) { "landed" } else { $outcome.error }
+    try { $"($reason)\n" | save --append $held.hold.log }
+    try { $outcome | save --force $"($held.hold.log).done.nuon" }
+    let record = ({ at: (date now | format date '%+') topic: $held.hold.topic head: $held.hold.head log: $held.hold.log } | merge $outcome)
+    try { $"($record | to json --raw)\n" | save --append ((holds-path) | path join "outcomes.jsonl") }
+}
+
+# Why `hold` cannot land as held, or null when it can: its workspace must
+# still have the held change checked out at the held head, and that change
+# must not be on trunk already.
+def hold-problem [hold: record] {
+    if not ($hold.workspace | path join ".jj" | path exists) { return $"its workspace ($hold.workspace) is gone" }
+    let at = (do { cd $hold.workspace; ^jj log -r @ --no-graph -T 'change_id ++ " " ++ commit_id' } | complete)
+    if $at.exit_code != 0 { return $"reading its workspace failed: ($at.stderr | str trim)" }
+    let fields = ($at.stdout | str trim | split row " ")
+    if ($fields | first) != $hold.change { return "its workspace no longer has the held change checked out" }
+    if ($fields | last) != $hold.head { return "it changed since it was queued; `ci queue` it again to land the new head" }
+    null
+}
+
+# The holds the drainer lands next, as one flight: the oldest, and with it
+# every later hold of the same repository and clearance, which fly together
+# as one train. Arrival is the only order for now; ordering the holds by
+# their dependencies would change this function alone.
+def next-flight [held: list] {
+    let lead = ($held | first | get hold)
+    $held | where {|entry| $entry.hold.repo == $lead.repo and $entry.hold.clearance == $lead.clearance }
+}
+
+# Land `flight`, holds that `next-flight` chose and that can land as held,
+# with the `ci` launcher in the lead's workspace: `ci land` for one, a train
+# for more. Its log, status reports, and outcome go to the lead's hold; the
+# others' logs point there.
+def fly [flight: list] {
+    let lead = ($flight | first | get hold)
+    let held = ($flight | get path | str join ":")
+    let common = [--clearance $lead.clearance --timeout $"($lead.timeout_sec)sec" --held $held]
+    let args = if ($flight | length) == 1 {
+        [land ...$common --attempts $lead.attempts]
+    } else {
+        [land --train ...$common]
+    }
+    for entry in ($flight | skip 1) {
+        try { $"Landing in a train led by ($lead.topic); its log is ($lead.log).\n" | save --append $entry.hold.log }
+    }
+    let script = if $lead.ci_script == null { {} } else { { CI_SCRIPT: $lead.ci_script } }
+    let code = (with-env ({ PST_FILE: $"($lead.log).status.jsonl" } | merge $script) {
+        try {
+            cd $lead.workspace
+            ^$lead.launcher ...$args o+e>> $lead.log
+            0
+        } catch {
+            let code = ($env.LAST_EXIT_CODE? | default 1)
+            if $code == 0 { 1 } else { $code }
+        }
+    })
+    let last = (try { open --raw $lead.log | lines | where {|line| $line | str trim | is-not-empty } | last } catch { "" })
+    for entry in $flight {
+        let landed = if ($flight | length) == 1 { $code == 0 } else {
+            let found = (do { cd $lead.workspace; ^jj log -r $"trunk\() & change_id\(($entry.hold.change))" --no-graph -T 'change_id' } | complete)
+            $found.exit_code == 0 and ($found.stdout | str trim | is-not-empty)
+        }
+        let outcome = if $landed { { exit_code: 0 } } else if ($flight | length) == 1 {
+            { exit_code: $code error: $"did not land: ($last)" }
+        } else {
+            { exit_code: 1 error: $"did not land with the train; see ($lead.log)" }
+        }
+        finish-hold $entry $outcome
+    }
+}
+
+# Release the drainer lock `lock`, held with `claim`, but only if no hold
+# waits: the check and the release share the holds' guard with draw-ticket,
+# so a hold drawn at that moment is either seen here or finds the drainer
+# gone and starts another. Returns whether it released.
+def release-idle-drainer [lock: string, claim: string] {
+    let dir = (holds-path)
+    mkdir $dir
+    let release = 'let waiting = (ls $env.HOLDS | get name | where {|path| ($path | path parse | get extension) == "json" }); if ($waiting | is-not-empty) { exit 4 }; let current = (try { open --raw $env.LOCK | into binary | hash sha256 } catch { "absent" }); if $current == $env.EXPECTED { rm --force $env.LOCK }'
+    let result = (with-env { HOLDS: $dir LOCK: $lock EXPECTED: ($claim | hash sha256) } {
+        ^flock ($dir | path join ".guard") $nu.current-exe --no-config-file --commands $release | complete
+    })
+    if $result.exit_code not-in [0 4] {
+        error make { msg: $"releasing the drainer failed with exit code ($result.exit_code): ($result.stderr | str trim)" }
+    }
+    $result.exit_code == 0
+}
+
+# Land every held topic in turn, then exit. Each flight is a child `ci` run,
+# so a failure ends that flight's holds and the drainer goes on to the next.
+def drain-holds [unit?: string] {
+    let lock = (drainer-lock-path)
+    mkdir ($lock | path dirname)
+    let claim = ({
+        topic: 'drainer "ci queue drain"'
+        pid: $nu.pid
+        start: (process-start $nu.pid)
+        unit: $unit
+        workspace: $env.PWD
+    } | to json --raw)
+    let holder = (claim-local-checks-lock $lock $claim)
+    if $holder != null {
+        print $"The drainer is already running \(pid ($holder.pid? | default '?'))."
+        return
+    }
+    let outcome = try {
+        loop {
+            let held = (held-topics)
+            if ($held | is-empty) {
+                if (release-idle-drainer $lock $claim) { break }
+                continue
+            }
+            for entry in $held { try { hold-job-record $entry.hold $nu.pid } }
+            let flight = (next-flight $held | each {|entry|
+                let problem = (try { hold-problem $entry.hold } catch {|err| $err.msg })
+                if $problem == null { $entry } else {
+                    print $"Dropping ($entry.hold.topic): ($problem)."
+                    finish-hold $entry { exit_code: 1 error: $"dropped: ($problem)" }
+                    null
+                }
+            } | compact)
+            if ($flight | is-not-empty) {
+                print $"Landing ($flight | each {|entry| $entry.hold.topic } | str join ', ')."
+                fly $flight
+            }
+        }
+        { error: null }
+    } catch {|err| { error: $err } }
+    swap-local-checks-lock $lock ($claim | hash sha256) "" | ignore
+    if $outcome.error != null { error make $outcome.error.raw }
 }
 
 # How a nix-fast-build run that exited with `exit_code` went, judged by the
@@ -2762,8 +3060,8 @@ def probe-state [probe: closure] {
 # `verify` once the release runs. Preflight is everything before activation;
 # inflight is everything on a running machine. Tools keep plain VCS words.
 def main [] {
-    print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
-    print "Also: `ci tower`, `ci start`, `ci status`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`, `ci trace export`."
+    print "A topic's trip: `ci new` → `ci sequence` → `ci preflight` / `ci sim` → `ci dispatch` → `ci land` on a clear runway, or `ci queue` to be landed in turn → `ci park` (or `ci cancel`), then `ci verify` once the release runs."
+    print "Also: `ci tower`, `ci start`, `ci status`, `ci queue list`, `ci queue drop`, `ci sync`, `ci rebase`, `ci conflicts`, `ci recover`, `ci review snapshot`, `ci interdiff`, `ci unclaim`, `ci prune`, `ci impact set`, `ci impact show`, `ci impact check`, `ci release`, `ci version`, `ci trace export`."
 }
 
 # The control tower: a live terminal view of every workspace's topic, each
@@ -3281,7 +3579,7 @@ def advance-main [head: string, base: string, label: string, clearance: string] 
     let trunk = (trunk)
     let remote = $trunk.remote
     let main = $trunk.bookmark
-    # The landing queue keeps other landings on this machine from moving main,
+    # The runway keeps other landings on this machine from moving main,
     # but another machine, or a push by hand, still may.
     fetch-trunk
     if not (contains-main $head) { return false }
@@ -3323,21 +3621,24 @@ def require-landable [published: record, proven?: string] {
     }
 }
 
-# Land a published topic through the landing queue. The fast checks run
-# before it joins the queue, so a topic that cannot land fails before it
-# waits. Once at the front, it rebases onto main only if main moved while it
-# waited, runs the fast checks again on the new head, and takes clearance. No
-# other landing on this machine moves main from then on; only something else
-# can, such as another machine or a push by hand, and `attempts` bounds how
-# many times that may send it back to rebase and take clearance again. A
-# rebase conflict or failed clearance still stops it.
+# Land a published topic from the runway. The fast checks run before it takes
+# the runway, so a topic that cannot land fails before it holds anyone up.
+# `ci land` takes the runway only when it is clear and refuses otherwise; the
+# drainer, landing a held topic, waits its turn. On the runway, a topic
+# rebases onto main only if main moved meanwhile, runs the fast checks again
+# on the new head, and takes clearance. No other landing on this machine
+# moves main from then on; only something else can, such as another machine
+# or a push by hand, and `attempts` bounds how many times that may send it
+# back to rebase and take clearance again. A rebase conflict or failed
+# clearance still stops it. `--hold` (`ci queue`) holds the topic for the
+# drainer instead of taking the runway.
 # Stately owns the next legal operation and the retry bound. Snapshots stay
 # inside this locked command: restarting an interrupted command re-observes
 # the repository rather than replaying a possibly completed remote effect.
 # CI_AGENT_SCRIPT selects the topic's machine when developing with CI_SCRIPT.
-def topic-agent-step [state?: record, event?: record, --land, --attempts: int = 5] {
+def topic-agent-step [state?: record, event?: record, --land, --hold, --attempts: int = 5] {
     let request = if $state == null {
-        { input: { land: $land attempts: $attempts } }
+        { input: { land: $land hold: $hold attempts: $attempts } }
     } else { { snapshot: $state.snapshot event: $event } }
     if ($env.CI_AGENT_SCRIPT? | is-empty) and (which ci-agent | is-empty) {
         # Only a ci.nu newer than the installed package meets this: the
@@ -3361,17 +3662,26 @@ def topic-agent-step [state?: record, event?: record, --land, --attempts: int = 
 # Execute only the effect named by the machine. Existing operations retain
 # ownership checks, checkpoints, exact-head clearance, and lease-protected
 # fast-forwards. No failure is automatically retried or conflict resolved.
-def drive-topic-agent [state: record, published: record, timeout: duration, gate: string] {
+# `held` names the hold files a drainer's landing flies for: it waits its turn
+# on the runway instead of refusing a busy one.
+def drive-topic-agent [state: record, published: record, timeout: duration, gate: string, --held: string] {
     mut step = $state
     mut current = $published
     mut base = ""
+    # Typed `any`: a bare `null` would fix the variable's type to nothing,
+    # and the hold record assigned later would not fit (2026-10-19).
+    mut holding: any = null
     while not $step.done {
         report-status working $"CI agent: ($step.state)" --id agent
         let active = $step
-        if $active.state == "queueing" {
-            let queued = $current
-            with-landing-queue (lock-topic $queued.head) {
-                drive-topic-agent (topic-agent-step $active { type: QUEUED }) $queued $timeout $gate
+        if $active.state == "approaching" {
+            let approaching = $current
+            with-runway (lock-topic $approaching.head) --alone=($held == null) --hold $held --busy {|ahead|
+                let refused = (topic-agent-step $active { type: RUNWAY_BUSY ahead: $ahead })
+                report-status error $"The runway is busy: ($refused.context.error)" --id runway
+                error make { msg: $"The runway is busy: ($ahead). `ci queue` holds this topic and lands it in turn, without keeping this session waiting." }
+            } {
+                drive-topic-agent (topic-agent-step $active { type: ON_RUNWAY }) $approaching $timeout $gate
             }
             return
         }
@@ -3379,6 +3689,10 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
             "checking" => {
                 require-landable $current
                 { type: LANDABLE }
+            }
+            "holding" => {
+                $holding = (hold-topic $current $gate $timeout $active.context.limit)
+                { type: HELD head: $current.head }
             }
             "refreshing" => {
                 fetch-trunk
@@ -3414,17 +3728,23 @@ def drive-topic-agent [state: record, published: record, timeout: duration, gate
         }
         $step = (topic-agent-step $step $event)
     }
+    if $step.state == "held" {
+        report-status done "CI agent: held" --id agent
+        let ahead = if $holding.ahead == 0 { "first in line" } else { $"behind ($holding.ahead) other held topic\(s)" }
+        print $"Held ($holding.hold.topic) for the drainer, ($ahead). It lands in turn; follow it with `watch-job ($holding.hold.log)`, or see the line with `ci queue list`. `ci queue drop` takes it out."
+        return
+    }
     if $step.state == "exhausted" {
-        error make { msg: $"main moved outside the landing queue during each of ($step.context.limit) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
+        error make { msg: $"main moved outside the runway during each of ($step.context.limit) landing attempts. Nothing landed; run `ci land` again once main is quiet." }
     }
     if $step.state != "landed" { error make { msg: $"CI agent stopped in ($step.state)." } }
     report-status done "CI agent: landed" --id agent
     print $"Landed ($current.branch) on main. `ci park` frees the workspace."
 }
 
-def publish-with-agent [land: bool, attempts: int] {
+def publish-with-agent [land: bool, attempts: int, --hold] {
     # Reject invalid run input before publishing anything.
-    let initial = (topic-agent-step --land=$land --attempts $attempts)
+    let initial = (topic-agent-step --land=$land --hold=$hold --attempts $attempts)
     report-status working "CI agent: publishing" --id agent
     let published = try { publish-topic } catch {|err|
         let blocked = (topic-agent-step $initial { type: FAILED message: (error-summary $err) })
@@ -3487,8 +3807,7 @@ def release-topic-locks [claims: list] {
 }
 
 # Land every dispatched topic that can go in one fast-forward: one
-# clearance for the lot instead of one per topic. From the front of the
-# landing queue, the topics in `ci sequence` order are rebased into one
+# clearance for the lot instead of one per topic. From the runway, the topics in `ci sequence` order are rebased into one
 # linear chain on main. A topic is left out, untouched, when it is not
 # dispatched as it stands, would conflict with the chain, has no single
 # declared impact, or is moved by another `ci` (its topic lock is held). A
@@ -3500,10 +3819,20 @@ def release-topic-locks [claims: list] {
 # one after it return to main for their owners to land again. `checker`
 # and `fingerprint` stand in for the landing gate and closure-fingerprint in
 # tests.
-def land-train [timeout: duration, gate: string, --checker: record, --fingerprint: closure] {
+#
+# Started by `ci land --train`, it takes only a clear runway, as `ci land`
+# does. The drainer passes `held`, the hold files of the topics it flies
+# together: the train then waits its turn and takes only those topics.
+def land-train [timeout: duration, gate: string, --checker: record, --fingerprint: closure, --held: string] {
     let checker = if $checker == null { landing-gate $gate } else { $checker }
     let fingerprint = (select-fingerprint $fingerprint {|flake| closure-fingerprint $flake })
-    with-landing-queue 'train "ci land --train"' {
+    let only = if $held == null { null } else {
+        $held | split row ":" | where {|path| $path | is-not-empty } | each {|path| open --raw $path | from json | get branch }
+    }
+    with-runway 'train "ci land --train"' --alone=($held == null) --hold $held --busy {|ahead|
+        report-status error $"The runway is busy: ($ahead)" --id runway
+        error make { msg: $"The runway is busy: ($ahead). Hold each topic with `ci queue` instead; the drainer lands held topics together as a train." }
+    } {
         fetch-trunk
         checkpoint "train"
         let base = (revision-id "trunk()")
@@ -3517,7 +3846,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                 local-complete { ^jj --repository $root status } | ignore
             }
         }
-        let plan = (build-plan $published | where bookmark != null)
+        let plan = (build-plan $published | where bookmark != null | where {|entry| $only == null or $entry.bookmark in $only })
         let moved = if ($published | is-empty) { [] } else {
             other-workspaces-in $"\(($published | each {|topic| bookmark-revset $topic.name } | str join ' | '))::"
         }
@@ -3605,7 +3934,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
                     let last = ($chain | get ($landed - 1))
                     for entry in ($chain | first $landed) { push-topic-bookmark $entry.name }
                     if not (advance-main $last.head $base $"a train of ($landed) topics" $gate) {
-                        print --stderr "main moved outside the landing queue while the train cleared; nothing landed."
+                        print --stderr "main moved outside the runway while the train cleared; nothing landed."
                         $landed = 0
                     }
                 }
@@ -3654,7 +3983,7 @@ def land-train [timeout: duration, gate: string, --checker: record, --fingerprin
             print $"Landed a train of ($result.landed) topics. Each topic's owner runs `ci park`."
         }
         if ($result.chain | is-not-empty) and $result.landed == 0 {
-            error make { msg: "main moved outside the landing queue while the train cleared. Nothing landed; every topic is back on main. Run `ci land --train` again once main is quiet." }
+            error make { msg: "main moved outside the runway while the train cleared. Nothing landed; every topic is back on main. Run `ci land --train` again once main is quiet." }
         }
     }
 }
@@ -3728,7 +4057,7 @@ def "main dispatch" [
     --land # Land the topic once it has clearance
     --clearance: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
-    --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
+    --attempts: int = 5 # How many times --land starts over when something outside the runway moves main
     --stack # Push one branch per revision for Tangled's stacked pull requests
 ] {
     if $stack {
@@ -3772,18 +4101,22 @@ def "main publish" [
     --land # Land the topic once it has clearance
     --gate: string = "local" # What must pass the head before --land: local, github, or nixbot
     --timeout: duration = 2hr # How long --land waits for the pipeline
-    --attempts: int = 5 # How many times --land starts over when something outside the landing queue moves main
+    --attempts: int = 5 # How many times --land starts over when something outside the runway moves main
 ] {
     renamed "publish" "dispatch"
     main dispatch --land=$land --clearance $gate --timeout $timeout --attempts $attempts
 }
 
+# Land the topic now, from this session. It takes the runway only when the
+# runway is clear: with another landing in flight or a topic held for the
+# drainer, it refuses and names them, and `ci queue` holds the topic instead.
 def "main land" [
     --clearance: string = "local" # What must pass the head: local, github, or nixbot
     --gate: string # Renamed to --clearance
     --timeout: duration = 2hr # How long to wait for the pipeline
-    --attempts: int = 5 # How many times to start over when something outside the landing queue moves main
+    --attempts: int = 5 # How many times to start over when something outside the runway moves main
     --train # Land every dispatched, conflict-free topic in one fast-forward, clearing the chain once
+    --held: string # The drainer's: hold files of the topics this run lands, joined by ":"
 ] {
     let cleared_by = if $gate == null { $clearance } else {
         print --stderr "`ci land --gate` is now `ci land --clearance`."
@@ -3792,16 +4125,111 @@ def "main land" [
     if $train {
         report-run "Landed the train" {
             require-jj-workspace-here
-            land-train $timeout $cleared_by
+            land-train $timeout $cleared_by --held $held
         }
         return
     }
     report-run "Landed the topic" {
         with-topic-lock (current-topic-id) {
+            if $held != null { require-held-head $held }
             let run = (publish-with-agent true $attempts)
-            drive-topic-agent $run.state $run.published $timeout $cleared_by
+            drive-topic-agent $run.state $run.published $timeout $cleared_by --held $held
         }
     }
+}
+
+# Fail unless this workspace still has the change the hold at `path` holds,
+# at the head it holds: the drainer lands only what `ci queue` held.
+def require-held-head [path: string] {
+    let hold = (try { open --raw $path | from json } catch {
+        error make { msg: $"The hold ($path) is gone; the topic was dropped or already taken." }
+    })
+    let change = (current-topic-id)
+    let head = (current-change 'commit_id')
+    if $change != $hold.change or $head != $hold.head {
+        error make { msg: $"($hold.topic) changed since it was queued \(now ($change | str substring 0..<8) at ($head | str substring 0..11)); `ci queue` it again to land the new head." }
+    }
+}
+
+# Hold this topic for the drainer instead of landing it from this session:
+# dispatch it, run the fast checks, and record its exact head. The drainer, a
+# transient systemd unit, lands held topics in the order they were held, as
+# one train when several share a repository and clearance, and waits its
+# turn on the runway for each, so this session can end at once. An edit after
+# `ci queue` ends the hold instead of landing a head nobody queued.
+def "main queue" [
+    --clearance: string = "local" # What must pass the head: local, github, or nixbot
+    --timeout: duration = 2hr # How long to wait for the pipeline once on the runway
+    --attempts: int = 5 # How many times to start over when something outside the runway moves main
+] {
+    report-run "Held the topic" {
+        with-topic-lock (current-topic-id) {
+            let change = (current-topic-id)
+            for entry in (held-topics | where {|entry| $entry.hold.change == $change }) {
+                finish-hold $entry { exit_code: 1 error: "dropped: queued again" }
+            }
+            let run = (publish-with-agent false $attempts --hold)
+            drive-topic-agent $run.state $run.published $timeout $clearance
+        }
+    }
+}
+
+# The runway and the topics held for it: what is landing, what waits, the
+# drainer, and how the latest held topics ended.
+def "main queue list" [
+    --json # Print the record instead of tables
+] {
+    let queue = (runway-path)
+    mkdir $queue
+    let runway = (runway-tickets $queue | each {|ticket|
+        { topic: ($ticket.holder.topic? | default "") pid: $ticket.holder.pid? workspace: ($ticket.holder.workspace? | default "") }
+    })
+    let held = (held-topics | each {|entry|
+        {
+            topic: $entry.hold.topic
+            head: ($entry.hold.head | str substring 0..11)
+            clearance: $entry.hold.clearance
+            held_at: $entry.hold.held_at
+            log: $entry.hold.log
+        }
+    })
+    let holder = (try { open --raw (drainer-lock-path) | from json } catch { null })
+    let drainer = if $holder != null and (try { lock-holder-alive $holder } catch { false }) { { pid: $holder.pid unit: $holder.unit? } } else { null }
+    let outcomes = ((holds-path) | path join "outcomes.jsonl")
+    let recent = if ($outcomes | path exists) {
+        open --raw $outcomes | lines | each {|line| try { $line | from json } catch { null } } | compact | last 10
+    } else { [] }
+    let report = { runway: $runway held: $held drainer: $drainer recent: $recent }
+    if $json { return ($report | to json) }
+    print (if ($runway | is-empty) { "Runway: clear." } else { "Runway:" })
+    if ($runway | is-not-empty) { print ($runway | table) }
+    print (if ($held | is-empty) { "Held: none." } else { "Held, in landing order:" })
+    if ($held | is-not-empty) { print ($held | table) }
+    print (if $drainer == null { "Drainer: not running." } else { $"Drainer: pid ($drainer.pid) \(($drainer.unit? | default 'no unit'))." })
+    if ($recent | is-not-empty) {
+        print "Recent held landings:"
+        print ($recent | select --optional at topic exit_code error | table)
+    }
+}
+
+# Take this topic out of the line: its hold ends without landing.
+def "main queue drop" [] {
+    let change = (current-topic-id)
+    let mine = (held-topics | where {|entry| $entry.hold.change == $change })
+    if ($mine | is-empty) {
+        print "This topic is not held."
+        return
+    }
+    for entry in $mine { finish-hold $entry { exit_code: 1 error: "dropped by its owner" } }
+    print $"Dropped ($mine | first | get hold.topic) from the line."
+}
+
+# The drainer: land every held topic in turn, then exit. `ci queue` starts
+# it as a transient user unit; running it by hand does the same work.
+def "main queue drain" [
+    --unit: string # The transient unit this drainer runs in, so a lock check sees it alive
+] {
+    drain-holds $unit
 }
 
 # Export each revision in `revisions` (a record of name to commit) into its own

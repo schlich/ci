@@ -42,6 +42,7 @@ pub enum Action {
     Conflicts,
     Sequence,
     Land,
+    Queue,
     Park,
     Cancel,
     RefreshCi,
@@ -50,10 +51,11 @@ pub enum Action {
 }
 
 impl Action {
-    pub const MENU: [Action; 11] = [
+    pub const MENU: [Action; 12] = [
         Action::Preflight,
         Action::Dispatch,
         Action::Land,
+        Action::Queue,
         Action::Park,
         Action::Rebase,
         Action::Conflicts,
@@ -72,6 +74,7 @@ impl Action {
             Action::Conflicts => 'c',
             Action::Sequence => 's',
             Action::Land => 'l',
+            Action::Queue => 'Q',
             Action::Park => 'P',
             Action::Cancel => 'X',
             Action::RefreshCi => 'u',
@@ -88,6 +91,7 @@ impl Action {
             Action::Conflicts => "conflicts",
             Action::Sequence => "sequence",
             Action::Land => "land…",
+            Action::Queue => "queue…",
             Action::Park => "park…",
             Action::Cancel => "cancel topic…",
             Action::RefreshCi => "pipeline state",
@@ -103,7 +107,8 @@ impl Action {
             Action::Rebase => "fetch trunk and rebase the topic in place",
             Action::Conflicts => "list conflicted revisions and files",
             Action::Sequence => "trial-merge in-flight topics, propose stacks",
-            Action::Land => "clear the head locally, fast-forward main",
+            Action::Land => "on a clear runway: clear the head, fast-forward main",
+            Action::Queue => "hold for the drainer, which lands it in turn",
             Action::Park => "confirm the landing, free the workspace",
             Action::Cancel => "delete the branch, abandon the topic",
             Action::RefreshCi => "re-read GitHub and the PR",
@@ -121,6 +126,7 @@ impl Action {
             Action::Conflicts => &["conflicts"],
             Action::Sequence => &["sequence"],
             Action::Land => &["land", "--clearance", "local"],
+            Action::Queue => &["queue", "--clearance", "local"],
             Action::Park => &["park"],
             Action::Cancel => &["cancel"],
             _ => return None,
@@ -140,7 +146,12 @@ impl Action {
     pub fn confirms(self) -> bool {
         matches!(
             self,
-            Action::Dispatch | Action::Land | Action::Park | Action::Cancel | Action::StopRun
+            Action::Dispatch
+                | Action::Land
+                | Action::Queue
+                | Action::Park
+                | Action::Cancel
+                | Action::StopRun
         )
     }
 

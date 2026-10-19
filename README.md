@@ -31,10 +31,12 @@ moves to a newer one.
 
 ## Stately dispatch and landing
 
-Single-topic `ci dispatch`, `ci dispatch --land`, and `ci land` use the
-Stately agent in `agent/machine.mjs`. It names the work that used to live in
-the landing retry loop: publishing, checking landability, queueing,
-refreshing trunk, republishing, proving, clearing, and advancing. Progress
+Single-topic `ci dispatch`, `ci dispatch --land`, `ci land`, and `ci queue`
+use the Stately agent in `agent/machine.mjs`. It names the work that used to
+live in the landing retry loop: publishing, checking landability, holding
+(`ci queue`, which ends `held`), approaching the runway (which ends `refused`
+for `ci land` on a busy runway), refreshing trunk, republishing, proving,
+clearing, and advancing. Progress
 reports expose the current state through the existing OSC 7501 and ci log
 channels. Dispatch ends in `dispatched`; only an explicitly requested landing
 enters the landing states. Stacked review and train landing keep their
@@ -42,7 +44,7 @@ separate orchestration.
 
 The agent is deterministic and needs no model, provider SDK, or credentials.
 Nushell executes the existing policy operations under the same topic lock
-and landing queue. Clearance must name the published head before advancing;
+and runway. Clearance must name the published head before advancing;
 only a lost landing race retries, up to `--attempts`. Conflicts, failed
 checks, and other command errors stop. Rewritten heads are redispatched and
 cleared again. No activation is part of this flow.
@@ -64,12 +66,13 @@ $env.CI_SCRIPT = '/path/to/ci/ci.nu'
 $env.CI_AGENT_SCRIPT = '/path/to/ci/agent/cli.mjs'
 ```
 
-`checks.x86_64-linux.ci-agent` covers dispatch-only termination, queue and
-clearance ordering, stale-head rejection, rewriting and reproving, bounded
-races, and terminal failures. It uses no repository or remote mutations.
-The existing Quint and Rust lifecycle model continue to define protocol
-safety; this command machine refines their Publish, Queue, GatePasses, and
-Land operations.
+`checks.x86_64-linux.ci-agent` covers dispatch-only termination, runway and
+clearance ordering, refusal of a busy runway, holding the exact head,
+stale-head rejection, rewriting and reproving, bounded races, and terminal
+failures. It uses no repository or remote mutations. The existing Quint and
+Rust lifecycle model continue to define protocol safety; this command
+machine refines their Publish, Hold, TakeRunway, GatePasses, and Land
+operations.
 
 ## Protocol
 
@@ -122,8 +125,10 @@ ci dispatch                 # Push the same topic branch to Tangled.
 ci review snapshot v2
 ci interdiff v1 v2
 # At topic closeout:
-ci land                     # Build the flake checks locally, then fast-forward main.
+ci land                     # On a clear runway: build the flake checks locally, then fast-forward main.
 ci land --clearance github  # Take clearance from GitHub Actions (or nixbot) instead.
+ci queue                    # With a landing in flight: hold the topic; the drainer lands it in turn.
+ci queue list               # The runway, the held topics, and how recent ones ended.
 ci park                     # Confirm the landing and free the workspace.
 # To drop an undispatched or closed topic instead:
 ci cancel
@@ -244,30 +249,55 @@ a stacked topic must wait for its parent to land, and a declared refactor
 must leave every NixOS closure as it was at that base. The proof compares the head with the
 commit it forks from, found once the proof holds the local checks lock, so a
 topic that lands while it waits is never counted as this one's change. Next
-the topic joins the landing queue, described below. Once at its front, `ci
-land` passes the exact commit through the landing clearance, fast-forwards
-`main` to it, mirrors it, and tags any release.
+the topic takes the runway, described below. There `ci land` passes the
+exact commit through the landing clearance, fast-forwards `main` to it,
+mirrors it, and tags any release.
 `main` therefore holds only commits that were tested as they are, and history
 stays linear without squashing. A stacked topic lands after its parent.
 `ci dispatch --land` dispatches and lands in one step.
 
-Every `ci land` on this machine waits its turn in one landing queue,
+Landings on this machine share one runway,
 `$XDG_STATE_HOME/jj-ci/landing-queue/`, shared by every workspace and
-session. Each waiting landing holds a ticket there, numbered in arrival
-order, and only the lowest live ticket may move `main`. From the front, a
-landing rebases onto `main@tangled` only if `main` moved while it waited,
-runs the fast checks again on the new head, and takes clearance. No other
-landing here moves `main` until it is done, so it never restarts and N
-landings at once cost about N clearances. Before the queue, they restarted
-one another: on 2026-10-16, landings that took 4 minutes alone took 30 to 77
-minutes each when five ran at once, and two never landed. While landings are
-ahead of it, `ci land` prints and reports, as a `blocked` record under
-`landing-queue`, `Waiting to land behind <topic> (pid N) and K more.`, so
-`watch-job` and `ci tower` show the wait. A landing that exits, however it
-ends, leaves the queue, and one that was killed is dropped by the next
+session. Each landing holds a ticket there, numbered in arrival order, and
+only the lowest live ticket may move `main`. On the runway, a landing
+rebases onto `main@tangled` only if `main` moved meanwhile, runs the fast
+checks again on the new head, and takes clearance. No other landing here
+moves `main` until it is done, so it never restarts and N landings cost
+about N clearances. Before the runway, they restarted one another: on
+2026-10-16, landings that took 4 minutes alone took 30 to 77 minutes each
+when five ran at once, and two never landed. A landing that exits, however
+it ends, leaves the runway, and one that was killed is dropped by the next
 landing to look.
 
-Something outside the queue can still move `main`: another machine, or a push
+One topic is in flight at a time. `ci land` takes the runway only when it is
+clear: no live ticket ahead of its own and no topic held for the drainer.
+Otherwise it gives its ticket back and fails at once, naming the landing in
+flight and the held topics, rather than keep a session waiting for a turn
+that session may not live to see. `ci queue` is for the rest. It dispatches
+the topic, runs the same fast checks, and holds the exact head it pushed in
+`$XDG_STATE_HOME/jj-ci/landing-holds/`, then returns. The drainer, a
+transient systemd user unit (`ci-landing-drain-*`) that `ci queue` starts
+when none runs, lands held topics in the order they were held. Holds of the
+same repository and clearance fly together as one train (below), so a
+backlog costs one clearance rather than one per topic. The drainer waits its
+turn on the runway like any landing, reporting the wait as `working` under
+`runway`, since waiting one's turn is progress rather than something for a
+person to unblock. Before each flight it drops a hold whose workspace no
+longer has the held change checked out at the held head: an edit after `ci
+queue` ends the hold instead of landing a head nobody queued, and `ci queue`
+again holds the new head. Its landing takes a runway ticket before the hold
+goes, so no `ci land` finds the runway clear between the two.
+
+Each hold has a log under `landing-holds/logs/` in `job-log`'s shape:
+`ci queue` prints its path, `watch-job LOG` follows the landing to its DONE
+line, and the outcome lands in `LOG.done.nuon` and in
+`landing-holds/outcomes.jsonl`. `ci queue list` shows the runway, the held
+topics in landing order, the drainer, and recent outcomes; `ci queue drop`
+takes the current topic out of the line. The drainer leaves once no hold
+waits, checking under the same guard that hold creation takes, so a hold
+drawn at that moment is either seen or starts a new drainer.
+
+Something outside the runway can still move `main`: another machine, or a push
 by hand. The push of `main` therefore still carries JJ's lease on it, and
 when clearance passes `ci land` fetches `main@tangled` again. If `main`
 moved, it leaves `main` alone, rebases and redispatches the topic, and takes
@@ -275,8 +305,9 @@ clearance again on the new head, up to `--attempts` times (default 5). A
 rebase conflict or failed clearance still stops it.
 
 `ci land --train` lands every dispatched topic it can in one fast-forward,
-for one clearance instead of one per topic. It runs from any workspace and
-waits in the same landing queue. From the front, it takes the topics `ci
+for one clearance instead of one per topic. It runs from any workspace and,
+like `ci land`, takes only a clear runway; the drainer runs it for a flight
+of held topics, limited to those topics. From the runway, it takes the topics `ci
 sequence` lists, in that order, and rebases each onto the one before it,
 forming one linear chain on `main`. A topic joins only as it was dispatched:
 its local bookmark is the one on the trunk remote, with no edits above it,
@@ -297,7 +328,7 @@ owners land them again. The run ends with a table of what happened to each
 topic, and fails when a culprit was found. Workspaces with a train topic
 checked out are snapshotted before planning and updated afterwards, and the
 whole rewrite has one `ci recover` checkpoint. A train does not retry: if
-something outside the queue moves `main` while it clears, nothing lands and
+something outside the runway moves `main` while it clears, nothing lands and
 every topic returns to `main`.
 
 The installed `ci`, the dev shell's, and the ci MCP server's are one launcher
@@ -374,10 +405,12 @@ so a second `ci` that finds a live holder fails at once, naming its pid and
 workspace, rather than waiting to move the topic again. Let that run finish.
 
 These locks are always taken in one order: the topic lock, which nothing
-waits for, then the landing queue, then the local checks lock. Nothing that
-holds the local checks lock waits for the queue, so no two `ci` processes can
-deadlock. `ci tower` shows the landing at the front of the queue as LANDING
-and those behind it as QUEUED.
+waits for, then the runway, then the local checks lock. Nothing that holds
+the local checks lock waits for the runway, so no two `ci` processes can
+deadlock. `ci tower` shows the landing on the runway as LANDING, any
+landings waiting behind it (the drainer's, or a train) as WAITING, and the
+topics held for the drainer as HELD; `Q` in ACTION mode queues the selected
+topic.
 
 Other sessions' work cannot stop a landing either. The plan that places a
 topic names every other topic's tip by commit, so a divergent change in some

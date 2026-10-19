@@ -5,29 +5,33 @@
 //! control facts become states and the data facts stay in shared storage:
 //!
 //! ```text
-//! topic                         GatePasses, ParentLands; rejects the rest
-//! ├── working                   Edit, TrunkAdvances, Queue, Dequeue, Abandon
+//! topic                         GatePasses, ParentLands, OthersLeave;
+//! │                             rejects the rest
+//! ├── working                   Edit, TrunkAdvances, OthersArrive, Hold,
+//! │   │                         DropHold, TakeRunway, LeaveRunway, Abandon
 //! │   ├── clean                 Rebase, Validate, Land, Finish
 //! │   │   ├── editing
 //! │   │   └── validated         Publish
 //! │   └── conflicted            Edit keeps the conflict, Resolve
 //! ├── delivered                 Finish
-//! └── released { workspace, delivered }
+//! └── released { workspace, delivered }   TrunkAdvances, OthersArrive
 //! ```
 //!
 //! `owner` and `active` hold exactly outside `released`, `conflict` is the
 //! `conflicted` state, and `validated` is the `validated` state, whose head
-//! is always the current one. Holding the front of the landing queue is a
-//! fact, `queued`, rather than a state, since a topic keeps editing and
-//! rebasing there. `tests/spec.rs` checks every transition of the bounded
-//! model against the Quint actions, every invariant against the reachable
-//! states, and every action property against the transitions.
+//! is always the current one. Holding the runway, being held for the
+//! drainer, and other topics being ahead are facts (`on_runway`, `held`,
+//! `others_ahead`) rather than states, since a topic keeps editing and
+//! rebasing through all of them. `tests/spec.rs` checks every transition of
+//! the bounded model against the Quint actions, every invariant against the
+//! reachable states, and every action property against the transitions.
 //!
 //! `agent/machine.mjs` refines this protocol into dispatch/landing command
-//! states. Its host maps publishing to Publish, queueing to Queue, clearing
-//! to GatePasses, and advancing to Land. Refreshing/republishing invalidates
-//! clearance on a rewritten head; bounded retries apply only to a lost
-//! landing lease. This lifecycle remains the shared protocol classifier.
+//! states. Its host maps publishing to Publish, holding to Hold, approaching
+//! to TakeRunway, clearing to GatePasses, and advancing to Land.
+//! Refreshing/republishing invalidates clearance on a rewritten head; bounded
+//! retries apply only to a lost landing lease. This lifecycle remains the
+//! shared protocol classifier.
 
 pub mod stage;
 
@@ -66,12 +70,22 @@ pub enum Event {
     ParentLands,
     /// Another topic landed and moved trunk.
     TrunkAdvances { main: Commit },
-    /// `ci land` reached the front of the landing queue.
-    Queue,
-    /// `ci land` left the landing queue without landing.
-    Dequeue,
-    /// `ci land` fast-forwarded main to the head the gate passed, from the
-    /// front of the landing queue, which it then left.
+    /// Another topic took the runway or was held, ahead of this one.
+    OthersArrive,
+    /// The topics ahead of this one landed or dropped out.
+    OthersLeave,
+    /// `ci queue` held the topic's exact published head for the drainer.
+    Hold,
+    /// The hold ended without the topic taking the runway: its head changed,
+    /// or its owner dropped it.
+    DropHold,
+    /// The topic took the runway: `ci land` on a clear runway, or the drainer
+    /// from its hold.
+    TakeRunway,
+    /// The landing left the runway without landing.
+    LeaveRunway,
+    /// The topic fast-forwarded main to the head the gate passed, from the
+    /// runway, which it then left.
     Land,
     /// `ci park` released a delivered or unpublished topic.
     Finish { workspace: Workspace },
@@ -104,9 +118,14 @@ pub struct Topic {
     pub parent_landed: bool,
     /// The trunk that landing fast-forwarded from.
     pub landed_onto: Option<Commit>,
-    /// Whether the topic holds the front of the landing queue, where trunk
-    /// moves for no other landing.
-    pub queued: bool,
+    /// Whether the topic holds the runway, where trunk moves for no other
+    /// landing.
+    pub on_runway: bool,
+    /// The head `ci queue` held for the drainer, while the topic is held.
+    pub held: Option<Commit>,
+    /// Whether another landing is in flight or another topic is held ahead
+    /// of this one.
+    pub others_ahead: bool,
 }
 
 /// Collects whether the machine accepted an event; only the `topic`
@@ -130,7 +149,9 @@ impl Topic {
             passed: None,
             parent_landed,
             landed_onto: None,
-            queued: false,
+            on_runway: false,
+            held: None,
+            others_ahead: false,
         }
     }
 
@@ -156,7 +177,18 @@ impl Topic {
             && self.passed.as_ref() == Some(&self.head)
             && self.parent_landed
             && self.base == self.main
-            && self.queued
+            && self.on_runway
+    }
+
+    /// Whether the topic may take the runway now: published, with nothing
+    /// ahead of it, and either held at its current head (the drainer) or not
+    /// held at all (`ci land`, which only the owner runs, as every working
+    /// state is owned).
+    fn can_take_runway(&self) -> bool {
+        self.publication.is_some()
+            && !self.on_runway
+            && !self.others_ahead
+            && self.held.as_ref().is_none_or(|held| *held == self.head)
     }
 }
 
@@ -186,6 +218,10 @@ impl Topic {
                 self.parent_landed = true;
                 Handled
             }
+            Event::OthersLeave if self.others_ahead => {
+                self.others_ahead = false;
+                Handled
+            }
             _ => {
                 context.rejected = true;
                 Handled
@@ -200,18 +236,42 @@ impl Topic {
                 self.head = head.clone();
                 Transition(State::editing())
             }
-            // Other topics land from the front of the same queue, so not
-            // while this one holds it.
-            Event::TrunkAdvances { main } if *main != self.main && !self.queued => {
+            // Other topics land from the same runway, so not while this one
+            // holds it.
+            Event::TrunkAdvances { main } if *main != self.main && !self.on_runway => {
                 self.main = main.clone();
                 Handled
             }
-            Event::Queue if !self.queued && self.publication.is_some() => {
-                self.queued = true;
+            // Topics that arrive once this one is held or on the runway line
+            // up behind it.
+            Event::OthersArrive
+                if !self.on_runway && self.held.is_none() && !self.others_ahead =>
+            {
+                self.others_ahead = true;
                 Handled
             }
-            Event::Dequeue if self.queued => {
-                self.queued = false;
+            Event::Hold
+                if self.held.is_none()
+                    && !self.on_runway
+                    && self
+                        .publication
+                        .as_ref()
+                        .is_some_and(|p| p.head == self.head) =>
+            {
+                self.held = Some(self.head.clone());
+                Handled
+            }
+            Event::DropHold if self.held.is_some() => {
+                self.held = None;
+                Handled
+            }
+            Event::TakeRunway if self.can_take_runway() => {
+                self.on_runway = true;
+                self.held = None;
+                Handled
+            }
+            Event::LeaveRunway if self.on_runway => {
+                self.on_runway = false;
                 Handled
             }
             // Abandoning discards unpublished work, conflicts included.
@@ -238,12 +298,11 @@ impl Topic {
             }
             Event::Validate => Transition(State::validated()),
             // A fast-forward of main to the exact head a gate passed, with a
-            // lease on the trunk the topic is based on, from the front of the
-            // landing queue.
+            // lease on the trunk the topic is based on, from the runway.
             Event::Land if self.can_land() => {
                 self.landed_onto = Some(self.main.clone());
                 self.main = self.head.clone();
-                self.queued = false;
+                self.on_runway = false;
                 Transition(State::delivered())
             }
             Event::Finish { workspace } if self.publication.is_none() => {
@@ -306,6 +365,10 @@ impl Topic {
         match event {
             Event::TrunkAdvances { main } if !*delivered && *main != self.main => {
                 self.main = main.clone();
+                Handled
+            }
+            Event::OthersArrive if !*delivered && !self.others_ahead => {
+                self.others_ahead = true;
                 Handled
             }
             _ => Super,

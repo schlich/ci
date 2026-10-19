@@ -6,16 +6,22 @@ import { z } from 'zod';
 // decides whether a topic is safe to publish or land. All facts come from the
 // existing locked, checked CI operations, including the exact cleared head.
 const head = z.string().min(1);
-const inputSchema = z.object({ land: z.boolean(), attempts: z.number().int().min(1) });
+// `land` carries the topic on to landing; `hold` (`ci queue`) holds it for
+// the drainer instead of taking the runway.
+const inputSchema = z.object({
+  land: z.boolean(), hold: z.boolean().default(false), attempts: z.number().int().min(1),
+});
 const setup = setupAgent({
   input: inputSchema,
   context: z.object({
-    land: z.boolean(), limit: z.number().int().min(1), attempt: z.number().int(),
+    land: z.boolean(), hold: z.boolean(), limit: z.number().int().min(1), attempt: z.number().int(),
     head: z.string(), proven: z.string(), error: z.string(),
   }),
   events: {
     PUBLISHED: z.object({ head }),
-    LANDABLE: {}, QUEUED: {},
+    LANDABLE: {}, ON_RUNWAY: {},
+    RUNWAY_BUSY: z.object({ ahead: z.string() }),
+    HELD: z.object({ head }),
     REFRESHED: z.object({ fresh: z.boolean() }),
     CLEARED: z.object({ head }),
     ADVANCED: z.object({ head, landed: z.boolean() }),
@@ -27,7 +33,7 @@ export const machine = setup.createMachine({
   id: 'ci-dispatch-landing',
   initial: 'publishing',
   context: ({ input }) => ({
-    land: input.land, limit: input.attempts, attempt: 1,
+    land: input.land || input.hold, hold: input.hold, limit: input.attempts, attempt: 1,
     head: '', proven: '', error: '',
   }),
   on: {
@@ -42,8 +48,27 @@ export const machine = setup.createMachine({
       },
     },
     dispatched: { type: 'final' },
-    checking: { on: { LANDABLE: { target: 'queueing' } } },
-    queueing: { on: { QUEUED: { target: 'refreshing' } } },
+    checking: {
+      on: { LANDABLE: ({ context }) => ({ target: context.hold ? 'holding' : 'approaching' }) },
+    },
+    // The host records the hold for the exact published head; the drainer
+    // lands it later in its own run.
+    holding: {
+      on: {
+        HELD: ({ context, event }) => event.head === context.head
+          ? { target: 'held' } : undefined,
+      },
+    },
+    held: { type: 'final' },
+    // `ci land` takes the runway only when it is clear, and refuses rather
+    // than wait; the drainer, landing a held topic, waits its turn instead.
+    approaching: {
+      on: {
+        ON_RUNWAY: { target: 'refreshing' },
+        RUNWAY_BUSY: ({ event }) => ({ target: 'refused', context: { error: event.ahead } }),
+      },
+    },
+    refused: { type: 'final' },
     refreshing: {
       on: {
         REFRESHED: ({ context, event }) => ({
@@ -106,7 +131,9 @@ export function step({ input, snapshot, event }) {
 const eventSchemas = {
   PUBLISHED: z.object({ type: z.literal('PUBLISHED'), head }),
   LANDABLE: z.object({ type: z.literal('LANDABLE') }),
-  QUEUED: z.object({ type: z.literal('QUEUED') }),
+  ON_RUNWAY: z.object({ type: z.literal('ON_RUNWAY') }),
+  RUNWAY_BUSY: z.object({ type: z.literal('RUNWAY_BUSY'), ahead: z.string() }),
+  HELD: z.object({ type: z.literal('HELD'), head }),
   REFRESHED: z.object({ type: z.literal('REFRESHED'), fresh: z.boolean() }),
   CLEARED: z.object({ type: z.literal('CLEARED'), head }),
   ADVANCED: z.object({ type: z.literal('ADVANCED'), head, landed: z.boolean() }),

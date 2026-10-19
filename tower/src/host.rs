@@ -41,9 +41,60 @@ pub struct Locks {
     pub checks: Option<Holder>,
     /// Topics being dispatched or landed, by full change id.
     pub topics: Vec<(String, Holder)>,
-    /// The landing queue, front first: the landing that may move main, then
-    /// those waiting behind it.
+    /// The runway, front first: the landing that may move main, then those
+    /// waiting behind it.
     pub landing: Vec<Holder>,
+    /// Topics `ci queue` held for the drainer, in landing order.
+    pub held: Vec<Held>,
+}
+
+/// A topic held for the drainer: ci's hold-topic record.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Held {
+    /// `change "title"`, as ci's lock-topic writes it.
+    pub topic: String,
+    pub workspace: String,
+    pub since_ms: Option<i64>,
+}
+
+impl Held {
+    pub fn change(&self) -> &str {
+        self.topic.split_whitespace().next().unwrap_or("")
+    }
+
+    pub fn title(&self) -> &str {
+        self.topic
+            .split_once(' ')
+            .map(|(_, title)| title.trim().trim_matches('"'))
+            .unwrap_or("")
+    }
+}
+
+/// The JSON tickets in `dir`, named by their number, lowest first, as ci's
+/// draw-ticket writes them.
+fn tickets(dir: &Path) -> Vec<PathBuf> {
+    let mut tickets: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .filter_map(|p| Some((p.file_stem()?.to_str()?.parse().ok()?, p)))
+                .collect()
+        })
+        .unwrap_or_default();
+    tickets.sort();
+    tickets.into_iter().map(|(_, p)| p).collect()
+}
+
+fn held(path: &Path) -> Option<Held> {
+    let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let field = |key: &str| value.get(key).and_then(|v| v.as_str());
+    Some(Held {
+        topic: field("topic")?.to_string(),
+        workspace: field("workspace").unwrap_or("").to_string(),
+        since_ms: field("held_at").and_then(time::parse),
+    })
 }
 
 /// A process's start time in clock ticks since boot, as ci's process-start.
@@ -135,26 +186,21 @@ impl LockReader {
             })
             .unwrap_or_default();
         topics.sort_by(|a, b| a.0.cmp(&b.0));
-        // ci's landing-queue: tickets named by their number, lowest first.
-        let mut tickets: Vec<(u64, PathBuf)> = fs::read_dir(dir.join("landing-queue"))
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                    .filter_map(|p| Some((p.file_stem()?.to_str()?.parse().ok()?, p)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        tickets.sort();
-        let landing = tickets
+        // ci keeps its runway tickets in landing-queue, and its holds in
+        // landing-holds.
+        let landing = tickets(&dir.join("landing-queue"))
             .iter()
-            .filter_map(|(_, p)| holder(p, &mut self.units))
+            .filter_map(|p| holder(p, &mut self.units))
+            .collect();
+        let held = tickets(&dir.join("landing-holds"))
+            .iter()
+            .filter_map(|p| held(p))
             .collect();
         Locks {
             checks,
             topics,
             landing,
+            held,
         }
     }
 }

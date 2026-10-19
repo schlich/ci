@@ -117,17 +117,32 @@ export extern "ci dispatch" [
     --land # Land the topic once it has clearance
     --clearance: string@"nu-complete ci clearances" # What must pass the head before --land (default local)
     --timeout: duration # How long --land waits for the pipeline (default 2hr)
-    --attempts: int # How many times --land starts over when something outside the landing queue moves main (default 5)
+    --attempts: int # How many times --land starts over when something outside the runway moves main (default 5)
     --stack # Push one branch per revision for Tangled's stacked pull requests
 ]
 
-# Dispatch the current topic, wait for clearance, and fast-forward main
+# On a clear runway, dispatch the current topic, wait for clearance, and fast-forward main
 export extern "ci land" [
     --clearance: string@"nu-complete ci clearances" # What must pass the head (default local)
     --timeout: duration # How long to wait for the pipeline (default 2hr)
-    --attempts: int # How many times to start over when something outside the landing queue moves main (default 5)
+    --attempts: int # How many times to start over when something outside the runway moves main (default 5)
     --train # Land every dispatched, conflict-free topic in one fast-forward, clearing the chain once
 ]
+
+# Dispatch the current topic and hold its exact head for the drainer, which lands it in turn
+export extern "ci queue" [
+    --clearance: string@"nu-complete ci clearances" # What must pass the head (default local)
+    --timeout: duration # How long to wait for the pipeline once on the runway (default 2hr)
+    --attempts: int # How many times to start over when something outside the runway moves main (default 5)
+]
+
+# Show the runway, the topics held for it, the drainer, and recent held landings
+export extern "ci queue list" [
+    --json # Print the record instead of tables
+]
+
+# Take the current topic out of the line without landing it
+export extern "ci queue drop" []
 
 # Check the declared impact of the revisions between two revisions
 export extern "ci impact check" [

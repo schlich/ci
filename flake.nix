@@ -100,8 +100,8 @@
             ''
               cp ${./JjCi.qnt} JjCi.qnt
               quint verify --backend=tlc \
-                --invariant=TypeOK,NoPublishWhileUnsafe,PublishedFromFreshBase,PublishedHeadWasValidated,NoFinishWithConflict,FinishLeavesMain,NoDropWhilePending,MainOnlyHoldsPassedHeads,DeliveryIsPublishedHead,DeliveredHeadIsLocal,LandsAfterParent,LandingIsFastForward,QueuedOnlyWhileLanding \
-                --temporal=QueuedTopicStaysOnTrunk,LandsFromQueue \
+                --invariant=TypeOK,NoPublishWhileUnsafe,PublishedFromFreshBase,PublishedHeadWasValidated,NoFinishWithConflict,FinishLeavesMain,NoDropWhilePending,MainOnlyHoldsPassedHeads,DeliveryIsPublishedHead,DeliveredHeadIsLocal,LandsAfterParent,LandingIsFastForward,RunwayOnlyWhileLanding,HeldOnlyWhileWaiting \
+                --temporal=RunwayTopicStaysOnTrunk,LandsFromRunway,RunwayTakenInTurn,HoldLandsHeldHead \
                 JjCi.qnt
               touch "$out"
             '';
