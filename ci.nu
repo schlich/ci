@@ -1372,12 +1372,24 @@ def hold-standing [hold: record, held: list = []] {
     }
     let parent = $hold.parent_change?
     if $parent != null and $parent not-in $held {
-        let landed = (do { cd $hold.workspace; ^jj log -r $"trunk\() & change_id\(($parent))" --no-graph -T 'change_id' } | complete)
-        if $landed.exit_code != 0 or ($landed.stdout | str trim | is-empty) {
+        if (changes-on-trunk $hold.workspace [$parent] | is-empty) {
             return (do $refused $"its parent ($hold.parent_branch? | default $parent) left the line without landing")
         }
     }
     { problem: null head: $head }
+}
+
+# Which of `changes` have landed, as `workspace` sees trunk: those among its
+# ancestors, not only its tip. A train lands its topics as a chain, so all
+# but the last sit below main; checking `trunk()` alone failed every hold
+# but the lead's (2026-10-19).
+def changes-on-trunk [workspace: string, changes: list<string>] {
+    if ($changes | is-empty) { return [] }
+    let any = ($changes | each {|change| $"change_id\(($change))" } | str join " | ")
+    let found = (do { cd $workspace; ^jj log --ignore-working-copy -r $"\(::trunk\() ~ root\()) & \(($any))" --no-graph -T 'change_id ++ "\n"' } | complete)
+    if $found.exit_code != 0 { return [] }
+    let ids = ($found.stdout | lines | where {|line| $line | is-not-empty })
+    $changes | where {|change| $ids | any {|id| $id | str starts-with $change } }
 }
 
 # Why `hold` cannot land as held, or null when it can; see hold-standing.
@@ -1600,10 +1612,7 @@ def fly [flight: list] {
         finish-hold ($flight | first) (if $code == 0 { { exit_code: 0 } } else { { exit_code: $code error: $"did not land: ($last)" } })
         return
     }
-    let landed = ($flight | where {|entry|
-        let found = (do { cd $lead.workspace; ^jj log -r $"trunk\() & change_id\(($entry.hold.change))" --no-graph -T 'change_id' } | complete)
-        $found.exit_code == 0 and ($found.stdout | str trim | is-not-empty)
-    } | get hold.change)
+    let landed = (changes-on-trunk $lead.workspace ($flight | get hold.change))
     let rows = (try { open --raw $report | from json } catch { [] })
     rm --force $report
     let verdicts = (train-verdicts $flight $rows $landed $"see ($lead.log)")
@@ -1616,7 +1625,9 @@ def fly [flight: list] {
 
 # What becomes of each hold in a train's `flight`, given the `rows` the train
 # reported ({ topic, kind } per branch, kind one of landed, culprit,
-# returned, conflicted, or skipped) and the changes `landed` on trunk. Only
+# returned, conflicted, or skipped) and the changes `landed` on trunk; either
+# one saying a topic landed is enough, since a train run by an older ci.nu
+# reports no rows. Only
 # the culprit and the topics stacked on it fail for its sake; a topic the
 # train put back on main cleanly goes back in line. A topic it left out, or
 # put back with conflicts, needs its owner and fails. With no rows, as when
@@ -1627,7 +1638,7 @@ def train-verdicts [flight: list, rows: list, landed: list, hint: string] {
         let row = ($rows | where topic == $entry.hold.branch | get --optional 0)
         let parent = $entry.hold.parent_change?
         let parent_topic = ($flight | where hold.change == $parent | get --optional 0.hold.topic)
-        let found = if $entry.hold.change in $landed {
+        let found = if $entry.hold.change in $landed or $row.kind? == "landed" {
             { verdict: "landed" error: null }
         } else if $parent != null and $parent in $state.failed {
             { verdict: "fail" error: $"did not land: its parent ($parent_topic | default $parent) did not land" }

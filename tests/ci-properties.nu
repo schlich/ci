@@ -1495,6 +1495,11 @@ with-env { XDG_STATE_HOME: $outcome_dir JJ_CONFIG: $train_config } {
     assert equal (revision-id "main@tangled") (revision-id "jj-c") "the train did not land its tip"
     assert (revset-change-ids "jj-b & ::main@tangled" | is-not-empty) "the train left a topic behind"
     assert equal (revision-id "jj-r") $refactor
+    # A train lands its topics as a chain, so all but the last sit below
+    # main's tip; each still counts as landed (2026-10-19).
+    let chain = (["jj-a" "jj-b" "jj-c"] | each {|name| revset-change-ids $name | first })
+    assert equal (changes-on-trunk $train_repo ($chain | append "zzzzzzzz" | append "kmkmkmkm")) $chain "a topic below main's tip did not count as landed"
+    assert equal (changes-on-trunk $train_repo (revset-change-ids "jj-r")) [] "an unlanded topic counted as landed"
 
     # The drainer lands a hold only while its workspace still has the held
     # change checked out at the held head.
@@ -1907,7 +1912,9 @@ for-all "a failed train fails only its culprit and the topics stacked on it" {|k
             if $kind == "missing" { null } else { { topic: $entry.item.hold.branch kind: $kind outcome: $kind } }
         } | compact
     }
-    let landed = ($flight | first $landing | get hold.change)
+    # The drainer may miss a landed topic on trunk that the train reported;
+    # without a report, trunk is all it has.
+    let landed = ($flight | first $landing | enumerate | where {|entry| not $reported or (flag $"($key)/seen/($entry.index)") } | get item.hold.change)
     let verdicts = (train-verdicts $flight $rows $landed "see the log")
     assert equal ($verdicts | get entry.hold.change) ($flight | get hold.change)
     let failed = ($verdicts | where verdict == "fail" | get entry.hold.change)
@@ -1915,7 +1922,7 @@ for-all "a failed train fails only its culprit and the topics stacked on it" {|k
         let hold = $verdict.entry.hold
         let row = ($rows | where topic == $hold.branch | get --optional 0)
         let parent_failed = $hold.parent_change != null and $hold.parent_change in $failed
-        let expected = if $hold.change in $landed { "landed" } else if $parent_failed or $row == null or $row.kind != "returned" { "fail" } else { "rehold" }
+        let expected = if $hold.change in $landed or $row.kind? == "landed" { "landed" } else if $parent_failed or $row == null or $row.kind != "returned" { "fail" } else { "rehold" }
         assert equal $verdict.verdict $expected $"($hold.change) with ($row) after ($failed)"
         if $verdict.verdict == "fail" { assert ($verdict.error | is-not-empty) "a failed hold gave no reason" }
     }
