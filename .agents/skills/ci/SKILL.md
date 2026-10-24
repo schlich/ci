@@ -1,15 +1,35 @@
 ---
 name: ci
-description: Use the repository's `ci` workflow to sequence, preflight, dispatch, land, park, and verify JJ changes. Apply when the `ci` command is available; do not use it as a generic Jujutsu tutorial.
+description: Use the repository's `ci` workflow to sequence, preflight, dispatch, land, park, and verify JJ changes. Apply only in a repository that opted into ci, where `jj config get ci.enable` prints `true`; elsewhere use plain JJ even though the command is installed. Do not use it as a generic Jujutsu tutorial.
 ---
 
 # `ci` workflow
 
-Use this skill when the repository provides the `ci` command. It is the
-repository's policy layer around Jujutsu, Prek, its forges, and the trunk
-workflow. The remote `trunk()` names (`main@tangled` or `main@origin`) hosts
-`main` and every topic branch, and the other forge mirrors `main`; `ci land`
-is the only path to `main`.
+Use this skill only in a repository that opted into `ci` (see Setup). There
+it is the repository's policy layer around Jujutsu, Prek, its forges, and the
+trunk workflow. The remote `trunk()` names (`main@tangled` or `main@origin`)
+hosts `main` and every topic branch, and the other forge mirrors `main`;
+`ci land` is the only path to `main`.
+
+## Setup
+
+The workflow is opt-in per repository. A repository opts in when JJ's config
+sets `ci.enable = true` there, so that `jj config get ci.enable` prints
+`true`:
+
+- For one clone, `jj config set --repo ci.enable true`;
+  `jj config unset --repo ci.enable` opts it out again.
+- For every clone and workspace at a path, a `[[--scope]]` table in the user's
+  JJ config whose `--when.repositories` names the path and that sets
+  `ci.enable = true`.
+
+Opt a repository in only when its owner asks: a new repository is not a ci
+repository. Without the key, do not run `ci` there, not even `ci status`,
+which can write a `trunk()` definition into the repository's config. Use plain
+JJ instead: describe the change with `jj describe`, point a bookmark at it
+with `jj bookmark set`, and push it with `jj git push --bookmark NAME`. In an
+opted-in repository `ci` lands on the remote bookmark `trunk()` names, and
+defines `trunk()` as `main` on the preferred remote when nothing else does.
 
 ## Before acting
 
